@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The GPU-free rules of replacement texture packs ("textures" mod packages written by ZeldaWWHD Texture Studio):
 // the index.json reader, which GX2 format may be replaced by which DDS format, the check of a loaded DDS file, the

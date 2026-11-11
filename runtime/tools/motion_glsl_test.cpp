@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The motion variant's GLSL (runtime/src/gfx/vulkan/motion_glsl.h) on shaders laid out as the translator writes them:
 // blocks per frame (and per view), vertex inputs doubled at location + 16, the translator's main run twice, the pixel

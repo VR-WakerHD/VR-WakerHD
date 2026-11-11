@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // VR frame synthesis and depth for reprojection (docs/VR_FRAME_SYNTHESIS.md). The OpenXR runtime makes the in-between
 // frames itself from each eye's motion vectors and depth while the game draws at half the refresh rate (45 fps at 90

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The VR wrist HUD (docs/VR_WRIST_HUD.md): the hearts on top of the left wrist, the item buttons underneath it, the
 // magic bar on top of the right wrist, the rupees underneath it. Four OpenXR quad layers in tracking space, placed from the controllers' grip

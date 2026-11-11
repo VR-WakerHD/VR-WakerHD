@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The renderer's hot threads on the CPU's core groups (docs/VR_SCENE_THREADS.md, "S6: the threads on the CPU's core
 // groups"; on by default since 2026-11-04, WWHD_VK_PLACE_THREADS=0 turns it off; Windows and desktop Linux on x86-64

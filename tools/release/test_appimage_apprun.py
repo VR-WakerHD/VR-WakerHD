@@ -29,7 +29,7 @@ def run(env_extra, make=()):
         apprun = os.path.join(appdir, "AppRun")
         with open(apprun, "w") as f:
             f.write(appimage.APPRUN)
-        launcher = os.path.join(appdir, "wind-waker-hd")
+        launcher = os.path.join(appdir, "wind-waker-hd-vr")
         with open(launcher, "w") as f:  # stands in for the launcher: report what it was given
             f.write('#!/bin/sh\necho "home=$HOME data=$XDG_DATA_HOME config=$XDG_CONFIG_HOME '
                     'cache=$XDG_CACHE_HOME args=$*"\n')

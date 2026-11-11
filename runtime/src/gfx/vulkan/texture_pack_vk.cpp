@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Replacement texture packs in the Vulkan renderer: which guest textures a pack replaces, the larger images made for
 // them, their lifetime and their VRAM budget (docs/superpowers/specs runtime texture adapter, sections 3, 4, 6, 7).

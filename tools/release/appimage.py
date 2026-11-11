@@ -110,14 +110,15 @@ if [ -n "$APPIMAGE" ] && [ -d "$APPIMAGE.data" ]; then
   n=$(basename "$APPIMAGE")
   echo "Found $n.data: this folder is no longer used. Move its contents to $n.home (see the changelog) to keep your saves and settings." >&2
 fi
-exec "$(dirname "$0")/wind-waker-hd" "$@"
+# (VR-WakerHD) wind-waker-hd-vr: the first start prepares the game, later starts open the VR launcher beside it
+exec "$(dirname "$0")/wind-waker-hd-vr" "$@"
 """
 
 DESKTOP = """[Desktop Entry]
 Type=Application
-Name=Wind Waker HD
-Comment=The Wind Waker HD (native PC port); the first start prepares the game from your own disc dump
-Exec=wind-waker-hd
+Name=VR-WakerHD
+Comment=Wind Waker HD in VR; the first start prepares the game from your own game files, later starts open the VR launcher
+Exec=wind-waker-hd-vr
 Icon=wwhd
 Categories=Game;
 Terminal=false
@@ -125,7 +126,7 @@ Actions=setup;
 
 [Desktop Action setup]
 Name=Setup (repair, update, change the game)
-Exec=wind-waker-hd --setup
+Exec=wind-waker-hd-vr --setup
 """
 
 
@@ -278,6 +279,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("pkg", help="the WindWakerHD-VERSION-linux-ARCH folder package.py produced")
     ap.add_argument("--out", required=True, help="where to write the .AppImage")
+    ap.add_argument("--arch", choices=["x86_64", "aarch64"],
+                    help="the package's architecture (default: this machine's); another one is packed with this "
+                    "machine's appimagetool and the target's runtime (2026-11-11: SteamOS aarch64 from x86-64)")
     ap.add_argument("--appimagetool", help="appimagetool to use (default: one on PATH, else the pinned download)")
     ap.add_argument("--runtime-file", help="the pinned AppImage runtime (RUNTIME; default: download it); "
                     "a file with another SHA-256 is refused")
@@ -286,8 +290,8 @@ def main():
     pkg = os.path.normpath(os.path.abspath(a.pkg))
     if not os.path.isfile(os.path.join(pkg, "tools", "installer", "setup.py")):
         sys.exit("%s is not a packaged release (no tools/installer/setup.py)" % pkg)
-    if not os.path.isfile(os.path.join(pkg, "wind-waker-hd")):
-        sys.exit("%s has no wind-waker-hd (package it with --setup-gui)" % pkg)
+    if not os.path.isfile(os.path.join(pkg, "wind-waker-hd-vr")):
+        sys.exit("%s has no wind-waker-hd-vr (package it with --setup-gui)" % pkg)
     if not os.path.isfile(os.path.join(pkg, "portable.txt")):
         sys.exit("%s has no portable.txt: package.py always writes one (the zip is the portable "
                  "release; the AppImage drops it)" % pkg)
@@ -298,8 +302,10 @@ def main():
     os.makedirs(out, exist_ok=True)
     name = os.path.basename(pkg)
     target = os.path.join(out, name + ".AppImage")
-    tool = ensure_appimagetool(a.appimagetool, arch)
-    runtime = ensure_runtime(a.runtime_file, arch)
+    host = arch
+    arch = a.arch or host
+    tool = ensure_appimagetool(a.appimagetool, host)  # (runs here)
+    runtime = ensure_runtime(a.runtime_file, arch)  # (the target's: the first part of the AppImage)
 
     work = tempfile.mkdtemp(prefix="wwhd-appimage-")
     try:

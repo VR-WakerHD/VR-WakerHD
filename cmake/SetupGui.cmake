@@ -40,7 +40,7 @@ set_source_files_properties(${IMGUI_DIR}/backends/imgui_impl_sdl3.cpp ${IMGUI_DI
 if(WIN32)
   # Windows: --console-setup and the bundled Python (tools\python; no download code in this program)
   target_sources(wwhd-setup PRIVATE tools/installer/gui/console_setup_win.cpp)
-  wwhd_windows_resources(wwhd-setup "Wind Waker HD setup and launcher" "Wind Waker HD.exe" gui)
+  wwhd_windows_resources(wwhd-setup "VR-WakerHD setup and launcher" "wind-waker-hd-vr.exe" gui)
   if(WWHD_STRIP_RELEASE)
     target_link_options(wwhd-setup PRIVATE ${WWHD_STRIP_RELEASE})
   endif()

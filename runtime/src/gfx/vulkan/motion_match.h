@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Draws matched across frames (docs/VR_DLSS.md, stage D2): motion vectors need, for each draw, the same draw of the
 // previous displayed frame (its transforms then). A draw is known by what does not change from frame to frame for the

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The guest offsets of one 8x8 micro tile's texels in a TM_2D_TILED_THIN1 surface with one sample, from one address
 // computation per tile (Cemu's AddrLibFastDecode.h): the tile's pipe, bank and macro tile are the same for its 64

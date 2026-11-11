@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The sailing views (docs/VR_SAILING_VIEWS.md): more views while Link sails the King of Red Lions on the Great Sea,
 // chosen with the right stick's click after first and third person: the view on the figurehead's neck, then the Free

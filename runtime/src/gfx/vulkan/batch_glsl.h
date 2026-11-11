@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // A vertex shader's batched variant (issue #1, docs/VR_PERFORMANCE.md "Batched same-state runs"): its translated GLSL,
 // rewritten so that one instanced draw draws a run of the guest's draws that differ only in the addresses of some of

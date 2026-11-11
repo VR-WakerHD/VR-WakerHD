@@ -4,7 +4,7 @@ This repository holds two kinds of code under two licenses.
 
 | Code | License | Text |
 |---|---|---|
-| The VR mode (VR-WakerHD): every file listed in `LICENSES/VR-FILES.txt`, written by Mehrab Kooner. Their source files say so in their first lines (`SPDX-License-Identifier: GPL-3.0-or-later`) | GNU General Public License v3.0 or later, with the additional term below | `LICENSES/GPL-3.0.txt` |
+| The VR mode (VR-WakerHD): every file listed in `LICENSES/VR-FILES.txt`, written by VR-WakerHD (https://github.com/VR-WakerHD/). Their source files say so in their first lines (`SPDX-License-Identifier: GPL-3.0-or-later`) | GNU General Public License v3.0 or later, with the additional term below | `LICENSES/GPL-3.0.txt` |
 | The original Wind Waker HD recompilation project (ZeldaWWHDRecomp) and every other file, including the changes made to its files for the VR mode | Mozilla Public License 2.0 | `LICENSE`, `LICENSES/MPL-2.0.txt` |
 
 The MPL-2.0 files keep their license: the MPL requires that a file under it, and changes to that file, stay under
@@ -25,7 +25,7 @@ As permitted by section 7(b) of the GNU General Public License v3.0, the followi
 VR mode's code:
 
 > Any copy, modified version, or program containing all or part of the VR-WakerHD VR mode must preserve the author
-> attribution **"VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner)"**:
+> attribution **"VR mode by VR-WakerHD (https://github.com/VR-WakerHD/)"**:
 > 1. in the copyright notices of the source files that contain it, which must not be removed or altered; and
 > 2. in the Appropriate Legal Notices of the program, shown where its users can see it: its about or credits screen,
 >    launcher, or the documentation distributed with it.
@@ -33,7 +33,7 @@ VR mode's code:
 > A modified version must also be marked as changed from the original, so that changes are not attributed to the
 > original author.
 
-Copyright (C) 2026 Mehrab Kooner.
+Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/).
 
 The game's own content (its code, art, music and text) belongs to Nintendo and is not covered by either license.
 You need your own copy of the game.

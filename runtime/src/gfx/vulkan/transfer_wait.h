@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The graphics queue's wait for the texture-pack upload thread's copies (texture_pack_vk.cpp): replacement images are
 // filled on a queue family of their own and signal a timeline semaphore; once the host has seen a value reached, the

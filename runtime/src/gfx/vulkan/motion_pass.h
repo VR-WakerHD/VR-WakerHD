@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The motion pass (docs/VR_DLSS.md, stage D2b 2d): per eye, after the scene, the scene's depth-writing draws drawn again
 // with their motion twins (motion_pipeline.h) into a motion target (R16G16 float, the eye's depth size), the eye's

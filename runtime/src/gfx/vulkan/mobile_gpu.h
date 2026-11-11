@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Paths for a mobile, tile-based GPU only: a standalone headset (Quest, other Android builds, the Steam Frame's native
 // build). They are compiled into no other build (Windows and Linux on x64 keep their code as it was: user, 2026-11-02).

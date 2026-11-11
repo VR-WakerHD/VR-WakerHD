@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The view in a Baba Bud (docs/VR_CONTROLS.md, "Baba Buds"; asked for in the headset, 2026-11-03): in first person,
 // Link dropping into a Baba Bud and being shot out of it is shown in third person (the game's camera), and first person

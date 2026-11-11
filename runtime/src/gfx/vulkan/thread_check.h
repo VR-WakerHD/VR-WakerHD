@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // (diagnostics) Which thread uses each shared part of the renderer (WWHD_VK_THREAD_CHECK=1;
 // docs/VR_ATLAS_THREAD.md). Recording the sun atlas on a thread of its own (docs/VR_PERFORMANCE.md, roadmap #1) makes

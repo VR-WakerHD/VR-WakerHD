@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The VR launcher's Install game tab (tools/vr_launcher/game_install.h, extract_runner.h): its decisions on their own,
 // then wwhd-extract run through the same runner on the synthetic disc images and Cemu archive its own tests build

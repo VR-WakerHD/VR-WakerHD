@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The smallest DLL for the game's DLL loader (docs/dll-loader.md): it shows a message box when the game loads it.
 //   x86_64-w64-mingw32-clang -shared -o hello_dll.dll hello_dll.c -luser32

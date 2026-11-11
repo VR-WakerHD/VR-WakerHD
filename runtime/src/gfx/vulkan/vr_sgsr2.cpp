@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // SGSR2: vr_sgsr2.h. The shaders are Qualcomm's Snapdragon Game Super Resolution 2, 2-pass fragment variant
 // (github.com/SnapdragonStudios/snapdragon-gsr, sgsr/v2/include/glsl_2_pass_fs: sgsr2_convert.fs, sgsr2_upscale.fs),

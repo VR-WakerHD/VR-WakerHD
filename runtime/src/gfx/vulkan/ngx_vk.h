@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // NVIDIA NGX on the game's Vulkan device (docs/VR_DLSS.md): finds the driver's NGX core at run time (no NVIDIA
 // library is linked or shipped), starts it on the game's device, asks which DLSS features this GPU and driver offer,

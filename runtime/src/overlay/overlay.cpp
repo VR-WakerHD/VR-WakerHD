@@ -1131,8 +1131,10 @@ void tab_graphics() {
     }
     if (dynres::fixed_applies_at_start())
         help("On this headset a new internal resolution is drawn from the next start.");
+#ifdef WWHD_VR
     if (uint32_t w = 0, h = 0; vr::picture_size(w, h))
         help("In VR the eyes are drawn at the VR tab's Headset resolution; this sets the shadows and other buffers.");
+#endif
 
     heading("Dynamic resolution");
     {
@@ -1657,6 +1659,7 @@ static void pip_percent(const char* label, float value, float minimum, float max
 // VR (docs/VR_MENU.md): the headset's settings, a tab of their own (shown with VR built in and the Vulkan renderer:
 // vr_tab_shown). They were a section of the Graphics tab.
 // the choices shown (DLSS is not one: docs/VR_DLSS.md; a saved "dlss" shows and runs as Auto)
+#ifdef WWHD_VR
 static const vr::upscale::Mode kUpscaleModes[] = {vr::upscale::Mode::Auto, vr::upscale::Mode::Off,
                                                   vr::upscale::Mode::Sgsr1, vr::upscale::Mode::SuperResolution,
                                                   vr::upscale::Mode::Sgsr2, vr::upscale::Mode::Fsr1};
@@ -1668,6 +1671,7 @@ static int upscale_index(vr::upscale::Mode m) {
         if (kUpscaleModes[i] == m) return i;
     return 0;  // (a saved "dlss": Auto)
 }
+#endif
 void tab_vr() {
 #ifdef WWHD_VR
     if (render::g_backend->api == render::Api::Vulkan) {
@@ -3827,7 +3831,7 @@ void tab_about() {
     ImGui::Text("The Legend of Zelda: The Wind Waker HD - native port (%s host, %s renderer)", hostui::name(),
                 render::api_name(render::active()));
     // the VR mode's credit (LICENSE-VR.md: GPL-3.0 section 7(b), shown where players see it)
-    ImGui::Text("VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner), %s. Licenses: the VR mode GPL-3.0 "
+    ImGui::Text("VR mode by VR-WakerHD (https://github.com/VR-WakerHD/), %s. Licenses: the VR mode GPL-3.0 "
                 "(LICENSE-VR.md), the original port MPL-2.0.", build::version());
     if (*build::variant())  // the decomp build (docs/decomp-build.md)
         ImGui::Text("%s (%s), %s build: the game code runs from the decompiled source (experimental)", build::version(),

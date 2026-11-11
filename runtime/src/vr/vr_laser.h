@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The VR aiming laser (docs/VR_AIMING.md): a red beam from the item in the sword hand to where the game's own sight
 // lands (the bow's, the hookshot's, the boomerang's, the grappling hook's target point), and a dot there: bright with

@@ -362,9 +362,29 @@ static std::vector<std::string> g_game_args;         // game options from this p
 static bool launch_game() {
     std::string save = g_data_dir + "/save";
     std::vector<std::string> args = {g_exe, "--game", g_game_dir, "--save", save};
-    args.insert(args.end(), g_game_args.begin(), g_game_args.end());
+    // (VR-WakerHD, 2026-11-11) once the game is prepared this program only opens the VR launcher installed beside the
+    // game (sdk/manifest.json runtime_files), whatever it was given: the launcher starts the game beside it (its
+    // Play VR / Play Flat) with the game files and saves passed here (vr_launcher.cpp --game, --save). Without a
+    // launcher there, or with WWHD_NO_VR_LAUNCHER=1, the game as before
+    bool toLauncher = false;
+    if (!SDL_getenv("WWHD_NO_VR_LAUNCHER")) {
+        const size_t slash = g_exe.find_last_of("/\\");
+#ifdef _WIN32
+        const std::string launcher = g_exe.substr(0, slash + 1) + "wwhd-vr-launcher.exe";
+#else
+        const std::string launcher = g_exe.substr(0, slash + 1) + "wwhd-vr-launcher";
+#endif
+        SDL_PathInfo info;
+        if (slash != std::string::npos && SDL_GetPathInfo(launcher.c_str(), &info)) {
+            SDL_Log("starting the VR launcher %s (game files %s)", launcher.c_str(), g_game_dir.c_str());
+            args = {launcher, "--game", g_game_dir, "--save", save};  // (the game files setup prepared, its saves)
+            g_exe = launcher;
+            toLauncher = true;
+        }
+    }
+    if (!toLauncher) args.insert(args.end(), g_game_args.begin(), g_game_args.end());
     // --vr / --no-vr from the VR launcher (docs/VR_LAUNCHER.md), unless the game options already name one
-    if (!g_vr_flag.empty() && std::find(args.begin(), args.end(), g_vr_flag) == args.end()) args.push_back(g_vr_flag);
+    if (!toLauncher && !g_vr_flag.empty() && std::find(args.begin(), args.end(), g_vr_flag) == args.end()) args.push_back(g_vr_flag);
 #ifdef _WIN32
     auto wide = [](const std::string& u) {
         int n = MultiByteToWideChar(CP_UTF8, 0, u.c_str(), -1, nullptr, 0);

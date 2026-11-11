@@ -1,4 +1,4 @@
-# The VR mode's files (VR-WakerHD, by Mehrab Kooner): GPL-3.0-or-later with the credit term in LICENSE-VR.md.
+# The VR mode's files (VR-WakerHD, https://github.com/VR-WakerHD/): GPL-3.0-or-later with the credit term in LICENSE-VR.md.
 # Every file of this repository not listed here is under the MPL-2.0 (LICENSE).
 CMakePresets.json
 QUEST3_BENCHMARK_RESULTS.md

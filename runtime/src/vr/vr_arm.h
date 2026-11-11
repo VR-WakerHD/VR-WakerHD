@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Link's arm posed towards a tracked controller (docs/VR_FIXES.md, fix 7): the animation's upper arm, forearm
 // and hand joints turned with the two-bone solver (vr_ik.h). Joint frames are J3D joint matrices (3x4, the

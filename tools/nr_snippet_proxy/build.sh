@@ -1,6 +1,6 @@
 #!/bin/sh
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+# Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 # credit required, see LICENSE-VR.md.
 # nvngx.dll_wwhd_nr.dll: the Vulkan forwarding proxy for the DLSS 5 NR model (tools/nr_snippet_proxy).
 # Cross-compiled from Linux; kernel32 is the only Windows library it needs (zig cc supplies the import

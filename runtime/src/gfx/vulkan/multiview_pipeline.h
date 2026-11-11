@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // A guest pipeline's multiview twin (docs/VR_MULTIVIEW.md, stage M4): the same fixed-function state and vertex input,
 // view mask 0b11, and for each stage either its own SPIR-V (nothing per view) or its multiview variant's

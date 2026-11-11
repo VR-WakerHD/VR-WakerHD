@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The VR item wheel's picture (vr_item_wheel_draw.h). Drawn on the CPU: the game's own item icons (read from the
 // player's 2D pack, item_icons::game_icons, on a worker thread the first time), the ring, the highlight, and the

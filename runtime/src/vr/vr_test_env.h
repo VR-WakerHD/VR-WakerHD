@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The Forsaken Fortress VR test environment (docs/VR_TEST_ENVIRONMENT.md): a repeatable place with every item, for
 // validating the VR interactions one test at a time (docs/VR_TEST_REGISTRY.md).

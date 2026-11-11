@@ -31,7 +31,8 @@ public final class GameShortcut {
     /** A game icon can be added. Not on Meta Horizon OS (Quest): its Library accepts a pinned
      *  shortcut but never shows it for a sideloaded app, and shows no pinned widgets. */
     static boolean supported(Context context) {
-        return !horizonOs(context);
+        // (VR-WakerHD, 2026-11-11) not in the VR build: the app's icon opens the VR launcher, which starts the game
+        return !horizonOs(context) && !context.getResources().getBoolean(R.bool.wwhd_vr);
     }
 
     /** The game shortcut (the icon on launchers that can't pin widgets) is on the home screen. */

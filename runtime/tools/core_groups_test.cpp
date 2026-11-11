@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Core groups (runtime/src/platform/core_groups.h): sysfs CPU lists and the layout from a CPU's L3 groups, as on a
 // Ryzen 9 3900X (four L3 groups of three cores, two logical processors a core) and on a CPU with one L3.

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // NVIDIA NGX (DLSS) decisions (runtime/src/gfx/vulkan/ngx_core.h): what the settings may offer for each driver
 // answer, the status line's reasons, the parameter object's slots, and the per-eye features with a fake backend:

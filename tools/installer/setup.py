@@ -2240,8 +2240,17 @@ def launch(state, data_dir, decomp=None, game_args=None):
             # the app's launcher passes its arguments on ("$@", mac_app)
             subprocess.Popen(["open", state["app"]] + (["--args"] + game_args if game_args else []))
             return
-    args = [exe, "--game", state.get("game_dir") or os.path.join(data_dir, "game"), "--save", os.path.join(data_dir, "save")]
-    args += game_args
+    # (VR-WakerHD, 2026-11-11) once the game is prepared, only the VR launcher installed beside it opens: it starts
+    # the game (its Play VR / Play Flat) with the game files and saves passed here. WWHD_NO_VR_LAUNCHER=1: the game
+    vr_launcher = os.path.join(os.path.dirname(exe), "wwhd-vr-launcher" + (".exe" if IS_WIN else ""))
+    if not IS_MAC and os.path.isfile(vr_launcher) and not os.environ.get("WWHD_NO_VR_LAUNCHER"):
+        say("Starting the VR launcher...")
+        # the game files setup prepared and the saves' folder, for its Play VR / Play Flat
+        exe, args = vr_launcher, [vr_launcher, "--game", state.get("game_dir") or os.path.join(data_dir, "game"),
+                                  "--save", os.path.join(data_dir, "save")]
+    else:
+        args = [exe, "--game", state.get("game_dir") or os.path.join(data_dir, "game"), "--save", os.path.join(data_dir, "save")]
+        args += game_args
     if IS_WIN:
         subprocess.Popen(args, cwd=data_dir, creationflags=0x00000008 | 0x00000200)  # DETACHED_PROCESS | NEW_GROUP
     else:
@@ -2252,7 +2261,7 @@ def launch(state, data_dir, decomp=None, game_args=None):
 # portable release: the launcher, an optional shortcut, the compiler download
 
 
-LAUNCHER = {"darwin": "Wind Waker HD.app", "win32": "Wind Waker HD.exe"}.get(sys.platform, "wind-waker-hd")
+LAUNCHER = {"darwin": "Wind Waker HD.app", "win32": "wind-waker-hd-vr.exe"}.get(sys.platform, "wind-waker-hd-vr")
 
 
 def create_shortcut():

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The VR launcher (docs/VR_LAUNCHER.md): sets the VR settings before the game starts and starts it, normally or in
 // VR. SDL3 + Dear ImGui with the SDL_Renderer backend, as the setup program (tools/installer/gui).
@@ -568,9 +568,9 @@ struct Launch {
 } g_launch;
 
 #ifdef _WIN32
-constexpr const char* kGameNames[] = {"wwhd.exe", "Wind Waker HD.exe"};
+constexpr const char* kGameNames[] = {"wwhd.exe", "wind-waker-hd-vr.exe", "Wind Waker HD.exe"};
 #else
-constexpr const char* kGameNames[] = {"wwhd", "wind-waker-hd"};
+constexpr const char* kGameNames[] = {"wwhd", "wind-waker-hd-vr", "wind-waker-hd"};
 #endif
 
 #ifdef __ANDROID__
@@ -657,6 +657,32 @@ std::string find_game(const std::string& configured) {
     }
     return {};
 }
+// (a release, 2026-11-11) the game setup built, installed beside this launcher in <data>/bin: <data>/install.json
+// names its game files ("game_dir", relative to <data> or absolute), as setup starts it (--game, --save <data>/save,
+// in <data>). Empty when this launcher is not in such a folder.
+// (2026-11-11) --game DIR / --save DIR on the launcher's command line: setup passes the player's game files and the
+// saves' folder when it opens the launcher after preparing the game (setup_gui.cpp launch_game, setup.py launch)
+std::string g_argGame, g_argSave;
+std::string installed_game_dir(const std::filesystem::path& data) {
+    std::FILE* f = std::fopen((data / "install.json").string().c_str(), "rb");
+    if (!f) return {};
+    std::string text;
+    char buf[4096];
+    for (size_t n; (n = std::fread(buf, 1, sizeof buf, f)) > 0;) text.append(buf, n);
+    std::fclose(f);
+    const size_t key = text.find("\"game_dir\"");
+    if (key == std::string::npos) return {};
+    size_t i = text.find('"', text.find(':', key) + 1);
+    if (i == std::string::npos) return {};
+    std::string v;
+    for (++i; i < text.size() && text[i] != '"'; ++i) {
+        if (text[i] == '\\' && i + 1 < text.size()) ++i;  // (\\ and \" in a path)
+        v += text[i];
+    }
+    if (v.empty()) return {};
+    const std::filesystem::path p = std::filesystem::u8path(v);
+    return utf8(p.is_absolute() ? p : data / p);
+}
 bool is_game_itself(const std::string& exe) {
     const std::string name = utf8(std::filesystem::u8path(exe).filename());
     return name == "wwhd" || name == "wwhd.exe";
@@ -707,14 +733,28 @@ void start_game(const std::string& exe, const std::string& gameDir, bool vrStart
     // the release's program passes its own arguments on)
     if (!vrStart && is_game_itself(exe)) args.push_back("--no-stereo");
     if (vrTest) args.push_back("--vr-test");  // the Forsaken Fortress test environment (docs/VR_TEST_ENVIRONMENT.md)
-    if (is_game_itself(exe) && !gameDir.empty()) {
-        args.push_back("--game");
-        args.push_back(expand_home(gameDir));
+    std::string cwd = utf8(std::filesystem::u8path(exe).parent_path());
+    if (is_game_itself(exe)) {
+        // the game files: as set here (setup passes them with --game), else those of the game setup installed beside
+        // this launcher (<data>/install.json); the saves: setup's --save, else <data>/save; it runs in <data>, as
+        // setup starts it
+        const auto data = std::filesystem::u8path(exe).parent_path().parent_path();
+        const std::string installed = installed_game_dir(data);
+        const std::string game = !gameDir.empty() ? expand_home(gameDir) : installed;
+        if (!game.empty()) {
+            args.push_back("--game");
+            args.push_back(game);
+        }
+        const std::string save = !g_argSave.empty() ? g_argSave : !installed.empty() ? utf8(data / "save") : std::string();
+        if (!save.empty()) {
+            args.push_back("--save");
+            args.push_back(save);
+        }
+        if (!installed.empty()) cwd = utf8(data);
     }
     std::vector<const char*> argv;
     for (auto& a : args) argv.push_back(a.c_str());
     argv.push_back(nullptr);
-    const std::string cwd = utf8(std::filesystem::u8path(exe).parent_path());
     SDL_PropertiesID props = SDL_CreateProperties();
     SDL_SetPointerProperty(props, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, (void*)argv.data());
     SDL_SetStringProperty(props, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, cwd.c_str());
@@ -760,6 +800,7 @@ void load() {
     S.launcherFile.load(launcher_path(), err);
     S.launcherFile.get("launcher.gameExe", S.gameExe);
     S.launcherFile.get("launcher.gameDir", S.gameDir);
+    if (!g_argGame.empty()) S.gameDir = g_argGame;  // (setup's: the game it just prepared)
     S.savedGameExe = S.gameExe;
     S.savedGameDir = S.gameDir;
     S.runtime = active_runtime();
@@ -2389,6 +2430,7 @@ int check(bool probe, bool dlss, bool saveToo) {
                                                                      : "stays off");
     }
     const std::string exe = find_game(S.gameExe);
+    if (!S.gameDir.empty()) std::printf("game files: %s\n", S.gameDir.c_str());
     std::printf("game: %s%s\n", exe.empty() ? "not found" : exe.c_str(), exe.empty() ? "" : is_game_itself(exe) ? " (the game)" : " (the release's program)");
     std::printf("vr.enabled=%d vr.menuDistance=%.3f vr.menuPlacement=%d vr.refreshRate=%g vr.frameRate=%s\n", int(S.config.enabled),
                 double(S.config.menuDistance), int(S.config.menuPlacement), double(S.config.refreshRate),
@@ -2408,6 +2450,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--probe")) probe = true;
         else if (!std::strcmp(argv[i], "--dlss")) dlss = true;
         else if (!std::strcmp(argv[i], "--check-save")) saveToo = true;
+        else if (!std::strcmp(argv[i], "--game") && i + 1 < argc) g_argGame = argv[++i];
+        else if (!std::strcmp(argv[i], "--save") && i + 1 < argc) g_argSave = argv[++i];
     }
     if (checkMode) return check(probe, dlss, saveToo);
 #ifdef __ANDROID__
@@ -2490,7 +2534,7 @@ int main(int argc, char** argv) {
             ImGui::EndTabBar();
         }
         // the VR mode's credit (LICENSE-VR.md: GPL-3.0 section 7(b), shown where players see it)
-        ImGui::TextDisabled("%s. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner): GPL-3.0 (LICENSE-VR.md); "
+        ImGui::TextDisabled("%s. VR mode by VR-WakerHD (https://github.com/VR-WakerHD/): GPL-3.0 (LICENSE-VR.md); "
                             "the original port: MPL-2.0.", build::version());
         ImGui::Separator();
         ImGui::BeginDisabled(!changed());

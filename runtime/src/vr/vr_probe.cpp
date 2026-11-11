@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // --vr-refresh-probe (docs/VR_FRAME_RATE.md, "Detect Headset"): the headset's refresh rate for the VR launcher's
 // Detect Headset button. OpenXR tells a refresh rate only to a session: the rate it runs (XR_FB_display_refresh_rate,

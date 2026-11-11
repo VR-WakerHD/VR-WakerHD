@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Which of a pipeline's uniform blocks are dynamic uniform buffers (QUEST3_IMPLEMENTATION_ROADMAP.md, 2.1; mobile GPUs
 // only: mobile_gpu.h). Vulkan caps a pipeline layout's dynamic uniform buffers (maxDescriptorSetUniformBuffersDynamic);

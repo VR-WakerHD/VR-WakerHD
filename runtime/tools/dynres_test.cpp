@@ -240,6 +240,7 @@ int main() {
             ++halves;
         }
         CHECK(h.level == 0);
+    }
     // memory (MemoryGuard): line 384 MB, lowest level 4 (0.5x)
     {
         MemoryGuard m;

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // (diagnostics, docs/VR_EYE_PROJECTION.md) the projection each eye's draws actually upload: found in the uniform bytes
 // after the eye shift (an eye's projection has an off-axis x and y and a translation, which stereo::camera_projection

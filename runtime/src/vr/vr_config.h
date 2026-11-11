@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // VR settings (docs/VR_CONTROLS.md): saved with the other settings as "vr.*" key=value lines
 // (hostui::get / hostui::set, the form motion.h uses for "gyro.*"). Every value is validated and clamped;

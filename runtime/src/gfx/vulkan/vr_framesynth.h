@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Frame synthesis and depth for the OpenXR runtime (docs/VR_FRAME_SYNTHESIS.md, vr/vr_framesynth.h): each eye's
 // motion vectors (from the motion pass) and depth (the scene's) written into the session's motion vector and depth

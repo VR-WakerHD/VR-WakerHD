@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // VR upscaling (docs/VR_UPSCALING.md): which upscaler draws each eye's picture into the headset's image. Each eye is
 // drawn at the internal resolution (on a Quest 0.75x of it, dynres.cpp fixed_factor) and was scaled to the swapchain's

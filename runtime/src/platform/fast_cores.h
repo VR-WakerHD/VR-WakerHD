@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The CPU's fastest cores (by their maximum clock in sysfs) and a thread placed on them: Android (a Quest, the Steam
 // Frame's Lepton layer, phones) and Linux on ARM (Steam Frame - Native), whose Snapdragons have a few fast cores

@@ -1,18 +1,16 @@
-# VR-WakerHD
+# ZeldaWWHD-VR
 
 A virtual-reality version of [Zelda: The Wind Waker HD Recomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp),
 the native PC port of *The Legend of Zelda: The Wind Waker HD* (Wii U). It adds an OpenXR VR mode: the view at Link's
 eyes, tracked head and hands, Link's arms following your controllers, a physical sword, a shoulder-reach item wheel,
-and HUD displays on Link's wrists. It is a derivative of the original project (see
+and HUD displays on Link's wrists. It is a derivative of the original project and keeps its history; this repository
+is a standalone private repository with the original as its `upstream` remote, not a GitHub-native fork (see
 [Relationship to the original project](#relationship-to-the-original-project)).
 
-**Download:** the Windows build is on the [Releases](https://github.com/VR-WakerHD/VR-WakerHD/releases) page
-(`VR-WakerHD-Windows-0.5.0.zip`). You need your own copy of the game.
-
 **License.** Two licenses (see [LICENSE-VR.md](LICENSE-VR.md)): the VR mode written for this project (the files in
-`LICENSES/VR-FILES.txt`) is under the **GPL-3.0-or-later, with a credit term**: anyone who
+`LICENSES/VR-FILES.txt`, by VR-WakerHD) is under the **GPL-3.0-or-later, with a credit term**: anyone who
 distributes it, changed or not, must share their program's source under the GPL and keep the credit "VR mode by
-from VR-WakerHD (VR-WakerHD, https://github.com/VR-WakerHD)" in the source and where users see it. The original port's code,
+VR-WakerHD (https://github.com/VR-WakerHD/)" in the source and where users see it. The original port's code,
 including the changes made to its files, stays under the **MPL-2.0** ([LICENSE](LICENSE)).
 
 **No game is included.** This repository contains no game code, no game-disc images, no keys and no game assets. To
@@ -87,11 +85,11 @@ Optional:
 ## Get the source
 
 ```bash
-git clone https://github.com/VR-WakerHD/VR-WakerHD.git VR-WakerHD
+git clone https://github.com/VR-WakerHD/VR-WakerHD.git ZeldaWWHD-VR
 ```
 
 ```bash
-cd VR-WakerHD
+cd ZeldaWWHD-VR
 ```
 
 ```bash
@@ -232,7 +230,7 @@ Optional:
 Then, with Ninja (the recommended generator, as in the original project):
 
 ```bash
-git clone https://github.com/VR-WakerHD/VR-WakerHD.git VR-WakerHD && cd VR-WakerHD
+git clone https://github.com/VR-WakerHD/VR-WakerHD.git ZeldaWWHD-VR && cd ZeldaWWHD-VR
 ```
 
 ```bash
@@ -399,17 +397,16 @@ More: [docs/VR_BUILD_WINDOWS.md](docs/VR_BUILD_WINDOWS.md), [docs/VR_BUILD_LINUX
   - `tools/vr_launcher/`.
 - **Scripted test aids** need no headset. They are described in the docs they belong to, for example
   `WWHD_VR_TEST_WHEEL` and `WWHD_VR_TEST_BODY`.
-- **Contributing:** issues and pull requests are welcome here. Contributions to the VR mode's files are accepted under
-  the GPL-3.0-or-later with its credit term (LICENSE-VR.md).
+- **Contributing:** this is a private repository. Access, issues and changes go through its owner; there is no public
+  issue tracker or release channel for the VR version.
 
 ### Relationship to the original project
 
-VR-WakerHD builds on [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp) (MPL-2.0). This
-repository holds the source of each public release as a snapshot; the original's history is in its own repository.
-- **The original's changes:** add it as a remote and merge, for example:
-  ```bash
-  git remote add upstream https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp.git
-  ```
+ZeldaWWHD-VR builds on [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp) and keeps its full Git
+history; the VR work is a series of commits on top of its `main` (v0.4.0).
+- **Not a native fork:** GitHub does not allow a private fork of a public repository, so this is a standalone private
+  repository rather than a GitHub-native fork.
+- **Upstream remote:** the original is configured as `upstream`. Bring in its changes with:
   ```bash
   git fetch upstream
   ```

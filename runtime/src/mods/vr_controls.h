@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // (VR fork) a start that tries VR (vr::wanted: the setting or --vr): the newer upstream control features
 // (walking direction, camera swing, boat speed, item ring, touch talk, context buttons, one screen) stay off, so

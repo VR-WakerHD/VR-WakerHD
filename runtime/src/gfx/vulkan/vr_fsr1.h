@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // FSR 1 (docs/VR_UPSCALING.md, vr/vr_upscale.h): an eye's picture upscaled into the headset's swapchain image by AMD
 // FidelityFX Super Resolution 1: EASU (edge-adaptive spatial upsampling) into an intermediate image of the output's

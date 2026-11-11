@@ -112,7 +112,7 @@ class WindowsUNC(unittest.TestCase):
         tools.mkdir(parents=True)
         batch = tools / 'Setup in a console window.bat'
         shutil.copyfile(PACKAGE / 'tools/installer/install-windows.bat', batch)
-        shutil.copyfile(fixture, release / 'Wind Waker HD.exe')
+        shutil.copyfile(fixture, release / 'wind-waker-hd-vr.exe')
         result = subprocess.run([os.environ.get('COMSPEC', 'cmd.exe'), '/d', '/c', str(batch)],
                                 cwd=os.environ['SystemRoot'], capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

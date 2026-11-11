@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // A shader's motion variant (docs/VR_DLSS.md, stage D2b): its translated GLSL, rewritten so a draw also writes each
 // pixel's motion since the previous frame. Like the multiview variant (multiview_glsl.h) it leaves the translator's

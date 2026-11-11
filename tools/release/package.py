@@ -119,18 +119,23 @@ MAC_SETUP_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
   <key>NSMicrophoneUsageDescription</key><string>Only when you turn on a code mod's singing option: the sound is analysed for its pitch while you play and never stored or sent.</string>
 </dict></plist>
 """
+# (VR-WakerHD, 2026-11-11) the release's program is wind-waker-hd-vr (Windows: wind-waker-hd-vr.exe): the first start
+# prepares the game, later starts open the VR launcher installed beside the game (setup_gui.cpp launch_game), whose
+# Play VR / Play Flat start it
+LINUX_EXE = "wind-waker-hd-vr"
+WINDOWS_EXE = "wind-waker-hd-vr.exe"
 LINUX_SETUP_DESKTOP = """[Desktop Entry]
 Type=Application
-Name=Wind Waker HD
-Comment=The Wind Waker HD (native PC port); the first start prepares the game from your own disc dump
-Exec=sh -c 'cd "$(dirname "%k")" && exec ./wind-waker-hd'
+Name=VR-WakerHD
+Comment=Wind Waker HD in VR; the first start prepares the game from your own game files, later starts open the VR launcher
+Exec=sh -c 'cd "$(dirname "%k")" && exec ./wind-waker-hd-vr'
 Terminal=false
 Categories=Game;
 Actions=setup;
 
 [Desktop Action setup]
 Name=Setup (repair, update, change the game)
-Exec=sh -c 'cd "$(dirname "%k")" && exec ./wind-waker-hd --setup'
+Exec=sh -c 'cd "$(dirname "%k")" && exec ./wind-waker-hd-vr --setup'
 """
 
 
@@ -145,13 +150,13 @@ def add_setup_gui(pkg, platform, exe, version):
         if shutil.which("codesign"):  # ad-hoc: seals the bundle (not a developer signature)
             subprocess.run(["codesign", "--force", "--deep", "-s", "-", os.path.join(pkg, SETUP_APP + ".app")], check=True)
     elif platform.startswith("windows"):
-        copy(exe, os.path.join(pkg, SETUP_APP + ".exe"))
+        copy(exe, os.path.join(pkg, WINDOWS_EXE))
     else:
-        copy(exe, os.path.join(pkg, "wind-waker-hd"))
-        os.chmod(os.path.join(pkg, "wind-waker-hd"), 0o755)
-        with open(os.path.join(pkg, SETUP_APP + ".desktop"), "w") as f:
+        copy(exe, os.path.join(pkg, LINUX_EXE))
+        os.chmod(os.path.join(pkg, LINUX_EXE), 0o755)
+        with open(os.path.join(pkg, "VR-WakerHD.desktop"), "w") as f:
             f.write(LINUX_SETUP_DESKTOP)
-        os.chmod(os.path.join(pkg, SETUP_APP + ".desktop"), 0o755)
+        os.chmod(os.path.join(pkg, "VR-WakerHD.desktop"), 0o755)
 VENDORED_LICENSES = {
     "Cemu (MPL-2.0)": "runtime/third_party/cemu/LICENSE.txt",
     "Dear ImGui (MIT)": "runtime/third_party/imgui/LICENSE.txt",
@@ -571,6 +576,7 @@ def main():
     ap.add_argument("--target", choices=["steamframe-native"],
                     help="a device target of the platform, named in the package and its manifest: steamframe-native "
                     "(Steam Frame - Native, linux-aarch64 for SteamOS arm64; docs/VR_STEAM_FRAME.md)")
+    ap.add_argument("--name", help="the package's folder and zip name (default WindWakerHD-VERSION-PLATFORM)")
     ap.add_argument("--no-rando", action="store_true", help="leave out the in-app randomizer (a build without -DWWHD_RANDO=ON)")
     ap.add_argument("--no-zip", action="store_true")
     a = ap.parse_args()
@@ -583,6 +589,8 @@ def main():
     variant = decomp_variant(build)
     name = "WindWakerHD-%s-%s%s%s" % (a.version, a.platform, "-" + variant if variant else "",
                                       "-" + a.target if a.target else "")
+    if a.name:
+        name = a.name
     pkg = os.path.join(os.path.abspath(a.out), name)
     if os.path.exists(pkg):
         shutil.rmtree(pkg)
@@ -663,9 +671,9 @@ def main():
     if a.platform.startswith("macos"):
         copy(os.path.join(inst, "install-macos.command"), os.path.join(pkg, "tools", "Setup in Terminal.command"))
     elif a.platform.startswith("windows"):
-        # runs "Wind Waker HD.exe --console-setup", which runs setup.py with the bundled Python
+        # runs "wind-waker-hd-vr.exe --console-setup", which runs setup.py with the bundled Python
         if not a.setup_gui:
-            sys.exit("windows: --setup-gui is required (tools/Setup in a console window.bat runs Wind Waker HD.exe)")
+            sys.exit("windows: --setup-gui is required (tools/Setup in a console window.bat runs wind-waker-hd-vr.exe)")
         if not a.windows_python:
             sys.exit("windows: --windows-python is required (the setup runs with the bundled Python)")
         add_windows_python(pkg, a.windows_python, a.platform)
@@ -678,6 +686,9 @@ def main():
 
     if a.setup_gui:
         add_setup_gui(pkg, a.platform, a.setup_gui, a.version)
+    # the VR launcher goes beside the game (a --runtime-file): later starts open it (setup_gui.cpp launch_game)
+    if not any(os.path.basename(f).startswith("wwhd-vr-launcher") for f in a.runtime_file):
+        print("note: no --runtime-file wwhd-vr-launcher: the program starts the game, not the VR launcher")
 
     copy(os.path.join(ROOT, "README.md"), os.path.join(pkg, "README.md"))
     copy(os.path.join(ROOT, "CHANGELOG.md"), os.path.join(pkg, "CHANGELOG.md"))
@@ -715,9 +726,9 @@ def main():
     with open(os.path.join(licdir, "README.txt"), "w") as f:
         f.writelines(index)
     with open(os.path.join(pkg, "VERSION.txt"), "w") as f:
-        f.write("Wind Waker HD native PC port %s (%s)\n"
+        f.write("VR-WakerHD %s (%s), the VR version of the Wind Waker HD native PC port\n" % (a.version, a.platform) +
                 "This package contains no game code, game data or keys; the installer builds the game\n"
-                "from your own disc dump on your machine.\n" % (a.version, a.platform))
+                "from your own disc dump on your machine.\n")
 
     print("packaged %s: %d runtime objects, %d libraries, %d gamecode flags" % (name, nobj, nlib, len(cflags)))
     if not a.no_zip:

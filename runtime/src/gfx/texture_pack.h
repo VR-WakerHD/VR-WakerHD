@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // Replacement texture packs at run time: the registry of every enabled "textures" package's index.json (Key ->
 // DDS file, texture_pack_core.h) and the background thread that reads and checks the DDS files the renderer asks for.

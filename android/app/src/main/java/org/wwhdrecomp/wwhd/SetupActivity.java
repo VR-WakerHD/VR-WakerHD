@@ -168,7 +168,7 @@ public class SetupActivity extends Activity {
         detail.setPadding(0, gap / 2, 0, gap);
         layout.addView(detail);
         // Play first: once a game is ready it is the main action
-        play = button(layout, getString(R.string.setup_play), () -> startActivity(QuestActivity.gameIntent(this)));
+        play = button(layout, getString(R.string.setup_play), this::playAfterSetup);
         button(layout, "Share log", () -> LogShare.share(this));
         play.setTextSize(20);
         play.setTextColor(0xFFFFFFFF);
@@ -925,4 +925,22 @@ public class SetupActivity extends Activity {
         }, "wwhd-setup-check").start();
     }
     @Override protected void onPause() { handler.removeCallbacks(refresh); super.onPause(); }
+
+    /** Play: the game; in the VR build (R.bool.wwhd_vr) the VR launcher (VrLauncherActivity, the vr flavor's first
+     *  screen), which starts the game with its settings (2026-11-11: setup returns to the launcher once the game is
+     *  ready). The launcher closes when it opens setup, so it starts again here and sees the prepared game. */
+    private void playAfterSetup() {
+        if (getResources().getBoolean(R.bool.wwhd_vr)) {
+            Intent launcher = new Intent().setClassName(this, "org.wwhdrecomp.wwhd.VrLauncherActivity")
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+            try {
+                startActivity(launcher);
+                finish();
+                return;
+            } catch (android.content.ActivityNotFoundException e) {
+                android.util.Log.w("WWHD", "setup: no VR launcher, starting the game: " + e);
+            }
+        }
+        startActivity(QuestActivity.gameIntent(this));
+    }
 }

@@ -20,7 +20,7 @@ class RuntimeLicenses(unittest.TestCase):
         os.makedirs(os.path.join(pkg, "third-party-licenses"))
         with open(os.path.join(pkg, "third-party-licenses", "README.txt"), "w") as f:
             f.write("Third-party software in this package and its license files:\n")
-        with open(os.path.join(pkg, "wind-waker-hd"), "w") as f:
+        with open(os.path.join(pkg, "wind-waker-hd-vr"), "w") as f:
             f.write("#!/bin/sh\n")
         self.appdir = os.path.join(self.tmp.name, "AppDir")
         appimage.make_appdir(pkg, self.appdir)

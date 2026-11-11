@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // gfx/vulkan/detile_fast.h: the micro tile offsets of the fast texture decode equal the address library's per-texel
 // ComputeSurfaceAddrFromCoordMacroTiledCached for every texel of TM_2D_TILED_THIN1 surfaces with one sample, across

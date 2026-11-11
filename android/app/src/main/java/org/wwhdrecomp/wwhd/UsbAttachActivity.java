@@ -16,7 +16,10 @@ public class UsbAttachActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
-        startActivity(QuestActivity.gameIntent(this).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+        // (VR-WakerHD, 2026-11-11) the VR build starts the game only from the VR launcher; a running game takes
+        // the controller through SDL as it is
+        if (!getResources().getBoolean(R.bool.wwhd_vr))
+            startActivity(QuestActivity.gameIntent(this).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
         finish();
     }
 }

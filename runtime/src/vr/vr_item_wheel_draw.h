@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The VR item wheel's picture (docs/VR_ITEM_WHEEL.md): what the game thread shows (vr_game.cpp set_wheel) and the
 // picture the render thread puts in its quad layer (vr_vulkan.cpp). The picture is drawn on the CPU once per change

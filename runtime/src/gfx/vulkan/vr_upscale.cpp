@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The SGSR1 pass: vr_upscale.h. The fragment shader is Qualcomm's Snapdragon Game Super Resolution 1
 // (github.com/SnapdragonStudios/snapdragon-gsr, sgsr/v1/include/glsl/sgsr1_shader_mobile_edge_direction.frag),

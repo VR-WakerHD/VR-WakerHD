@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // The previous frame's draw data (runtime/src/gfx/vulkan/motion_store.h): slots per draw and eye, lookups through the
 // match as each draw is keyed (without the vertex buffer), new draws, the capacity, the budget, and frames turning over.

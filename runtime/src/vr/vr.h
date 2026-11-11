@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Copyright (C) 2026 Mehrab Kooner. VR mode by Mehrab Kooner (VR-WakerHD, https://github.com/mkooner):
+// Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // VR mode (docs/VR_ARCHITECTURE.md): the state shared by the game thread (vr_game.cpp: camera, input,
 // sword) and the render thread (gfx/vulkan/vr_vulkan.cpp: Vulkan binding, swapchains, frame loop).
