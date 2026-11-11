@@ -132,7 +132,9 @@ public class SetupActivity extends Activity {
                 !getIntent().getBooleanExtra(EXTRA_SHOW_SETUP, false) && readyToPlay())) {
             launchingGame = true;
             CrashReports.offer(this, () -> {
-                startActivity(QuestActivity.gameIntent(this));
+                // (VR-WakerHD) the VR build: the game installed, the icon opens the VR launcher, which starts it
+                Intent launcher = vrLauncherIntent();
+                startActivity(launcher != null ? launcher : QuestActivity.gameIntent(this));
                 finish();
             });
             return;
@@ -929,10 +931,16 @@ public class SetupActivity extends Activity {
     /** Play: the game; in the VR build (R.bool.wwhd_vr) the VR launcher (VrLauncherActivity, the vr flavor's first
      *  screen), which starts the game with its settings (2026-11-11: setup returns to the launcher once the game is
      *  ready). The launcher closes when it opens setup, so it starts again here and sees the prepared game. */
+    /** The VR launcher (the vr flavor's VrLauncherActivity) in a task of its own, or null outside the VR build. */
+    private Intent vrLauncherIntent() {
+        if (!getResources().getBoolean(R.bool.wwhd_vr)) return null;
+        return new Intent().setClassName(this, "org.wwhdrecomp.wwhd.VrLauncherActivity")
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+    }
+
     private void playAfterSetup() {
-        if (getResources().getBoolean(R.bool.wwhd_vr)) {
-            Intent launcher = new Intent().setClassName(this, "org.wwhdrecomp.wwhd.VrLauncherActivity")
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+        Intent launcher = vrLauncherIntent();
+        if (launcher != null) {
             try {
                 startActivity(launcher);
                 finish();
