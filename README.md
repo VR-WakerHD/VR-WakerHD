@@ -7,7 +7,7 @@ and HUD displays on Link's wrists. It is a derivative of the original project (s
 [Relationship to the original project](#relationship-to-the-original-project)).
 
 **Download:** the Windows build is on the [Releases](https://github.com/VR-WakerHD/VR-WakerHD/releases) page
-(`VR-WakerHD-Windows-0.50.zip`). You need your own copy of the game.
+(`VR-WakerHD-Windows-0.5.0.zip`). You need your own copy of the game.
 
 **License.** Two licenses (see [LICENSE-VR.md](LICENSE-VR.md)): the VR mode written for this project (the files in
 `LICENSES/VR-FILES.txt`, by Mehrab Kooner) is under the **GPL-3.0-or-later, with a credit term**: anyone who
