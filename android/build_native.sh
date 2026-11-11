@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# Builds the native libraries of the Android app (arm64-v8a) with the NDK: the game as libmain.so,
+# with SDL3, glslang, zlib and LZ4 built in the same CMake run from the pinned sources (URL + SHA-256)
+# of cmake/WindowsDependencies.cmake (WWHD_BUNDLED_DEPS; SDL 3.4.18, the version of the app's SDL
+# Java files), and copies libmain.so, libSDL3.so, libc++_shared.so and libyaz0.so (shader preparation's
+# decoder) to android/app/libs/arm64-v8a
+# for Gradle (cd android && ./gradlew assembleRelease).
+#
+# usage: android/build_native.sh
+# env:   ANDROID_SDK (default $ANDROID_HOME or $ANDROID_SDK_ROOT, else the SDK's usual place:
+#        ~/Library/Android/sdk, ~/Android/Sdk, C:/Android/Sdk), NDK_VERSION (default 30.0.16248370),
+#        JOBS (default 8), GEN_DIR (default build/gen), OUT (default android/build),
+#        ABI (default arm64-v8a; x86_64 for emulator CI),
+#        WWHD_VERSION (the version the port reports and checks mods against; release.yml passes the
+#        release or development version, else it comes from git describe),
+#        QUEST_THEATER (default ON; OFF also needs Gradle -PwwhdQuestTheater=false),
+#        CPU (default generic: any arm64 phone; quest3 for a VR=1 build without a TARGET. CPU=oryon-1 tunes for the
+#        Snapdragon 8 Elite, e.g. Galaxy S25, where the port was measured; the APK then runs only on that CPU family.
+#        CPU=quest3: Meta Quest 3's Snapdragon XR2 Gen 2, -march=armv8.2-a (what both of its core types run) tuned
+#        for its Cortex-A78-class cores (the user's choice of 2026-11-03: the VR build's default; not yet measured on
+#        the headset); CPU=generic in a VR build: none of it),
+#        LTO (default 0; 1 for a VR=1 build without a TARGET: ThinLTO across the game code and the runtime, CMake
+#        WWHD_LTO; LTO=0 turns it off),
+#        PGO (default none: no profile. PGO=generate: an instrumented build in its own folder (game-vr-pgo-gen), which
+#        writes captures/wwhd-pgo-<pid>.profraw in the app's folder as it runs (slower: for a training session only);
+#        PGO=<file.profdata>: optimized with that profile, merged with the NDK's own llvm-profdata:
+#        $ANDROID_HOME/ndk/<version>/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-profdata merge -o quest.profdata *.profraw),
+#        VR (default 0: the phone build. VR=1 builds VR through OpenXR in, for standalone headsets such as
+#        Meta Quest 3 (docs/VR_ANDROID.md); its own build folder (game-vr), and the APK then needs the app's VR
+#        variant: cd android && ./gradlew -PwwhdVr assembleVrRelease),
+#        TARGET (default none; steamframe-lepton: Steam Frame - Lepton, docs/VR_STEAM_FRAME.md: VR=1 for Lepton's
+#        Android 11, API 30, its own build folder (game-steamframe-lepton) and app/libs-steamframe-lepton, for
+#        ./gradlew -PwwhdVr assembleSteamframeLeptonRelease)
+# The game code in build/gen is generated from your own game (tools/recomp/recomp.py) and stays on
+# your machine; the APK built from it contains it and must not be distributed. CI builds this with
+# placeholder code (tools/recomp/stubgen.py) only to check that it compiles.
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+root="$(cd "$here/.." && pwd)"
+case "$(uname -s)" in
+Darwin) host=darwin-x86_64; exe=; default_sdk="$HOME/Library/Android/sdk" ;;
+Linux) host=linux-x86_64; exe=; default_sdk="$HOME/Android/Sdk" ;;
+MINGW* | MSYS* | CYGWIN*) host=windows-x86_64; exe=.exe; default_sdk="C:/Android/Sdk" ;;
+*) echo "unsupported host $(uname -s)"; exit 2 ;;
+esac
+sdk="${ANDROID_SDK:-${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$default_sdk}}}"
+ndk="$sdk/ndk/${NDK_VERSION:-30.0.16248370}"
+[ -f "$ndk/build/cmake/android.toolchain.cmake" ] || { echo "no NDK at $ndk (sdkmanager --install \"ndk;${NDK_VERSION:-30.0.16248370}\")"; exit 1; }
+jobs="${JOBS:-8}"
+abi="${ABI:-arm64-v8a}"
+case "$abi" in
+arm64-v8a) target_triple=aarch64-linux-android ;;
+x86_64) target_triple=x86_64-linux-android ;;
+*) echo "unsupported Android ABI: $abi"; exit 2 ;;
+esac
+api=33  # Android 13: Vulkan 1.3 phones ship 13 or newer (Android 12/13 functions: platform/android_late_api.h)
+target="${TARGET:-}"
+case "$target" in
+"") ;;
+steamframe-lepton) api=30; VR=1 ;;  # Lepton v3.0.5: LineageOS 11 (RQ3A), Android 11
+*) echo "unknown TARGET: $target (steamframe-lepton)"; exit 2 ;;
+esac
+# CMake and Ninja: from PATH, else the SDK's newest
+cmake="$(command -v cmake || true)"
+[ -n "$cmake" ] || cmake="$(ls -d "$sdk"/cmake/*/bin 2>/dev/null | tail -1)/cmake$exe"
+ninja="$(command -v ninja || true)"
+[ -n "$ninja" ] || ninja="$(dirname "$cmake")/ninja$exe"
+vr="${VR:-0}"
+out="${OUT:-$here/build}/game"
+[ "$vr" = 1 ] && out="$out-vr"
+[ -n "$target" ] && out="${OUT:-$here/build}/game-$target"
+pgo="${PGO:-}"
+[ "$pgo" = generate ] && out="$out-pgo-gen"
+# a standalone headset's VR build (Quest, Android XR; not a TARGET such as Lepton): tuned for the Quest 3 and ThinLTO
+# by default (the user's choice, 2026-11-03), each turned off with CPU=generic or LTO=0
+vr_default=0
+[ "$vr" = 1 ] && [ -z "$target" ] && vr_default=1
+if [ "$vr_default" = 1 ]; then cpu="${CPU:-quest3}"; lto="${LTO:-1}"; else cpu="${CPU:-generic}"; lto="${LTO:-0}"; fi
+flags=()
+# (a VR build names its flags every time: CMake keeps them in the build folder's cache, so CPU=generic or LTO=0 there
+# would otherwise keep the last build's)
+if [ "$vr_default" = 1 ] && [ "$cpu" = generic ]; then flags=("-DCMAKE_C_FLAGS=" "-DCMAKE_CXX_FLAGS="); fi
+if [ "$cpu" = quest3 ]; then
+    # (the game code keeps -ffp-contract=off, CMakeLists.txt: the tuning never contracts its floating point)
+    flags=("-DCMAKE_C_FLAGS=-march=armv8.2-a -mtune=cortex-a78" "-DCMAKE_CXX_FLAGS=-march=armv8.2-a -mtune=cortex-a78")
+elif [ "$cpu" != generic ]; then flags=("-DCMAKE_C_FLAGS=-mcpu=$cpu" "-DCMAKE_CXX_FLAGS=-mcpu=$cpu"); fi
+if [ "$lto" = 1 ]; then flags+=(-DWWHD_LTO=ON); elif [ "$vr_default" = 1 ]; then flags+=(-DWWHD_LTO=OFF); fi
+if [ "$vr" = 1 ]; then flags+=(-DWWHD_ANDROID_VR=ON); else flags+=(-DWWHD_ANDROID_VR=OFF); fi
+# (named every time, as LTO: the build folder's cache would keep the last profile)
+if [ "$pgo" = generate ]; then flags+=(-DWWHD_PGO_GENERATE=ON "-DWWHD_PGO_USE=")
+elif [ -n "$pgo" ]; then
+    [ -f "$pgo" ] || { echo "no profile at $pgo"; exit 1; }
+    flags+=(-DWWHD_PGO_GENERATE=OFF "-DWWHD_PGO_USE=$(cd "$(dirname "$pgo")" && pwd)/$(basename "$pgo")")
+else flags+=(-DWWHD_PGO_GENERATE=OFF "-DWWHD_PGO_USE="); fi
+[ "$target" = steamframe-lepton ] && flags+=(-DWWHD_STEAM_FRAME_LEPTON=ON)
+if [ -n "${WWHD_VERSION:-}" ]; then flags+=("-DWWHD_VERSION=$WWHD_VERSION"); fi
+
+echo "== game (libmain.so), NDK $(basename "$ndk"), API $api, CPU $cpu$([ "$lto" = 1 ] && echo ", ThinLTO")$([ -n "$pgo" ] && echo ", PGO $pgo")$([ "$vr" = 1 ] && echo ", VR (OpenXR)")${target:+, target $target}"
+mkdir -p "$out"
+"$cmake" -S "$root" -B "$out" -G Ninja "-DCMAKE_MAKE_PROGRAM=$ninja" \
+    "-DCMAKE_TOOLCHAIN_FILE=$ndk/build/cmake/android.toolchain.cmake" "-DANDROID_ABI=$abi" \
+    "-DANDROID_PLATFORM=android-$api" -DANDROID_STL=c++_shared -DCMAKE_BUILD_TYPE=Release \
+    -DWWHD_BUNDLED_DEPS=ON "-DWWHD_QUEST_THEATER=${QUEST_THEATER:-$([ "$vr" = 1 ] && echo OFF || echo ON)}" \
+    "-DGEN_DIR=${GEN_DIR:-$root/build/gen}" ${flags[@]+"${flags[@]}"} > "$out.log"
+# (the VR build opens its own OpenXR session: the Quest theater's is left out unless QUEST_THEATER=ON)
+targets=(wwhd wwhd_yaz0)
+[ "$vr" = 1 ] && targets+=(vrlauncher wwhd-extract)  # the VR launcher (the app's first screen) and its extractor
+"$cmake" --build "$out" -j "$jobs" --target "${targets[@]}" >> "$out.log" 2>&1 || { tail -40 "$out.log"; exit 1; }
+libs="$here/app/libs/$abi"
+[ -n "$target" ] && libs="$here/app/libs-$target/$abi"  # (the flavor's own folder: android/app/build.gradle)
+mkdir -p "$libs"
+bin="$ndk/toolchains/llvm/prebuilt/$host"
+"$bin/bin/llvm-strip$exe" --strip-unneeded "$out/libmain.so" -o "$libs/libmain.so"  # 400 MB -> 52 MB
+cp "$(find "$out/_deps" -name libSDL3.so -print -quit)" "$libs/"
+# the Yaz0 decoder shaderprep.py loads (ctypes) to prepare shaders on the phone
+"$bin/bin/llvm-strip$exe" --strip-unneeded "$out/libyaz0.so" -o "$libs/libyaz0.so"
+cp "$bin/sysroot/usr/lib/$target_triple/libc++_shared.so" "$libs/"
+# VR=1 (docs/VR_ANDROID.md, "The VR launcher"): the launcher's library, and wwhd-extract for its Install game tab, in
+# the native-library folder (the one place an app may run a program), named as the app's setup names it. A phone
+# build leaves neither in app/libs
+if [ "$vr" = 1 ]; then
+    "$bin/bin/llvm-strip$exe" --strip-unneeded "$out/libvrlauncher.so" -o "$libs/libvrlauncher.so"
+    "$bin/bin/llvm-strip$exe" --strip-unneeded "$out/wwhd-extract" -o "$libs/libwwhd-extract-driver.so"
+else
+    rm -f "$libs/libvrlauncher.so" "$libs/libwwhd-extract-driver.so"
+fi
+# libadrenotools loads these hooks by soname from ApplicationInfo.nativeLibraryDir.
+if [ "$abi" = arm64-v8a ]; then  # libadrenotools is arm64-only
+    for hook in main_hook hook_impl file_redirect_hook gsl_alloc_hook; do
+        hook_file="$(find "$out/_deps" -name "lib${hook}.so" -print -quit)"
+        [ -n "$hook_file" ] || { echo "missing AdrenoTools hook: $hook"; exit 1; }
+        cp "$hook_file" "$libs/"
+    done
+fi
+ls -la "$libs"

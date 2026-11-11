@@ -1,0 +1,230 @@
+// Dynamic resolution: the decision logic (no clocks, no renderer), shared by both renderers through
+// dynres.cpp and tested on its own (runtime/tools/dynres_test.cpp).
+//
+// The idea comes from GreenNaugahyde's Android fork (v0.9.5): when the GPU holds the game below its
+// frame rate, render at a lower resolution; when it has room again, go back up. The renderers here
+// keep the images of recently used scales (no reallocation when the scale returns to one of them), so
+// the scale moves through a few fixed levels of the chosen internal resolution rather than in free
+// 0.05 steps: 1, 7/8, 3/4, 5/8 and 1/2 give whole-pixel sizes at the game's 1280x720.
+//
+// Input: one measurement window (about half a second): wall time, frames presented, GPU busy time
+// (the union of the command buffers' GPU intervals) and the frame rate the game aims for.
+// Busy share = GPU busy time / wall time. GPU-bound = the game misses its frame rate (< 95 %) while
+// the GPU is busy more than 90 % of the time: one level down (always one: the renderers keep only the
+// images of the levels next to the current one, so a one-level change needs no new images).
+// A game held back by the CPU leaves the GPU idle, so the resolution stays.
+// Going up: when the share predicted at the next level (pixels grow with the square of the scale)
+// stays under 80 % for two windows in a row, and the last step down is at least `hold` ago. The hold
+// starts at 2 s and doubles (up to 32 s) when a step up had to be undone within 4 s, so the scale
+// does not swing back and forth; 30 s without a step down resets it. The window after a change is
+// not judged (its frames were partly at the old scale).
+//
+// VR (vr.dynamicResolution, docs/VR_DYNAMIC_RESOLUTION.md): the same controller with a highest level too (the most
+// it draws: Custom's maximum), and its GPU target (the busy share that counts as overloaded; up at 10 points under it)
+// and its first hold (the settle time) from the profile. Their defaults are the constants above: the flat game's
+// behaviour does not change.
+#pragma once
+#include <algorithm>
+#include <cmath>
+
+namespace dynres {
+
+constexpr float kLevels[] = {1.0f, 0.875f, 0.75f, 0.625f, 0.5f};
+constexpr int kLevelCount = int(sizeof kLevels / sizeof kLevels[0]);
+
+// the highest level allowed by a maximum factor (the level at or under it; 0 or >= 1: level 0)
+inline int highest_level(float maxFactor) {
+    if (!(maxFactor > 0.0f) || maxFactor >= 1.0f) return 0;
+    for (int i = 0; i < kLevelCount; i++)
+        if (kLevels[i] <= maxFactor + 1e-4f) return i;
+    return kLevelCount - 1;
+}
+
+// the lowest level allowed by a minimum factor (0 or anything >= 1: level 0 only, i.e. off)
+inline int lowest_level(float minFactor) {
+    if (!(minFactor > 0.0f) || minFactor >= 1.0f) return 0;
+    int lo = 0;
+    for (int i = 0; i < kLevelCount; i++)
+        if (kLevels[i] >= minFactor - 1e-4f) lo = i;
+    return lo;
+}
+
+// The measurement window's length (s): half a second, or a quarter in VR at half the headset's rate (2026-11-03: 36 fps
+// at 72 Hz, 45 at 90; a late frame there costs two refreshes, so an overload is found and stepped down from in half the
+// time, 9 frames at 36 fps). hz: the headset's refresh rate (0: not in VR). The way up keeps its pace: it needs the same
+// second of room (room_windows), and its hold is in seconds
+constexpr double kWindowSeconds = 0.5, kHalfRateWindowSeconds = 0.25;
+inline double window_seconds(double targetFps, int hz) {
+    return hz > 0 && targetFps > 0 && targetFps <= hz / 2.0 + 1.0 ? kHalfRateWindowSeconds : kWindowSeconds;
+}
+// windows of room in a row before a step up: a second of them (2 half-second windows, as before; 4 quarter ones)
+inline int room_windows(double windowSeconds) {
+    return std::max(2, int(std::lround(2.0 * kWindowSeconds / std::max(0.05, windowSeconds))));
+}
+
+struct Window {
+    double seconds = 0;     // wall time of the window
+    double busyMs = 0;      // GPU busy time in it (<= 0: no GPU timing, no decision)
+    int frames = 0;         // frames presented in it
+    double targetFps = 30;  // the frame rate the game aims for
+    double budgetMs = 0;    // test switch: GPU budget per frame (> 0 replaces the busy share test)
+};
+
+struct Decision {
+    int level = 0;
+    bool changed = false;
+    bool judged = false;  // false: the window was skipped (paused, settling, no timing)
+    double share = -1, fps = 0;
+};
+
+struct Controller {
+    static constexpr double kDownShare = 0.90, kUpShare = 0.80, kMissed = 0.95;
+    static constexpr double kHoldBase = 2.0, kHoldMax = 32.0, kUndoneWithin = 4.0, kHoldReset = 30.0;
+    static constexpr double kLongWindow = 2.0;  // longer: paused, in the background or loading
+    int level = 0, lowest = 0, highest = 0;  // (highest <= level <= lowest; level 0 is the largest)
+    double downShare = kDownShare, upShare = kUpShare, holdBase = kHoldBase;  // (tune: VR profiles)
+    double hold = kHoldBase;
+    double sinceDown = 1e9, sinceUp = 1e9;
+    int room = 0;
+    int roomWindows = 2;  // windows of room in a row before a step up (room_windows; set per window by the caller)
+    bool settle = false;
+    int upperLimit = 0;  // the highest-resolution level a step up may reach (MemoryGuard::cap; a tight memory: the level)
+
+    void reset(int lowestLevel, int highestLevel = 0) {
+        const double d = downShare, u = upShare, h = holdBase;
+        *this = Controller{};
+        downShare = d, upShare = u, holdBase = hold = h;
+        set_range(lowestLevel, highestLevel);
+        level = highest;  // (starts at the most it may draw)
+    }
+    void set_lowest(int lowestLevel) { set_range(lowestLevel, highest); }
+    // the levels it may use; the current one moved into them
+    void set_range(int lowestLevel, int highestLevel) {
+        lowest = std::clamp(lowestLevel, 0, kLevelCount - 1);
+        highest = std::clamp(highestLevel, 0, lowest);
+        level = std::clamp(level, highest, lowest);
+    }
+    // the GPU target (busy share counted as overloaded, 0.5..0.98; up at 10 points under it) and the first hold (s)
+    void tune(double gpuTarget, double holdSeconds) {
+        downShare = std::clamp(gpuTarget, 0.5, 0.98);
+        upShare = downShare - 0.10;
+        holdBase = std::clamp(holdSeconds, 0.5, kHoldMax);
+        hold = std::max(hold, holdBase);
+    }
+    float factor() const { return kLevels[level]; }
+    // a forced level (test schedule): counts as a change (the next window is not judged)
+    void force(int l) {
+        l = std::clamp(l, 0, kLevelCount - 1);
+        if (l != level) settle = true;
+        level = l;
+    }
+
+    Decision decide(const Window& w) {
+        Decision d;
+        d.level = level;
+        if (w.seconds <= 0) return d;
+        sinceDown += w.seconds;
+        sinceUp += w.seconds;
+        if (sinceDown > kHoldReset) hold = holdBase;
+        d.fps = w.frames / w.seconds;
+        const bool budget = w.budgetMs > 0;
+        if (w.frames > 0 && w.busyMs > 0)
+            d.share = budget ? (w.busyMs / w.frames) / w.budgetMs : w.busyMs / (w.seconds * 1000.0);
+        if (w.seconds > kLongWindow || w.frames < 3 || d.share < 0) { room = 0; return d; }
+        if (settle) { settle = false; room = 0; return d; }
+        d.judged = true;
+        const double target = w.targetFps > 0 ? w.targetFps : 30.0;
+        const bool missed = budget || d.fps < target * kMissed;
+        const int before = level;
+        if (missed && d.share > (budget ? 1.0 : downShare)) {
+            room = 0;
+            if (level < lowest) {
+                // one level at a time: the renderers keep the images of the neighbouring levels only
+                level = std::min(lowest, level + 1);
+                if (sinceUp < kUndoneWithin) hold = std::min(kHoldMax, hold * 2);
+                sinceDown = 0;
+            }
+        } else if (level > std::max(highest, upperLimit)) {  // (VR range, memory cap)
+            const double r = double(kLevels[level - 1]) / kLevels[level];
+            const double predicted = d.share * r * r;
+            room = predicted < upShare ? room + 1 : 0;
+            if (room >= std::max(2, roomWindows) && sinceDown >= hold) {
+                level--;
+                sinceUp = 0;
+                room = 0;
+            }
+        } else {
+            room = 0;
+        }
+        if (level != before) settle = true;
+        d.level = level;
+        d.changed = level != before;
+        return d;
+    }
+};
+
+// Memory (Android): when the room above the system's low-memory line falls under `line` MB, the scale goes down a
+// level (at most every second; under half the line straight to the lowest level) and that level becomes the upper
+// limit; no step up while the room is under twice the line. The limit goes back up one level per 10 s once the room
+// stayed above twice the line for a minute (and the last step down is a minute ago). Devices with little memory
+// keep the limit at the level that keeps the 3D view at 1x at most, and start there.
+// A Tegra X1 (3 GB) at 2x was ended by the low-memory killer after 13 min while the scale swung back and forth.
+// From GreenNaugahyde/ZeldaWWHDRecompAndroid v0.9.9 (db65d60, runtime/src/vk/vk_dynres.cpp memory_step), MPL-2.0;
+// here in this file's levels (one level is about the fork's two 0.05 steps).
+struct MemoryGuard {
+    static constexpr double kDownEvery = 1.0, kRoomFor = 60.0, kUpEvery = 10.0;
+    int cap = 0;           // the highest-resolution level allowed (0: no limit)
+    int floor = 0;         // the limit never goes above this level (devices with little memory: 1x at most)
+    double sinceDown = 1e9, sinceUp = 1e9, room = -1;  // room: seconds with room above twice the line (-1: none)
+
+    // the level for a scale base * kLevels[level] of 1x at most (low-memory devices), within 0..lowest
+    static int one_x_level(float base, int lowest) {
+        int l = 0;
+        while (l < lowest && base * kLevels[l] > 1.0f + 1e-4f) l++;
+        return l;
+    }
+    void start_capped(int level) { cap = floor = level; sinceDown = 0; room = -1; }
+    // one measurement (`seconds` since the last), `headroomMb` < 0: unknown (nothing changes). Returns the level
+    // to use now given the current one; the controller is not to go above `cap`.
+    int step(double seconds, int headroomMb, int lineMb, int level, int lowest) {
+        sinceDown += seconds;
+        sinceUp += seconds;
+        if (headroomMb < 0 || lineMb <= 0) return std::max(level, cap);
+        if (headroomMb < lineMb) {
+            room = -1;
+            const bool far = headroomMb < lineMb / 2;
+            if (!far && sinceDown < kDownEvery) return std::max(level, cap);
+            const int to = far ? lowest : std::min(lowest, level + 1);
+            if (to != level) sinceDown = 0;
+            cap = std::max(cap, to);
+            return to;
+        }
+        if (headroomMb < 2 * lineMb) { room = -1; return std::max(level, cap); }
+        if (cap > floor) {
+            room = room < 0 ? 0 : room + seconds;
+            if (room >= kRoomFor && sinceDown >= kRoomFor && sinceUp >= kUpEvery) {
+                cap--;
+                sinceUp = 0;
+            }
+        }
+        return std::max(level, cap);
+    }
+    bool tight(int headroomMb, int lineMb) const { return headroomMb >= 0 && headroomMb < 2 * lineMb; }
+};
+
+// GPU busy time from command buffer intervals that may overlap or come out of order: each interval
+// adds only the time no earlier one covered (intervals arrive roughly in submission order).
+struct BusyUnion {
+    double lastEnd = 0;
+    double busyNs = 0;
+    void add(double startNs, double endNs) {
+        if (!(endNs > startNs)) return;
+        if (endNs + 1e9 < lastEnd) lastEnd = 0;  // the clock went back (new device, counter wrap)
+        if (startNs < lastEnd) startNs = lastEnd;
+        if (endNs > startNs) busyNs += endNs - startNs;
+        if (endNs > lastEnd) lastEnd = endNs;
+    }
+    double take() { double b = busyNs; busyNs = 0; return b; }
+};
+
+}  // namespace dynres

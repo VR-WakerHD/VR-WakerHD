@@ -1,0 +1,91 @@
+# Windows build check: builds the Vulkan/SDL3 runtime with MSYS2's CLANG64 toolchain against
+# placeholder guest code (tools/recomp/stubgen.py; no game files involved) and runs the unit
+# tests. The runner has no Vulkan driver, so the renderer smoke test is not run here.
+name: windows
+
+on:
+  push:
+    branches: ["**"]   # not on tag pushes: a release tag points at a commit CI already tested
+  pull_request:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: msys2/setup-msys2@v2
+        id: msys2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-python-pillow
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-lz4
+            mingw-w64-clang-x86_64-zlib
+
+      - name: Configure
+        run: |
+          python tools/recomp/stubgen.py build/gen-stub
+          cmake -S . -B build/windows -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DGEN_DIR="$PWD/build/gen-stub"
+
+      - name: Build
+        run: cmake --build build/windows
+
+      - name: Unit tests
+        run: ctest --test-dir build/windows --output-on-failure
+
+      # The in-app randomizer's command (tools/rando: TWWHD Randomizer 1.2.0); no game files
+      - name: Randomizer command
+        run: |
+          cmake -S tools/rando -B build/rando -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+          cmake --build build/rando
+          python tools/rando/test_rando_cli.py build/rando
+          python tools/rando/test_places.py
+
+      # Synthetic fixtures only: no game files, caches or performance runs.
+      - name: Shader preparation and benchmark tooling unit tests
+        run: |
+          python tools/test_shaderprep.py
+          python -m unittest discover -s tools/bench -p "test_*.py"
+
+      # Issue #144: setup unpacks the compiler with \\?\ paths and stops early in a folder too deep for the
+      # game. MSYS2's Python joins paths with "/" and keeps ordinary paths (setup.NATIVE_WINDOWS_PATHS);
+      # the release's kind of Python (python.org, backslashes) really crosses MAX_PATH in the deep unpack test.
+      # CompilerUnpack (issue #388): the unpack progress and the player-facing errors on Windows.
+      - name: Installer long path unit tests (MSYS2 Python)
+        run: python tools/installer/test_setup.py LongPaths CompilerUnpack
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Installer long path unit tests (python.org Python, as in the release)
+        shell: pwsh
+        run: python tools/installer/test_setup.py LongPaths CompilerUnpack
+
+      - name: Shader generation and console setup on local UNC share
+        shell: pwsh
+        env:
+          WWHD_UNC_CONSOLE_FIXTURE: ${{ github.workspace }}/build/windows/unc_console_fixture.exe
+        run: python tools/installer/test_unc_setup.py
+
+      - name: Atomic code-mod status publication (release Python)
+        shell: pwsh
+        run: |
+          python tools/installer/test_setup.py AtomicReplace
+          # the MSYS2 CLANG64 test reader needs its runtime DLLs; appended, so "python" stays python.org's
+          $env:PATH = "$env:PATH;${{ steps.msys2.outputs.msys2-location }}\clang64\bin"
+          python tools/installer/test_code_mods_io.py build/windows/code_mods_io_test.exe

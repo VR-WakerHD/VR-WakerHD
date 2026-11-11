@@ -1,0 +1,524 @@
+#include "../renderer.h"
+// Settings overlay on the SDL host (Vulkan-only builds: Windows, Linux, Android): hostui.h on top of
+// the SDL windows and the Vulkan renderer's settings. Options are kept in <config dir>/settings.ini
+// (key=value lines; WWHD_SETTINGS names another file; test runs with WWHD_NO_HOST_INPUT use none).
+// The GamePad screen modes are the AppKit host's (gfx/display_modes.cpp): the GamePad window is shown
+// in window mode and hidden in the others, which draw the GamePad picture into the TV window.
+#ifdef WWHD_SDL_HOST
+#include "backend.h"
+#include "gfx/display_modes.h"
+#include "settings.h"
+#include "stereo.h"
+#include "input.h"
+#include "interp.h"
+#include "framegen.h"
+#include "overlay/hostui.h"
+#include "platform/host.h"
+#include "platform/perf_hint.h"
+#include "platform/heat_guard.h"
+#include "platform/dual_display.h"
+#include "runtime.h"
+#include "platform/gaming_mode.h"
+#include "platform/touch_options.h"
+#include <SDL3/SDL.h>
+#include <algorithm>
+#include <atomic>
+#include <cctype>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <mutex>
+#include <vector>
+
+
+namespace hostui {
+namespace {
+std::mutex g_mu;
+std::vector<std::function<void()>> g_posted;
+std::map<std::string, std::string> g_values;
+bool g_loaded = false;
+// Missing keys mean never chosen. Legacy keys are retained as player choices;
+// incidental PiP saves must never materialize an automatic mode default.
+bool g_mode_chosen = false;
+bool g_last_fullscreen = false;
+
+std::string path() {
+    if (const char* e = getenv("WWHD_SETTINGS")) return e;
+    if (getenv("WWHD_NO_HOST_INPUT")) return {};  // test runs leave the user's settings alone
+    return host::config_dir() + "/settings.ini";
+}
+void load_locked() {
+    if (g_loaded) return;
+    g_loaded = true;
+    std::string p = path();
+    if (p.empty()) return;
+    std::ifstream in(p);
+    std::string line;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        size_t eq = line.find('=');
+        if (eq != std::string::npos) g_values[line.substr(0, eq)] = line.substr(eq + 1);
+    }
+}
+void save_locked() {
+    std::string p = path();
+    if (p.empty()) return;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(p).parent_path(), ec);
+    std::string tmp = p + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::trunc);
+        out << "# Wind Waker HD settings (settings overlay, Esc or F1)\n";
+        for (auto& [k, v] : g_values) out << k << '=' << v << '\n';
+        if (!out) return;
+    }
+    if (!host::replace_file(tmp, p)) LOG("[settings] cannot write %s", p.c_str());
+}
+bool env_set(std::initializer_list<const char*> env) {
+    for (const char* e : env)
+        if (getenv(e)) return true;
+    return false;
+}
+// the GamePad screen options, as the AppKit host keeps them in display.plist (same keys; the mode's
+// WWHD_DRC_MODE and the overlay's WWHD_DRC_PIP win and are not saved)
+void save_display_locked() {
+    using namespace gfx;
+    if (g_mode_chosen && !env_set({"WWHD_DRC_MODE", "WWHD_TEST_DRC_MODE"})) g_values["drcMode"] = kModeNames[display_saved_mode()];
+    if (!env_set({"WWHD_DRC_PIP"})) {
+        char v[16];
+        g_values["pipAnchor"] = kAnchorNames[g_pip_anchor];
+        snprintf(v, sizeof v, "%g", g_pip_x.load());
+        g_values["pipX"] = v;
+        snprintf(v, sizeof v, "%g", g_pip_y.load());
+        g_values["pipY"] = v;
+        snprintf(v, sizeof v, "%g", g_pip_size.load());
+        g_values["pipSize"] = v;
+        snprintf(v, sizeof v, "%g", g_pip_opacity.load());
+        g_values["pipOpacity"] = v;
+    }
+#ifdef __ANDROID__
+    g_values["androidSecondScreenOff"] = g_second_screen_off ? "1" : "0";
+#endif
+    save_locked();
+}
+void save_display() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    load_locked();
+    save_display_locked();
+}
+// show or hide the GamePad window to match the mode (main thread)
+void apply_drc_window() {
+    SDL_Window* w = gfxvk::R.drc.window;
+    if (!w) w = gfxvk::ensure_gamepad_window(gfx::drc_window_wanted());
+    if (!w) return;
+    const bool want = gfx::drc_window_wanted();
+    const bool shown = !(SDL_GetWindowFlags(w) & SDL_WINDOW_HIDDEN);
+    if (want && !shown && !getenv("WWHD_HIDDEN_WINDOWS")) {
+        SDL_ShowWindow(w);
+        gfxvk::R.drc.visible = true;
+    } else if (!want && shown) {
+        if (SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN) SDL_SetWindowFullscreen(w, false);
+        SDL_HideWindow(w);
+        gfxvk::R.drc.visible = false;
+    }
+}
+}  // namespace
+
+void post(std::function<void()> fn) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_posted.push_back(std::move(fn));
+}
+void choose_file(const char* title, const char* extension, bool folder, std::function<void(std::string)> chosen) {
+    (void)title;
+    const std::string ext = extension ? extension : "";
+    post([ext, folder, chosen] {
+        auto callback = new std::function<void(std::string)>(chosen);
+        auto done = [](void* context, const char* const* files, int) {
+            auto fn = static_cast<std::function<void(std::string)>*>(context);
+            if (files && files[0]) (*fn)(files[0]);
+            delete fn;
+        };
+        if (folder) SDL_ShowOpenFolderDialog(done, callback, nullptr, nullptr, false);
+        else if (!ext.empty()) {
+            static std::string pattern;
+            pattern = ext;
+            static SDL_DialogFileFilter filter[1];
+            filter[0] = {ext == "dll" ? "DLL" : "Model", pattern.c_str()};
+            SDL_ShowOpenFileDialog(done, callback, nullptr, filter, 1, nullptr, false);
+        } else
+            SDL_ShowOpenFileDialog(done, callback, nullptr, nullptr, 0, nullptr, false);
+    });
+}
+void choose_mod_source(bool folder, std::function<void(std::string)> chosen) {
+    post([folder, chosen] {
+        auto callback = new std::function<void(std::string)>(chosen);
+        auto done = [](void* context, const char* const* files, int) {
+            auto fn = static_cast<std::function<void(std::string)>*>(context);
+            if (files && files[0]) (*fn)(files[0]);
+            delete fn;
+        };
+        if (folder) SDL_ShowOpenFolderDialog(done, callback, nullptr, nullptr, false);
+        else SDL_ShowOpenFileDialog(done, callback, nullptr, nullptr, 0, nullptr, false);
+    });
+}
+void choose_save_folder(std::function<void(std::string)> chosen) {
+    post([chosen] {
+        auto callback = new std::function<void(std::string)>(chosen);
+        auto done = [](void* context, const char* const* files, int) {
+            auto fn = static_cast<std::function<void(std::string)>*>(context);
+            if (files && files[0]) (*fn)(files[0]);
+            delete fn;
+        };
+        SDL_ShowOpenFolderDialog(done, callback, nullptr, nullptr, false);
+    });
+}
+void choose_game_source(bool folder, std::function<void(std::string)> chosen) {
+    post([folder, chosen] {
+        auto callback = new std::function<void(std::string)>(chosen);
+        auto done = [](void* context, const char* const* files, int) {
+            auto fn = static_cast<std::function<void(std::string)>*>(context);
+            if (files && files[0]) (*fn)(files[0]);
+            delete fn;
+        };
+        if (folder) SDL_ShowOpenFolderDialog(done, callback, nullptr, nullptr, false);
+        else {
+            static const SDL_DialogFileFilter filter[]={ {"GameCube disc image", "iso;gcm;rvz"} };
+            SDL_ShowOpenFileDialog(done, callback, nullptr, filter, 1, nullptr, false);
+        }
+    });
+}
+// SDL main loop (backend.cpp run_main_loop)
+void run_posted() {
+    std::vector<std::function<void()>> fns;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        fns.swap(g_posted);
+    }
+    for (auto& f : fns) f();
+}
+
+bool get(const char* key, std::string& value) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    load_locked();
+    auto it = g_values.find(key);
+    if (it == g_values.end()) return false;
+    value = it->second;
+    return true;
+}
+void set(const char* key, const std::string& value) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    load_locked();
+    g_values[key] = value;
+    save_locked();
+}
+
+float res_scale() { return gfxvk::requested_res_scale(); }
+void set_res_scale(float s) { gfxvk::set_res_scale(s); }
+// the graphics options are saved as the AppKit host saves them (an option's WWHD_* variable wins and
+// is not saved)
+void graphics_changed() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    load_locked();
+    auto put = [&](const char* key, std::initializer_list<const char*> env, const std::string& v) {
+        if (!env_set(env)) g_values[key] = v;
+    };
+    char res[16];
+    snprintf(res, sizeof res, "%g", gfxvk::requested_res_scale());
+    put("resScale", {"WWHD_RES_SCALE"}, res);
+    put("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"}, std::to_string(gfxvk::ao_mode()));
+    put("aoHires", {"WWHD_AO_HIRES"}, gfxvk::ao_hires_enabled() ? "1" : "0");
+    put("aniso", {"WWHD_ANISO"}, gfxvk::aniso_flat_enabled() ? "1" : "0");
+    put("anisoVR", {"WWHD_ANISO"}, gfxvk::aniso_vr_enabled() ? "1" : "0");  // (VR's own, since 2026-11-08: settings.cpp)
+    put("bloomStrength", {"WWHD_BLOOM_STRENGTH"}, std::to_string(render::bloom_strength()));
+    put("horizonHaze", {"WWHD_HORIZON_HAZE", "WWHD_SKY_HAZE"}, std::to_string(render::horizon_haze()));
+    put("cloudShadows", {"WWHD_CLOUD_SHADOWS"}, render::cloud_shadows() ? "1" : "0");
+    put("fullLight", {"WWHD_FULL_LIGHT"}, render::full_light() ? "1" : "0");
+    put("cloudStyle", {"WWHD_CLOUD_STYLE"}, std::to_string(render::cloud_style()));
+    put("fxaa", {"WWHD_FXAA"}, gfxvk::fxaa_enabled() ? "1" : "0");
+#ifdef __ANDROID__
+    // the player's choice: the phone pauses interpolation by itself (platform/perf_hint.cpp)
+    put("fps60", {"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"}, perf_hint::fps60_chosen() ? "1" : "0");
+    // Graphics > Heat guard: normal | relaxed | off
+    put("heatGuard", {"WWHD_HEAT_GUARD"}, heat_guard::name(heat_guard::to_setting(heat_guard::choice.load())));
+#else
+    put("fps60", {"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"}, std::to_string(interp::mode()));
+#endif
+    // (fps60 is the mode, from before 120/240 fps; interpFps the interpolation's frame rate)
+    put("interpFps", {"WWHD_INTERP_FPS"}, std::to_string(interp::fps()));
+    put("fpsGenerated", {"WWHD_FRAMEGEN"}, framegen::chosen() ? "1" : "0");  // 60 fps (generated, framegen.h)
+    put("fps60Paced", {"WWHD_INTERP_PACED"}, interp::paced_interpolation_at(60) ? "1" : "0");
+    put("fpsHighPaced", {"WWHD_INTERP_PACED"}, interp::paced_interpolation_at(120) ? "1" : "0");
+    put("scaleFilter", {"WWHD_SCALE_FILTER"}, std::to_string(gfxvk::scale_filter()));
+    put("vkPresentMode", {"WWHD_VK_PRESENT_MODE"}, std::to_string(gfxvk::present_mode()));
+    put("vkDevice", {"WWHD_VK_DEVICE"}, gfxvk::device_setting());
+    save_locked();
+}
+// Called before creating windows: retain legacy keys as explicit choices.
+int startup_drc_mode() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    load_locked();
+    g_mode_chosen = g_values.count("drcMode") != 0;
+    int mode = gfx::find_name(gfx::kModeNames, gfx::kDrcModeCount,
+        g_mode_chosen ? g_values["drcMode"].c_str() : nullptr, gfx::g_mode);
+    mode = gaming_mode::defaults(gaming_mode::active() && !getenv("WWHD_NO_GAMEPAD"),
+        mode, g_mode_chosen, false, false).mode;
+    if (const char* e = getenv("WWHD_DRC_MODE"))
+        mode = gfx::find_name(gfx::kModeNames, gfx::kDrcModeCount, e, mode);
+    return mode;
+}
+#ifndef __ANDROID__
+// SDL defers fullscreen changes on hidden windows until they are shown. This
+// lets hidden Gaming Mode runs exercise the real request without taking focus.
+bool apply_startup_fullscreen(bool saved) {
+    SDL_Window* tv = gfxvk::R.tv.window;
+    if (!tv) return false;
+    const bool hidden = SDL_GetWindowFlags(tv) & SDL_WINDOW_HIDDEN;
+    const bool wanted = gfx::display_fullscreen_env() ? atoi(getenv("WWHD_FULLSCREEN")) != 0 : saved;
+    const bool apply = gfx::display_start_fullscreen(saved, hidden) ||
+        (hidden && gaming_mode::active() && wanted);
+    const bool requested = apply && SDL_SetWindowFullscreen(tv, true);
+    if (hidden && requested)
+        LOG("[display] TV full screen requested while hidden; SDL defers the switch until shown");
+    // Startup ENTER events describe the default, not a player choice.
+    g_last_fullscreen = requested || fullscreen();
+    return requested;
+}
+#endif
+// start-up (backend.cpp init): the saved graphics options
+void load_saved_options() {
+    std::map<std::string, std::string> v;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        load_locked();
+        v = g_values;
+    }
+    auto saved = [&](const char* key, std::initializer_list<const char*> env) { return !env_set(env) && v.count(key); };
+    auto num = [&](const char* key) { return atof(v[key].c_str()); };
+#ifdef __ANDROID__
+    if (saved("touchButtons", {})) gfx::g_touch_buttons = std::clamp((int)num("touchButtons"), 0, 2);
+    if (saved("touchControls", {})) gfx::g_touch_controls = num("touchControls") != 0;
+    touch_options::load(v);
+#endif
+    gfxvk::load_saved_stereo_hdr();  // shared with the AppKit host (init_appkit)
+    if (saved("resScale", {"WWHD_RES_SCALE"})) gfxvk::set_res_scale((float)num("resScale"));
+    if (saved("aoMode", {"WWHD_AO_MODE", "WWHD_NO_AO_QUIRK"})) gfxvk::set_ao_mode((int)num("aoMode"));
+    if (saved("aoHires", {"WWHD_AO_HIRES"})) gfxvk::set_ao_hires(num("aoHires") != 0);
+    if (saved("aniso", {"WWHD_ANISO"})) gfxvk::set_aniso_flat(num("aniso") != 0);
+    if (saved("anisoVR", {"WWHD_ANISO"})) gfxvk::set_aniso_vr(num("anisoVR") != 0);
+    if (saved("bloomStrength", {"WWHD_BLOOM_STRENGTH"})) render::set_bloom_strength((float)num("bloomStrength"));
+    if (saved("horizonHaze", {"WWHD_HORIZON_HAZE", "WWHD_SKY_HAZE"})) render::set_horizon_haze((float)num("horizonHaze"));
+    if (saved("cloudShadows", {"WWHD_CLOUD_SHADOWS"})) render::set_cloud_shadows(num("cloudShadows") != 0);
+    if (saved("fullLight", {"WWHD_FULL_LIGHT"})) render::set_full_light(num("fullLight") != 0);
+    if (saved("cloudStyle", {"WWHD_CLOUD_STYLE"})) render::set_cloud_style((int)num("cloudStyle"));
+    if (saved("fxaa", {"WWHD_FXAA"})) gfxvk::set_fxaa(num("fxaa") != 0);
+    if (saved("interpFps", {"WWHD_INTERP_FPS"})) interp::set_fps((int)num("interpFps"));
+    if (saved("fps60", {"WWHD_INTERP", "WWHD_TRUE60", "WWHD_INTERP_FPS"})) interp::set_mode((int)num("fps60"));
+    if (saved("fpsGenerated", {"WWHD_FRAMEGEN"})) framegen::set_chosen(num("fpsGenerated") != 0);  // (after fps60: it clears it)
+    if (saved("fps60Paced", {"WWHD_INTERP_PACED"})) interp::load_paced_interpolation_at(60, num("fps60Paced") != 0);
+    if (saved("fpsHighPaced", {"WWHD_INTERP_PACED"})) interp::load_paced_interpolation_at(120, num("fpsHighPaced") != 0);
+    if (saved("scaleFilter", {"WWHD_SCALE_FILTER"})) gfxvk::set_scale_filter((int)num("scaleFilter"));
+    if (saved("vkPresentMode", {"WWHD_VK_PRESENT_MODE"})) gfxvk::set_present_mode((int)num("vkPresentMode"));
+#ifdef __ANDROID__
+    if (saved("heatGuard", {"WWHD_HEAT_GUARD"})) heat_guard::choice = heat_guard::parse(v["heatGuard"].c_str());
+    if (v.count("androidSwapDisplays")) dual_display::requested_swap = num("androidSwapDisplays") != 0;
+    gfx::load_second_screen_off(v.count("androidSecondScreenOff") && num("androidSecondScreenOff") != 0);
+#endif
+    // GamePad screen (display_modes.h); the start-up test overrides after the saved choices
+    using namespace gfx;
+    g_mode = startup_drc_mode();
+    if (v.count("drcMode") && !gaming_mode::active()) {
+        const int m = find_name(kModeNames, kDrcModeCount, v["drcMode"].c_str(), g_mode);
+        if (drc_mode_offered(m)) g_mode = m;
+    }
+    g_pip_anchor = pip_load_anchor(v.count("pipAnchor") ? v["pipAnchor"].c_str() : nullptr,
+                                   v.count("pipCorner") ? v["pipCorner"].c_str() : nullptr);
+    if (v.count("pipX")) g_pip_x = pip_clamp((float)num("pipX"), 0, 1, 0.5f);
+    if (v.count("pipY")) g_pip_y = pip_clamp((float)num("pipY"), 0, 1, 0.5f);
+    if (v.count("pipSize")) g_pip_size = pip_clamp_size((float)num("pipSize"));
+    if (v.count("pipOpacity")) g_pip_opacity = pip_clamp_opacity((float)num("pipOpacity"));
+    display_env_overrides();
+    if (!drc_mode_offered(g_mode) && g_mode == kDrcWindow) g_mode = kDrcOff;  // no GamePad window (WWHD_NO_GAMEPAD, Android)
+    g_shown = !input::pro_controller();  // Pro Controller: GamePad screen starts hidden (as on macOS)
+    apply_drc_window();
+    LOG("[display] GamePad screen mode: %s%s", kModeNames[g_mode], g_shown ? "" : " (hidden)");
+#ifndef __ANDROID__  // always full screen there
+    // TV window: full screen as it was left (tv_fullscreen_changed); test runs with hidden windows
+    // only log it
+    const auto defaults = gaming_mode::defaults(gaming_mode::active(), g_mode, true,
+        v.count("tvFullScreen") && v.at("tvFullScreen") == "1", v.count("tvFullScreen") != 0);
+    apply_startup_fullscreen(defaults.fullscreen);
+    if (const char* reason = gaming_mode::reason()) {
+        int window_count = 0;
+        SDL_Window** windows = SDL_GetWindows(&window_count);
+        SDL_free(windows);
+        LOG("[display] Gaming Mode detected (%s): GamePad %s (%s), TV %s (%s); SDL windows: %d", reason,
+            kModeNames[g_mode], getenv("WWHD_NO_GAMEPAD") ? "WWHD_NO_GAMEPAD" :
+            getenv("WWHD_DRC_MODE") ? "WWHD_DRC_MODE" : g_mode_chosen ? "saved choice" : "Gaming Mode default",
+            (display_fullscreen_env() ? atoi(getenv("WWHD_FULLSCREEN")) != 0 : defaults.fullscreen) ? "full screen" : "windowed",
+            display_fullscreen_env() ? "WWHD_FULLSCREEN" : v.count("tvFullScreen") ? "saved choice" : "Gaming Mode default", window_count);
+    }
+#endif
+}
+
+int scale_filter() { return gfxvk::scale_filter(); }
+void set_scale_filter(int f) {
+    gfxvk::set_scale_filter(f);
+    graphics_changed();
+}
+bool scale_filter_available() { return gfxvk::graphics_feature_available(gfxvk::GraphicsFeature::ScaleFilter); }
+#ifdef __ANDROID__
+bool displays_swapped() { return dual_display::requested_swap; }
+void set_displays_swapped(bool swapped) {
+    dual_display::requested_swap = swapped;
+    set("androidSwapDisplays", swapped ? "1" : "0");
+}
+#endif
+
+bool fullscreen() { return gfxvk::R.tv.window && (SDL_GetWindowFlags(gfxvk::R.tv.window) & SDL_WINDOW_FULLSCREEN); }
+void set_fullscreen(bool on) {
+    if (!gfxvk::R.tv.window) return;
+    if (!SDL_SetWindowFullscreen(gfxvk::R.tv.window, on)) {
+        LOG("[display] TV window: full screen %s failed: %s", on ? "on" : "off", SDL_GetError());
+        return;
+    }
+#ifndef __ANDROID__
+    // An explicit choice counts even when the window already has that state.
+    // Save the requested state: SDL may finish the transition asynchronously.
+    g_last_fullscreen = on;
+    if (!gfx::display_fullscreen_env()) set("tvFullScreen", on ? "1" : "0");
+#endif
+}
+// full screen is remembered for the next start, as display.plist does on macOS (same key): saved
+// whenever the TV window's state differs from the saved one, whichever way it changed (F11, Alt+Enter,
+// the overlay, the window manager); a session started with WWHD_FULLSCREEN does not save it
+void tv_fullscreen_changed() {
+#ifndef __ANDROID__
+    if (gfx::display_fullscreen_env() || !gfxvk::R.tv.window) return;
+    const bool state = fullscreen();
+    if (state == g_last_fullscreen) return;
+    g_last_fullscreen = state;
+    const std::string on = state ? "1" : "0";
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        load_locked();
+        auto it = g_values.find("tvFullScreen");
+        if ((it == g_values.end() ? std::string("0") : it->second) == on) return;
+        g_values["tvFullScreen"] = on;
+        save_locked();
+    }
+    LOG("[display] TV window full screen %s: remembered for the next start", on == "1" ? "on" : "off");
+#endif
+}
+// the GamePad screen modes of display_modes.h (as the AppKit host's Display menu)
+int drc_modes() { return gfx::kDrcModeCount; }
+bool drc_mode_offered(int m) {
+#ifdef __ANDROID__
+    return gfx::drc_mode_offered(m);  // no SDL GamePad window: "window" is the second display (#222)
+#else
+    return m == gfx::kDrcWindow ? gfxvk::gamepad_window_available() : gfx::drc_mode_offered(m);
+#endif
+}
+int drc_mode() { return gfx::g_mode; }
+void set_drc_mode(int m) {
+    if (!drc_mode_offered(m)) return;
+    g_mode_chosen = true;
+    gfx::display_set_mode(m);
+    apply_drc_window();
+    save_display();
+    LOG("[display] GamePad screen mode: %s", gfx::kModeNames[m]);
+}
+void save_pip_position() { save_display(); }
+int pip_anchor() { return gfx::g_pip_anchor; }
+void set_pip_anchor(int c) {
+    gfx::g_pip_anchor = std::clamp(c, 0, int(gfx::kPipCustom));
+    save_display();
+}
+float pip_size() { return gfx::g_pip_size; }
+void set_pip_size(float s) {
+    gfx::g_pip_size = gfx::pip_clamp_size(s);
+    save_display();
+}
+float pip_opacity() { return gfx::g_pip_opacity; }
+void set_pip_opacity(float o) {
+    gfx::g_pip_opacity = gfx::pip_clamp_opacity(o);
+    save_display();
+}
+bool drc_available() {
+#ifdef __ANDROID__
+    if (gfx::g_second_display_available) return true;
+#endif
+    return gfxvk::R.drc.window != nullptr || gfx::g_mode == gfx::kDrcPip || gfx::g_mode == gfx::kDrcAuto;
+}
+bool drc_shown() {
+#ifdef __ANDROID__
+    if (gfx::g_second_display_available) return !gfx::drc_screen_off();
+#endif
+    SDL_Window* w = gfxvk::R.drc.window;
+    return gfx::drc_screen_shown(w && !(SDL_GetWindowFlags(w) & SDL_WINDOW_HIDDEN));
+}
+// show / hide the GamePad screen in the current mode (overlay, Ctrl+G, Pro Controller choice)
+void show_drc(bool on) {
+    gfx::display_show_drc(on);
+    apply_drc_window();
+#ifdef __ANDROID__
+    save_display();  // the second screen's on/off is remembered (#222)
+#endif
+    LOG("[display] GamePad screen %s (%s)", on ? "shown" : "hidden", gfx::kModeNames[gfx::g_mode]);
+}
+void toggle_drc() { show_drc(!drc_shown()); }
+void drc_window_closed() {
+    if (gfx::g_mode == gfx::kDrcWindow) gfx::g_shown = false;
+    apply_drc_window();
+}
+void set_pro_controller(bool on) {
+    // as on macOS: the GamePad screen follows the choice
+    input::set_pro_controller(on);
+    show_drc(!on);
+}
+// Settings > Quit Game: as closing the TV window. SDL_PushEvent runs the event watches at once (the rumble
+// stops, platform/input_sdl.cpp); the renderer's loop then quits (quit_game in backend.cpp).
+static std::atomic<bool> g_quit_from_menu{false};
+void quit() {
+    g_quit_from_menu = true;
+    SDL_Event event{};
+    event.type = SDL_EVENT_QUIT;
+    if (!SDL_PushEvent(&event)) LOG("[quit] cannot post the quit event: %s", SDL_GetError());
+}
+bool quit_from_menu() { return g_quit_from_menu; }
+
+const char* name() { return "SDL"; }
+void set_clipboard(const std::string& text) { SDL_SetClipboardText(text.c_str()); }
+#ifdef __ANDROID__
+bool can_open_folder() { return false; }  // app-private storage: no file manager shows it
+void open_folder(const std::string&) {}
+#else
+bool can_open_folder() { return true; }
+void open_folder(const std::string& path) {
+    // file URL of the absolute path (Windows: file:///C:/...); SDL hands it to the desktop's file manager
+    std::error_code ec;
+    std::string p = std::filesystem::absolute(path, ec).generic_string();
+    if (ec) p = path;
+    std::string url = "file://";
+    if (!p.empty() && p[0] != '/') url += "/";
+    for (unsigned char c : p) {
+        if (isalnum(c) || strchr("/-_.~:", c)) url += (char)c;
+        else {
+            char hex[4];
+            snprintf(hex, sizeof hex, "%%%02X", c);
+            url += hex;
+        }
+    }
+    if (!SDL_OpenURL(url.c_str())) LOG("[overlay] cannot open %s: %s", url.c_str(), SDL_GetError());
+}
+#endif
+
+}  // namespace hostui
+
+namespace gfxvk {
+void load_device_setting() { std::string value; if (hostui::get("vkDevice", value)) set_device_setting(value); }
+void save_device_setting() { if (!device_from_env()) hostui::set("vkDevice", device_setting()); }
+}
+#endif  // WWHD_SDL_HOST

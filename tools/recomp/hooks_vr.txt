@@ -1,0 +1,20 @@
+# VR mode (runtime/src/vr/, docs/VR_ARCHITECTURE.md). The camera, Link's execute and the pad use hooks that
+# exist for other reasons (camera_draw 024FFC40 in hooks.txt, daPy_Execute 0240EBB0 in hooks_mods.txt).
+023DBBE4  # daPy_Draw: VR first person (Link's head hidden, the sword drawn at the tracked hand)
+024F8018  # dCam_getControledAngleY: VR movement is relative to the head's heading
+02403150  # daPy_lk_c::jointCB1: VR arms posed towards the controllers after Link's model calc
+020C0E04  # daBoko_Draw: VR places the weapon Link holds (a stick) at the tracked hand before its own draw
+025A83AC  # dPa_control_c::draw: VR does not draw the 2D particle groups (the HUD's sparkles; vr_ui.h)
+023D8624  # daPy_lk_c::setDrawHandModel: VR keeps Link's left hand drawn with the bow before the arrow is on
+02414834  # daPy_sightPacket_c::draw: VR draws the bow/hookshot/grappling hook sight a quarter the size
+02506964  # dCamera_c::CalcSubjectAngle: VR aims bow, hookshot, boomerang and grappling hook with the hand holding it
+0205244C  # daArrow_c::setKeepMatrix: VR lays the arrow on the bow along its laser, so the shot flies along it
+020CDBFC  # daBoomerang_sightPacket_c::draw: VR draws the boomerang's lock-on sights into the UI layer (shown twice in the eyes)
+0242FA80  # daPy_lk_c::procBtJumpCut_init: VR first person, a parry's finishing cut waits for the player's swing
+02430078  # daPy_lk_c::procBtRollCut_init: the same, after the parry's roll
+024306C8  # daPy_lk_c::procBtVerticalJumpCut_init: the same, after the parry's leap
+023EC370  # daPy_lk_c::setSpecialBattle: VR first person, the locked-on enemy's parry window widened for the prompt
+023E5400  # daPy_lk_c::changeSpecialBattle: the same for the parry's start
+026FD1DC  # hdMsgWindow_updateWaitInput: VR, a page at its end shows all its letters (the white stuck at a colour change)
+026FCC10  # hdMsgWindow_updateOpen: VR diagnostics, a message window's typing going back to the start
+026FCEE0  # hdMsgWindow_updateStop: VR, a page's stop takes no A in its first steps (the page still turning white)

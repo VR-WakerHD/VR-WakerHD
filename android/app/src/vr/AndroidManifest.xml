@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The VR variant (-PwwhdVr, docs/VR_ANDROID.md): merged over src/main's manifest. An immersive OpenXR app for
+     standalone headsets: Meta Quest (com.oculus.*, developers.meta.com/horizon/documentation/native/android/
+     mobile-native-manifest) and the Khronos OpenXR loader's runtime discovery (org.khronos.openxr.*). The setup
+     screens (SetupActivity) stay a 2D panel; the game (WwhdActivity) is the immersive activity. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
+    <!-- Android XR (developer.android.com/develop/xr/openxr/get-started): an OpenXR app. Not required, so that
+         Meta Quest and Steam Frame, which do not list it, install the same APK -->
+    <uses-feature android:name="android.software.xr.api.openxr" android:required="false" />
+    <!-- (the headset's Vulkan version is checked at run time; not required to install) -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x403000"
+        android:required="false" tools:replace="android:required" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+    <!-- the VR launcher's Install game tab: an extract location in the device's shared storage, by path (asked for
+         only when that location is chosen: the system's All files access screen) -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+
+    <queries>
+        <provider android:authorities="org.khronos.openxr.runtime_broker;org.khronos.openxr.system_runtime_broker" />
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+    </queries>
+
+    <application>
+        <!-- Steam Frame (Lepton, Android 11 reporting a newer version): AndroidX's profile installer, which androidx.core
+             brings in, took its Android 13 path 5 s after start and ended the app (PackageInfoFlags.of missing). It only
+             speeds up the Java start, so it is not started in this variant -->
+        <provider android:name="androidx.startup.InitializationProvider"
+            android:authorities="${applicationId}.androidx-startup"
+            android:exported="false"
+            tools:node="merge">
+            <meta-data android:name="androidx.profileinstaller.ProfileInstallerInitializer"
+                tools:node="remove" />
+        </provider>
+        <!-- Android XR: its OpenXR runtime is loaded only for apps that declare its library -->
+        <uses-native-library android:name="libopenxr.google.so" android:required="false" />
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
+        <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <!-- the VR launcher is the app's first screen (its own process: one SDL lifetime per process); the setup
+             screens are opened from it, so their launcher entry is removed in this variant -->
+        <activity android:name=".VrLauncherActivity" android:exported="true"
+            android:process=":launcher"
+            android:label="@string/app_name"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask"
+            android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|smallestScreenSize|uiMode"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".SetupActivity">
+            <intent-filter tools:node="removeAll" />
+        </activity>
+        <activity android:name=".WwhdActivity"
+            android:screenOrientation="landscape"
+            android:resizeableActivity="false"
+            tools:replace="android:screenOrientation">
+            <!-- Android XR: the game starts in Full Space, unmanaged (an OpenXR app); on the game only, so the launcher
+                 stays a panel in the Home Space -->
+            <property android:name="android.window.PROPERTY_XR_ACTIVITY_START_MODE"
+                android:value="XR_ACTIVITY_START_MODE_FULL_SPACE_UNMANAGED" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="com.oculus.intent.category.VR" />
+                <category android:name="org.khronos.openxr.intent.category.IMMERSIVE_HMD" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

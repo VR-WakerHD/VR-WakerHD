@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""Tests of the guest mod translator (Mod SDK v2 prototype).
+
+Builds the example mods with a PowerPC-capable clang (WWHD_PPC_CLANG / WWHD_PPC_LLD, or clang and
+ld.lld on PATH; skipped without one), translates them and compiles the modules with the host
+compiler. No game files are needed.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+import guestmod  # noqa: E402
+import build_guest_mod as builder  # noqa: E402
+
+CLANG = os.environ.get("WWHD_PPC_CLANG") or shutil.which("clang")
+LLD = os.environ.get("WWHD_PPC_LLD") or shutil.which("ld.lld")
+FLAGS = ["--target=powerpc-unknown-eabi", "-mcpu=750", "-mstackrealign", "-O2", "-ffreestanding", "-fno-builtin", "-nostdlib",
+         "-fno-jump-tables", "-ffunction-sections", "-fdata-sections",
+         "-I", os.path.join(REPO, "runtime", "guest", "include")]
+
+
+def cxx_command(cc):
+    """Keep setup's launcher/target arguments while selecting its C++ driver."""
+    command = list(cc)
+    for i, value in enumerate(command):
+        compiler = Path(value)
+        name = compiler.name
+        suffix = '.exe' if name.endswith('.exe') else ''
+        stem = name[:-4] if suffix else name
+        for c, cpp in (('clang', 'clang++'), ('gcc', 'g++'), ('cc', 'c++')):
+            if stem == c or stem.endswith('-' + c):
+                command[i] = str(compiler.with_name(stem[:-len(c)] + cpp + suffix))
+                return command
+    raise ValueError('Cannot select a C++ compiler from CC; set CXX explicitly')
+
+
+def ppc_ok():
+    if not CLANG or not LLD or not shutil.which(CLANG) or not shutil.which(LLD):
+        return False
+    p = subprocess.run([CLANG, "--target=powerpc-unknown-eabi", "-mstackrealign", "-x", "c", "-c", "-o", os.devnull, "-"],
+                       input="int x;", capture_output=True, text=True)
+    if p.returncode:
+        print("PowerPC compiler probe failed:", p.stderr, file=sys.stderr)
+    return p.returncode == 0
+
+
+@unittest.skipUnless(ppc_ok(), "no clang with the PowerPC target / ld.lld")
+class GuestModTest(unittest.TestCase):
+    def test_european_hook_calls_function_pointer_and_data(self):
+        from builds import by_name
+        src = r'''
+#include "wwhd_guest.h"
+WWHD_GAME_FUNC(0x0240EBB0, void, link_execute, (void*));
+WWHD_GAME_ORIGINAL(0x0240EBB0, void, original, (void*));
+void (*volatile function_pointer)(void*) = link_execute;
+WWHD_HOOK(0x0240EBB0, mapped, (void* actor)) {
+    WWHD_GAME_DATA(0x101F84DC, u32) = 123;
+    WWHD_GAME_DATA(0x1048D0CC, f32) = 1.0f;
+    link_execute(actor); original(actor);
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            elf = Path(self.build_elf(src, d)).read_bytes()
+            eu = by_name("EU")
+            usa = guestmod.Translator(guestmod.Elf(elf), 0x7F000000)
+            mapped = guestmod.Translator(guestmod.Elf(elf), 0x7F000000, eu)
+            self.assertEqual(mapped.hooks[0][1], eu.code(0x0240EBB0))
+            self.assertEqual({value for kind, value in mapped.imports.values() if kind != "svc"},
+                             {eu.code(0x0240EBB0)})
+            self.assertIn(eu.code(0x0240EBB0).to_bytes(4, "big"), mapped.image)
+            self.assertNotEqual(usa.image, mapped.image)
+            # lis/addi materializes the mapped data address, including its adjusted high half.
+            address = eu.data(0x101F84DC)
+            halves = [int.from_bytes(mapped.image[i:i+2], "big") for i in range(0, len(mapped.image), 2)]
+            self.assertIn((address + 0x8000) >> 16, halves)
+            self.assertIn(address & 0xFFFF, halves)
+            self.assertIn(eu.data(0x1048D0CC) & 0xFFFF, halves)
+            include = str(Path(REPO, "runtime/include"))
+            self.assertNotEqual(builder.cache_key(elf, "mapped", 0x7F000000, builder.default_cc(), include),
+                                builder.cache_key(elf, "mapped", 0x7F000000, builder.default_cc(), include, eu))
+
+    def test_european_changed_and_unmapped_functions_refused(self):
+        from builds import by_name
+        eu = by_name("EU")
+        for address in (eu.differing[0][0], 0x01000000):
+            with self.subTest(address=address), tempfile.TemporaryDirectory() as d:
+                for use in (f'WWHD_HOOK(0x{address:08X}, hook, (void)) {{ }}',
+                            f'WWHD_GAME_FUNC(0x{address:08X}, void, game, (void)); void mod(void) {{ game(); }}'):
+                    elf = Path(self.build_elf('#include "wwhd_guest.h"\n' + use, d)).read_bytes()
+                    with self.assertRaisesRegex(guestmod.ModError, f'0x{address:08X} on EU'):
+                        builder.translator_for(elf, 0x7F000000, eu)
+
+    def test_european_data_addend_maps_before_shift(self):
+        from builds import Build
+        eu = Build({"name": "EU", "title_id": "test", "rpx_sha256": "test",
+                    "code_bounds": ["02000000", "03000000"],
+                    "data_bounds": ["10000000", "11000000"],
+                    "data_steps": [["10000000", 4], ["10000004", 16]]})
+        src = '#include "wwhd_guest.h"\n __asm__(".section .data,\\\"aw\\\"\\n.long __wwhd_gdata_0x10000000 + 8\\n");'
+        with tempfile.TemporaryDirectory() as d:
+            elf = Path(self.build_elf(src, d)).read_bytes()
+            t = builder.translator_for(elf, 0x7F000000, eu)
+            self.assertIn((0x10000018).to_bytes(4, "big"), t.image)
+
+    def test_european_old_sdk_package_refused(self):
+        from builds import by_name
+        with tempfile.TemporaryDirectory() as d:
+            elf = Path(self.build_elf('int old_mod(void) { return *(volatile int*)0x101F84DC; }', d)).read_bytes()
+            builder.translator_for(elf, 0x7F000000)  # USA retains compatibility
+            with self.assertRaisesRegex(guestmod.ModError, 'older SDK'):
+                builder.translator_for(elf, 0x7F000000, by_name("EU"))
+
+    def test_public_headers_c_and_cpp(self):
+        headers = ("bindings", "actor", "link", "camera", "items", "save", "messages", "data")
+        source = "".join('#include "wwhd/%s.h"\n' % name for name in headers)
+        for language, standard in (("c", "c11"), ("c++", "c++17")):
+            with self.subTest(language=language):
+                subprocess.run([CLANG] + FLAGS + ["-x", language, "-std=" + standard,
+                               "-fsyntax-only", "-"], input=source, text=True, check=True)
+
+    def build_elf(self, src_text, d):
+        src = os.path.join(d, "mod.c")
+        with open(src, "w") as f:
+            f.write(src_text)
+        subprocess.run([CLANG] + FLAGS + ["-c", src, "-o", os.path.join(d, "mod.o")], check=True)
+        subprocess.run([LLD, "-m", "elf32ppc", "-r", os.path.join(d, "mod.o"), "-o", os.path.join(d, "mod.elf")], check=True)
+        return os.path.join(d, "mod.elf")
+
+    def test_examples_build(self):
+        for mod in ("addcalc-replace", "hud-demo", "button-icons", "hud-cost"):
+            with tempfile.TemporaryDirectory() as d:
+                pkg = os.path.join(d, "pkg")
+                os.makedirs(pkg)
+                shutil.copy(os.path.join(REPO, "examples", "guest-mods", mod, "manifest.json"), pkg)
+                with open(os.path.join(REPO, "examples", "guest-mods", mod, "mod.c")) as f:
+                    self.build_elf(f.read(), pkg)
+                out = subprocess.run([sys.executable, os.path.join(HERE, "build_guest_mod.py"), pkg, "--out",
+                                      os.path.join(d, "cache"), "--json"], capture_output=True, text=True)
+                r = json.loads(out.stdout.strip().splitlines()[-1])
+                self.assertTrue(r["ok"], r)
+                self.assertTrue(os.path.isfile(r["module"]))
+                again = subprocess.run([sys.executable, os.path.join(HERE, "build_guest_mod.py"), pkg, "--out",
+                                        os.path.join(d, "cache"), "--json"], capture_output=True, text=True)
+                self.assertTrue(json.loads(again.stdout.strip().splitlines()[-1])["cached"])
+
+    def test_inspect_without_compiler(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "manifest.json").write_text(json.dumps({"id": "inspect-test", "kind": "guest",
+                                                          "guest": {"api_version": 1}}))
+            self.build_elf("int value = 3; int f(void) { return value; }", d)
+            with mock.patch.object(builder.subprocess, "run", side_effect=AssertionError("compiler invoked")):
+                result = builder.inspect_package(d, 0x7F100000)
+            self.assertEqual(result["base"], 0x7F100000)
+            self.assertGreater(result["memory_size"], 0)
+            self.assertEqual(result["allocation_size"] % 65536, 0)
+            self.assertEqual(len(result["elf_sha256"]), 64)
+
+    def test_relocations_and_imports(self):
+        src = r'''
+#include "wwhd_guest.h"
+WWHD_GAME_FUNC(0x02001234, int, game_fn, (int));
+WWHD_GAME_ORIGINAL(0x02005678, void, orig_fn, (void));
+static int table[4] = {1, 2, 3, 4};
+int (*volatile ptr)(int) = 0;
+__attribute__((noinline)) static int helper(int x) { return table[x & 3] + game_fn(x); }
+WWHD_REPLACE(0x02005678, void, repl, (void)) { ptr = helper; orig_fn(); wwhd_log_int("v", ptr(2)); }
+'''
+        with tempfile.TemporaryDirectory() as d:
+            t = guestmod.Translator(guestmod.Elf(Path(self.build_elf(src, d)).read_bytes()), 0x7F200000)
+            c = t.emit("test")
+            self.assertEqual([(k, tg) for k, tg, _, _ in t.hooks], [(1, 0x02005678)])
+            self.assertIn("c->pc = 0x02001234u; ppc_dispatch(c);", c)
+            self.assertIn("g_host->call_original(c, 0x02005678u);", c)
+            self.assertEqual(t.services, ["wwhd_log_int"])
+            self.assertTrue(all(0x7F200000 <= e < t.end for e in t.entries))
+            self.assertGreaterEqual(len(t.entries), 2)  # helper is address-taken: its own function
+
+    def test_host_services_compile(self):
+        src = r'''
+#include "wwhd_guest.h"
+_Static_assert(sizeof(wwhd_hud_element)==72, "HUD wire ABI");
+_Static_assert(WWHD_HUD_API_VERSION==3, "HUD capability version");
+static void draw(u32 list) {
+    static wwhd_hud_element element = {.kind=WWHD_HUD_RECT,.w=10,.h=20,.thickness=1,.u1=1,.v1=1,.rgba=0xFFFFFFFF};
+    wwhd_hud_emit(list,&element);
+    element.kind=WWHD_HUD_CLIP_PUSH;wwhd_hud_clip(list,&element);
+    element.kind=WWHD_HUD_CLIP_POP;wwhd_hud_clip(list,&element);
+}
+WWHD_HOOK(0x02000000, all_services, (void)) {
+    static short pcm[2]={-1234,1234};
+    int stream=wwhd_audio_open(48000,2);
+    wwhd_audio_submit(stream,pcm,1,2);wwhd_audio_available(stream);
+    wwhd_audio_close(stream);wwhd_audio_epoch();
+    wwhd_hud_register(draw,WWHD_HUD_BOTH);
+    u32 image=wwhd_hud_texture(WWHD_HUD_PACKAGE,"assets/original.png");
+    wwhd_hud_release(image);
+    wwhd_log_int("hud epoch",(int)wwhd_hud_epoch());
+    wwhd_log_int("mirrored",(int)wwhd_hud_mirrored_images());
+    static char label[16];
+    if (wwhd_game_messages()) wwhd_game_message_get("layout-message:DungeonMapUp_00/T_FloorU_00_2F",label,sizeof label);
+    char* p = wwhd_malloc(64);
+    wwhd_setting_get("input.face_layout",WWHD_SETTING_STRING,p,64);
+    wwhd_log_int("settings revision",(int)wwhd_setting_changed("input.face_layout"));
+    wwhd_input_state pad;
+    wwhd_input_read(&pad);
+    wwhd_config_string("choice", p, 64);
+    if (wwhd_config_bool("on", 0)) wwhd_log_float("dt", wwhd_logic_dt());
+    wwhd_log_float("amount", wwhd_config_float("amount", 1.5));
+    wwhd_log_int("step", (int)wwhd_logic_step());
+    wwhd_file_write("progress.bin", p, 64);
+    wwhd_file_read("progress.bin", p, 64);
+    if (wwhd_mail_send("hello", "A friend", "Text") == WWHD_MAIL_WAITING) wwhd_log("sent");
+    wwhd_log_int("letter", wwhd_mail_state("hello"));
+    if (wwhd_chart_give("tale") == WWHD_CHART_OWNED) wwhd_log("given");
+    wwhd_chart_mark("tale", "start", WWHD_CHART_COLUMN_X('D'), WWHD_CHART_ROW_Z(2), WWHD_CHART_ICON_STORY, "Windfall");
+    wwhd_log_int("chart", wwhd_chart_state("tale"));
+    wwhd_chart_unmark("tale", 0);
+    wwhd_chart_finish("tale");
+    wwhd_quest_define("tale", "A tale", 0, 0);
+    wwhd_quest_step("tale", 1, "Go", "Windfall");
+    wwhd_quest_place("tale", 0.0f, 0.0f);
+    wwhd_quest_no_place("tale");
+    wwhd_quest_known("tale", "Known");
+    wwhd_quest_portrait("tale", "assets/p.png");
+    wwhd_log_int("quest", wwhd_quest_state("tale"));
+    wwhd_quest_carry("tale", 1);
+    wwhd_quest_talk("tale", 1, "windfall-um1", "Hello", 6);
+    wwhd_quest_set_flag("tale", 1, 1);
+    wwhd_log_int("flag", wwhd_quest_flag("tale", 1));
+    wwhd_quest_done("tale");
+    if (wwhd_item_give("key", 1) == 1) wwhd_log("item");
+    wwhd_item_take("key", 1);
+    wwhd_log_int("items", wwhd_item_count("key") + wwhd_item_used("key"));
+    wwhd_free(p);
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            t = guestmod.Translator(guestmod.Elf(Path(self.build_elf(src, d)).read_bytes()), 0x7F000000)
+            translated = t.emit("services")
+            for address, (kind, name) in t.imports.items():
+                if kind == "svc":
+                    self.assertIn("c->pc = 0x%08Xu;" % address, translated, name)
+            for name in ("wwhd_audio_open","wwhd_audio_submit","wwhd_audio_available","wwhd_audio_close","wwhd_audio_epoch","wwhd_file_write","wwhd_hud_register","wwhd_hud_emit","wwhd_hud_texture",
+                         "wwhd_hud_release","wwhd_hud_epoch","wwhd_hud_clip","wwhd_setting_get","wwhd_setting_changed",
+                         "wwhd_mail_send","wwhd_mail_state","wwhd_chart_give","wwhd_chart_finish","wwhd_chart_state",
+                         "wwhd_chart_mark","wwhd_chart_unmark","wwhd_quest_define","wwhd_quest_step","wwhd_quest_place",
+                         "wwhd_quest_no_place","wwhd_quest_known","wwhd_quest_portrait","wwhd_quest_done","wwhd_quest_state","wwhd_quest_carry","wwhd_quest_talk",
+                         "wwhd_quest_set_flag","wwhd_quest_flag","wwhd_item_give","wwhd_item_take","wwhd_item_count","wwhd_item_used"):
+                self.assertIn(name,t.services)
+            Path(d, "manifest.json").write_text(json.dumps({"kind": "guest", "id": "services", "guest": {"api_version": 1}}))
+            result = builder.build(d, str(Path(d, "cache")), 0x7F000000, builder.default_cc(), str(Path(REPO, "runtime/include")))
+            self.assertTrue(result["ok"])
+
+    def test_clip_service_refuses_old_host(self):
+        src = r'''
+#include "wwhd_guest.h"
+WWHD_HOOK(0x02000000, clipping, (void)) { wwhd_hud_clip(0,0); }
+'''
+        driver = r'''
+/* assert() performs and checks the driver's setup: keep it in every build (zig cc -O2 defines NDEBUG) */
+#undef NDEBUG
+#include "wwhd_guest_abi.h"
+#include <assert.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
+static int supported;
+static void clip(Cpu* cpu) { (void)cpu; }
+static PpcFunc service(const char* name) {
+    return supported && !strcmp(name,"wwhd_hud_clip") ? clip : 0;
+}
+int main(int argc,char** argv) {
+    assert(argc==2);
+#ifdef _WIN32
+    HMODULE library=LoadLibraryA(argv[1]);assert(library);
+    WWHDGuestInitV1 init=(WWHDGuestInitV1)GetProcAddress(library,WWHD_GUEST_INIT_SYMBOL);
+#else
+    void* library=dlopen(argv[1],RTLD_NOW);assert(library);
+    WWHDGuestInitV1 init=(WWHDGuestInitV1)dlsym(library,WWHD_GUEST_INIT_SYMBOL);
+#endif
+    assert(init);
+    WWHDGuestHostV1 host={0};host.size=sizeof(host);host.abi_version=WWHD_GUEST_ABI_VERSION;host.service=service;
+    assert(!init(&host)); // v1 host without clipping cannot load this module
+    supported=1;assert(init(&host));
+#ifdef _WIN32
+    FreeLibrary(library);
+#else
+    dlclose(library);
+#endif
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            self.build_elf(src,d)
+            Path(d,'manifest.json').write_text(json.dumps({'kind':'guest','id':'clip-capability','guest':{'api_version':1}}))
+            result=builder.build(d,str(Path(d,'cache')),0x7F000000,builder.default_cc(),str(Path(REPO,'runtime/include')))
+            source=Path(d,'driver.c');source.write_text(driver)
+            executable=Path(d,'driver.exe' if os.name=='nt' else 'driver')
+            command=builder.default_cc()+['-O2','-I',str(Path(REPO,'runtime/include')),str(source),'-o',str(executable)]
+            if sys.platform.startswith('linux'):
+                command.append('-ldl')
+            subprocess.run(command,check=True)
+            subprocess.run([str(executable),result['module']],check=True)
+
+    def test_map_hud_services_optional_on_old_host(self):
+        src = r'''
+#define WWHD_MAP_HUD_DIRECT_IMPORTS 1
+#include "wwhd_guest.h"
+WWHD_REPLACE(0x02000000, s32, lease, (void)) { return wwhd_hud_boat_compasses(1); }
+WWHD_REPLACE(0x02000004, s32, rect, (void)) { return wwhd_hud_boat_compasses_rect(0); }
+WWHD_REPLACE(0x02000008, s32, select_chart, (void)) { return wwhd_map_chart_select(3); }
+WWHD_REPLACE(0x0200000C, s32, selected, (void)) { return wwhd_map_chart_selected(); }
+WWHD_REPLACE(0x02000010, s32, cancel, (void)) { return wwhd_map_chart_cancel(); }
+'''
+        driver = r'''
+/* assert() performs and checks the driver's setup: keep it in every build (zig cc -O2 defines NDEBUG) */
+#undef NDEBUG
+#include "wwhd_guest_abi.h"
+#include <assert.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <sys/mman.h>
+#endif
+static int supported;
+static void success(Cpu* cpu) { cpu->r[3]=42; }
+static PpcFunc service(const char* name) {
+    (void)name;return supported ? success : 0;
+}
+int main(int argc,char** argv) {
+    assert(argc==2);
+#ifdef _WIN32
+    HMODULE library=LoadLibraryA(argv[1]);assert(library);
+    WWHDGuestInitV1 init=(WWHDGuestInitV1)GetProcAddress(library,WWHD_GUEST_INIT_SYMBOL);
+#else
+    void* library=dlopen(argv[1],RTLD_NOW);assert(library);
+    WWHDGuestInitV1 init=(WWHDGuestInitV1)dlsym(library,WWHD_GUEST_INIT_SYMBOL);
+#endif
+    assert(init);
+    volatile int preempt[3]={0};
+    WWHDGuestHostV1 host={0};host.core_preempt=preempt;host.size=sizeof(host);host.abi_version=WWHD_GUEST_ABI_VERSION;host.service=service;
+    const WWHDGuestModuleV1* module=init(&host);assert(module&&module->hook_count==5);
+#ifdef _WIN32
+    assert(VirtualAlloc(ppc_ptr(0x20000000),0x10000,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+#else
+    assert(mmap(ppc_ptr(0x20000000),0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)!=MAP_FAILED);
+#endif
+    for(unsigned i=0;i<module->hook_count;i++) { Cpu c={0};c.r[1]=0x20008000;module->hooks[i].fn(&c);assert(c.r[3]==0xFFFFFFFFu); }
+    supported=1;module=init(&host);assert(module);
+    for(unsigned i=0;i<module->hook_count;i++) { Cpu c={0};c.r[1]=0x20008000;module->hooks[i].fn(&c);assert(c.r[3]==42); }
+#ifdef _WIN32
+    FreeLibrary(library);
+#else
+    dlclose(library);
+#endif
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            self.build_elf(src,d)
+            Path(d,'manifest.json').write_text(json.dumps({'kind':'guest','id':'map-hud-capability','guest':{'api_version':1}}))
+            result=builder.build(d,str(Path(d,'cache')),0x7F000000,builder.default_cc(),str(Path(REPO,'runtime/include')))
+            source=Path(d,'driver.c');source.write_text(driver)
+            executable=Path(d,'driver.exe' if os.name=='nt' else 'driver')
+            command=builder.default_cc()+['-O2','-I',str(Path(REPO,'runtime/include')),str(source),'-o',str(executable)]
+            if sys.platform.startswith('linux'):
+                command.append('-ldl')
+            subprocess.run(command,check=True)
+            subprocess.run([str(executable),result['module']],check=True)
+
+    def test_map_hud_query_transport_on_older_installer(self):
+        src = r'''
+#include "wwhd_guest.h"
+WWHD_REPLACE(0x02000000, s32, lease, (void)) { return wwhd_hud_boat_compasses(1); }
+static wwhd_boat_compasses_rect where={24,1};
+WWHD_REPLACE(0x02000004, s32, rect, (void)) { return wwhd_hud_boat_compasses_rect(&where); }
+WWHD_REPLACE(0x02000008, s32, select_chart, (void)) { return wwhd_map_chart_select(3); }
+WWHD_REPLACE(0x0200000C, s32, selected, (void)) { return wwhd_map_chart_selected(); }
+WWHD_REPLACE(0x02000010, s32, cancel, (void)) { return wwhd_map_chart_cancel(); }
+'''
+        driver = r'''
+/* assert() performs and checks the driver's setup: keep it in every build (zig cc -O2 defines NDEBUG) */
+#undef NDEBUG
+#include "wwhd_guest_abi.h"
+#include <assert.h>
+#include <string.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <sys/mman.h>
+#endif
+static int supported;
+static void unknown_setting(Cpu* cpu) { cpu->r[3]=0; }
+static PpcFunc service(const char* name) {
+    return !strcmp(name,"wwhd_setting_get") ? unknown_setting : 0;
+}
+int main(int argc,char** argv) {
+    assert(argc==2);
+#ifdef _WIN32
+    HMODULE library=LoadLibraryA(argv[1]);assert(library);
+    WWHDGuestInitV1 init=(WWHDGuestInitV1)GetProcAddress(library,WWHD_GUEST_INIT_SYMBOL);
+#else
+    void* library=dlopen(argv[1],RTLD_NOW);assert(library);
+    WWHDGuestInitV1 init=(WWHDGuestInitV1)dlsym(library,WWHD_GUEST_INIT_SYMBOL);
+#endif
+    assert(init);
+    volatile int preempt[3]={0};
+    WWHDGuestHostV1 host={0};host.core_preempt=preempt;host.size=sizeof(host);host.abi_version=WWHD_GUEST_ABI_VERSION;host.service=service;
+    const WWHDGuestModuleV1* module=init(&host);assert(module&&module->hook_count==5);
+#ifdef _WIN32
+    assert(VirtualAlloc(ppc_ptr(0x20000000),0x10000,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+#else
+    assert(mmap(ppc_ptr(0x20000000),0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)!=MAP_FAILED);
+#endif
+#ifdef _WIN32
+    assert(VirtualAlloc(ppc_ptr(module->mem_base),module->mem_size,MEM_RESERVE|MEM_COMMIT,PAGE_READWRITE));
+#else
+    assert(mmap(ppc_ptr(module->mem_base),module->mem_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_FIXED,-1,0)!=MAP_FAILED);
+#endif
+    memcpy(ppc_ptr(module->mem_base),module->image,module->image_size);
+    for(unsigned i=0;i<module->hook_count;i++) { Cpu c={0};c.r[1]=0x20008000;module->hooks[i].fn(&c);assert(c.r[3]==0xFFFFFFFFu); }
+    supported=1;module=init(&host);assert(module);
+    for(unsigned i=0;i<module->hook_count;i++) { Cpu c={0};c.r[1]=0x20008000;module->hooks[i].fn(&c);assert(c.r[3]==0xFFFFFFFFu); }
+#ifdef _WIN32
+    FreeLibrary(library);
+#else
+    dlclose(library);
+#endif
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            self.build_elf(src,d)
+            translator=guestmod.Translator(guestmod.Elf(Path(d,'mod.elf').read_bytes()),0x7F000000)
+            self.assertEqual(translator.services,["wwhd_setting_get"])
+            Path(d,'manifest.json').write_text(json.dumps({'kind':'guest','id':'map-hud-capability','guest':{'api_version':1}}))
+            result=builder.build(d,str(Path(d,'cache')),0x7F000000,builder.default_cc(),str(Path(REPO,'runtime/include')))
+            source=Path(d,'driver.c');source.write_text(driver)
+            executable=Path(d,'driver.exe' if os.name=='nt' else 'driver')
+            command=builder.default_cc()+['-O2','-I',str(Path(REPO,'runtime/include')),str(source),'-o',str(executable)]
+            if sys.platform.startswith('linux'):
+                command.append('-ldl')
+            subprocess.run(command,check=True)
+            subprocess.run([str(executable),result['module']],check=True)
+
+    def test_register_pair_module_executes(self):
+        # Execute the actual translated module with a valid guest stack.
+        # Stack realignment may give even a leaf function a stack frame.
+        src = r'''
+#include "wwhd/bindings.h"
+WWHD_REPLACE(0x02000000, wwhd_gpr_pair, pair_result, (void)) {
+    return 0x1122334455667788ULL;
+}
+WWHD_REPLACE(0x02000004, u32, pair_low, (wwhd_gpr_pair value)) {
+    return WWHD_RESULT_R4(value);
+}
+'''
+        driver = r'''
+/* assert() performs and checks the driver's setup: keep it in every build (zig cc -O2 defines NDEBUG) */
+#undef NDEBUG
+#include "wwhd_guest_abi.h"
+#include <assert.h>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <dlfcn.h>
+#include <sys/mman.h>
+#endif
+int main(int argc, char** argv) {
+    assert(argc == 2);
+#ifdef _WIN32
+    HMODULE library = LoadLibraryA(argv[1]); assert(library);
+    WWHDGuestInitV1 init = (WWHDGuestInitV1)GetProcAddress(library, WWHD_GUEST_INIT_SYMBOL);
+#else
+    void* library = dlopen(argv[1], RTLD_NOW); assert(library);
+    WWHDGuestInitV1 init = (WWHDGuestInitV1)dlsym(library, WWHD_GUEST_INIT_SYMBOL);
+#endif
+    assert(init);
+    volatile int preempt[3] = {0};
+    WWHDGuestHostV1 host = {0}; host.size = sizeof(host);
+    host.abi_version = WWHD_GUEST_ABI_VERSION; host.core_preempt = preempt;
+    const WWHDGuestModuleV1* module = init(&host); assert(module && module->hook_count == 2);
+#ifdef _WIN32
+    void* stack = VirtualAlloc(ppc_ptr(0x20000000), 0x10000, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    assert(stack == ppc_ptr(0x20000000));
+#else
+    void* stack = mmap(ppc_ptr(0x20000000), 0x10000, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    assert(stack == ppc_ptr(0x20000000));
+#endif
+    for (unsigned alignment = 0; alignment < 2; ++alignment) {
+    Cpu cpu = {0}; int pairs = 0, lows = 0;
+    const uint32_t sp = 0x20008000 + alignment * 8;
+    cpu.r[1] = sp;
+    for (uint32_t i = 0; i < module->hook_count; ++i) if (module->hooks[i].target == 0x02000000) {
+        ++pairs; module->hooks[i].fn(&cpu);
+        assert(cpu.r[3] == 0x11223344 && cpu.r[4] == 0x55667788);
+    }
+    cpu.r[3] = 0xABCDEF01; cpu.r[4] = 0x12345678;
+    for (uint32_t i = 0; i < module->hook_count; ++i) if (module->hooks[i].target == 0x02000004) {
+        ++lows; module->hooks[i].fn(&cpu); assert(cpu.r[3] == 0x12345678);
+    }
+    assert(pairs == 1 && lows == 1);
+    assert(cpu.r[1] == sp);
+    }
+#ifdef _WIN32
+    assert(VirtualFree(stack, 0, MEM_RELEASE));
+    FreeLibrary(library);
+#else
+    assert(munmap(stack, 0x10000) == 0);
+    dlclose(library);
+#endif
+    return 0;
+}
+'''
+        with tempfile.TemporaryDirectory() as d:
+            self.build_elf(src, d)
+            Path(d, 'manifest.json').write_text(json.dumps({'kind': 'guest', 'id': 'register-pair', 'guest': {'api_version': 1}}))
+            result = builder.build(d, str(Path(d, 'cache')), 0x7F000000, builder.default_cc(), str(Path(REPO, 'runtime/include')))
+            source = Path(d, 'driver.c'); source.write_text(driver)
+            executable = Path(d, 'driver.exe' if os.name == 'nt' else 'driver')
+            command = builder.default_cc() + ['-O2', '-I', str(Path(REPO, 'runtime/include')), str(source), '-o', str(executable)]
+            if sys.platform.startswith('linux'):
+                command.append('-ldl')
+            subprocess.run(command, check=True)
+            subprocess.run([str(executable), result['module']], check=True)
+
+    def test_native_entry_stack_realignment(self):
+        # Reduced from the real #117 heap-frame failure, without its game
+        # consumer: preserve the same align16 local-frame/callback pattern.
+        fixtures=Path(HERE, 'fixtures')
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            executable=root/('driver.exe' if os.name=='nt' else 'driver')
+            command=cxx_command(builder.default_cc())+['-std=c++17','-O2','-Wall','-Wextra','-Werror',
+                '-I',str(Path(REPO,'runtime/include')),str(fixtures/'stack_realign.cpp'),'-o',str(executable)]
+            if sys.platform.startswith('linux'):
+                command.append('-ldl')
+            subprocess.run(command,check=True)
+            # Run identical ordinary C with and without the required producer
+            # flag. The negative control must expose all 64 SP8 entries.
+            for realign in (False, True):
+                with self.subTest(realign=realign):
+                    directory=root/('aligned' if realign else 'flagless');directory.mkdir()
+                    flags=FLAGS if realign else [flag for flag in FLAGS if flag!='-mstackrealign']
+                    subprocess.run([CLANG,*flags,'-c',str(fixtures/'stack_realign.c'),
+                                    '-o',str(directory/'mod.o')],check=True)
+                    subprocess.run([LLD,'-m','elf32ppc','-r',str(directory/'mod.o'),
+                                    '-o',str(directory/'mod.elf')],check=True)
+                    (directory/'manifest.json').write_text(json.dumps({'kind':'guest','id':'stack-entry',
+                        'guest':{'api_version':1}}))
+                    result=builder.build(str(directory),str(root/'cache'),0x7F000000,
+                        builder.default_cc(),str(Path(REPO,'runtime/include')))
+                    subprocess.run([str(executable),result['module'],'0' if realign else '64'],check=True)
+
+    def test_nonvolatile_paired_single_module_boundaries(self):
+        # Eighteen scalar float values force ordinary Clang C to use f14..f31.
+        # Native callers can instead keep a live pair in those registers.
+        values = "\n".join(f"f32 v{i}=source[{i}];" for i in range(18))
+        src = ('#include "wwhd/bindings.h"\n'
+               'WWHD_GAME_FUNC(0x02000010,void,native_call,(void));\n'
+               'volatile f32 source[18]={' + ','.join(str(i+1) for i in range(18)) + '};\n'
+               'WWHD_REPLACE(0x02000000,f32,pair_test,(void)){' + values +
+               '\nnative_call();return ' + '+'.join(f'v{i}' for i in range(18)) + ';}\n')
+        import shlex
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(sys.modules[__name__], 'FLAGS', FLAGS + ['-mstackrealign']):
+                self.build_elf(src, d)
+            Path(d, 'manifest.json').write_text(json.dumps({'kind':'guest','id':'paired-single',
+                                                          'guest':{'api_version':1}}))
+            result = builder.build(d, str(Path(d, 'cache')), 0x7F000000,
+                                   builder.default_cc(), str(Path(REPO, 'runtime/include')))
+            cc = builder.default_cc()
+            if os.environ.get('CXX'):
+                cxx = shlex.split(os.environ['CXX'])
+            else:
+                cxx = cxx_command(cc)
+            executable = Path(d, 'driver.exe' if os.name == 'nt' else 'driver')
+            command = cxx + ['-std=c++17', '-O2', '-I', str(Path(REPO, 'runtime/include')),
+                             '-I', str(Path(REPO, 'runtime/src')),
+                             str(Path(HERE, 'fixtures/nonvolatile_ps1.cpp')), '-o', str(executable)]
+            if sys.platform.startswith('linux'):
+                command.append('-ldl')
+            subprocess.run(command, check=True)
+            subprocess.run([str(executable), result['module']], check=True)
+
+    def test_flagless_module_entry_stack_alignment(self):
+        src = r'''
+#include "wwhd/bindings.h"
+typedef struct __attribute__((aligned(16))) { u32 words[4]; } Local;
+WWHD_GAME_FUNC(0x02000010,u32,native,(Local*,u32*,u32*,u32,u32));
+#define PARAMETERS u32* out,u32 a,u32 b,u32 c,u32 d,u32 e,u32 f,u32 g,u32 ninth,u32 tenth,u32* escaped
+#define ARGUMENTS out,a,b,c,d,e,f,g,ninth,tenth,escaped
+static u32 body(PARAMETERS) {
+ Local local={{ninth,tenth,*escaped,a+b+c+d+e+f+g}};
+ u32 result=native(&local,out,escaped,ninth,tenth);
+ *out+=a+b+c+d+e+f+g;
+ return result;
+}
+WWHD_REPLACE(0x02000000,u32,legacy,(PARAMETERS)) { return body(ARGUMENTS); }
+WWHD_HOOK(0x02000004,legacy_entry,(PARAMETERS)) { (void)body(ARGUMENTS); }
+WWHD_HOOK_RETURN(0x02000004,legacy_return,(PARAMETERS)) { (void)body(ARGUMENTS); }
+'''
+        import shlex
+        with tempfile.TemporaryDirectory() as d:
+            # Deliberately omit the current SDK's realignment flag: this models old modules.
+            with mock.patch.object(sys.modules[__name__], 'FLAGS', [f for f in FLAGS if f != '-mstackrealign']):
+                self.build_elf(src, d)
+            Path(d, 'manifest.json').write_text(json.dumps({'kind':'guest','id':'legacy-stack','guest':{'api_version':1}}))
+            result=builder.build(d,str(Path(d,'cache')),0x7F000000,builder.default_cc(),str(Path(REPO,'runtime/include')))
+            cxx=shlex.split(os.environ['CXX']) if os.environ.get('CXX') else cxx_command(builder.default_cc())
+            executable=Path(d,'driver.exe' if os.name=='nt' else 'driver')
+            command=cxx+['-std=c++17','-O2','-I',str(Path(REPO,'runtime/include')),'-I',str(Path(REPO,'runtime/src')),
+                         str(Path(HERE,'fixtures/entry_stack_alignment.cpp')),'-o',str(executable)]
+            if sys.platform.startswith('linux'):command.append('-ldl')
+            subprocess.run(command,check=True)
+            subprocess.run([str(executable),result['module']],check=True)
+
+    def test_errors(self):
+        with self.assertRaises(guestmod.ModError):
+            guestmod.Elf(b"not an elf at all" * 4)
+
+
+class BuildInterfaceTest(unittest.TestCase):
+    def test_all_module_entry_boundaries_use_the_stack_adapter(self):
+        import re
+        root = Path(REPO, 'runtime/src')
+        dispatch = (root/'core.cpp').read_text().split('extern "C" void ppc_dispatch(Cpu* c) {', 1)[1].split('// checking builds', 1)[0]
+        self.assertRegex(dispatch, r'invoke_module_entry\(c,\s*f\)')
+        self.assertLess(dispatch.index('dispatch::lookup'), dispatch.index('invoke_module_entry'))
+        self.assertIn('MUSTTAIL return f(c)', dispatch)
+        hooks = (root/'mods/guest_mods.cpp').read_text().split('extern "C" void ppc_mod_run(Cpu* c) {', 1)[1]
+        self.assertEqual(len(re.findall(r'invoke_module_entry\(c,\s*h\)', hooks)), 2)
+        self.assertRegex(hooks, r'invoke_module_entry\(c,\s*ch.replace\)')
+        self.assertEqual(hooks.count('ObserverRegisters preserve(c)'), 2)
+        adapter = (root/'guest_module_entry.h').read_text()
+        self.assertRegex(adapter, r'threads::current_stack_bounds\(cpu,\s*bounds.bottom,\s*bounds.top\)')
+
+
+    def test_cxx_driver_keeps_setup_launcher_and_target(self):
+        for cc, expected in (
+            (['xcrun', 'clang'], ['xcrun', 'clang++']),
+            (['/tool/zig', 'cc', '-target', 'x86_64-linux-gnu.2.35'],
+             ['/tool/zig', 'c++', '-target', 'x86_64-linux-gnu.2.35']),
+            (['/tool/clang.exe', '-fuse-ld=lld'], ['/tool/clang++.exe', '-fuse-ld=lld']),
+            (['ccache', '/tool/aarch64-linux-gnu-gcc'], ['ccache', '/tool/aarch64-linux-gnu-g++']),
+        ):
+            with self.subTest(cc=cc):
+                self.assertEqual(cxx_command(cc), expected)
+        with self.assertRaisesRegex(ValueError, 'set CXX'):
+            cxx_command(['unknown-driver'])
+
+    def test_source_and_release_include_roots(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(builder, "REPO", d):
+            self.assertEqual(builder.default_include(), os.path.join(d, "runtime", "include"))
+            installed = Path(d, "sdk", "include")
+            installed.mkdir(parents=True)
+            (installed / "wwhd_guest_abi.h").write_text("/* ABI fixture */")
+            self.assertEqual(builder.default_include(), str(installed))
+
+    def test_read_only_batch_cache_validation(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d); pkg = root / "pkg"; pkg.mkdir()
+            (pkg / "manifest.json").write_text(json.dumps({"id": "fixture", "kind": "guest", "guest": {"api_version": 1}}))
+            (pkg / "mod.elf").write_bytes(b"fixture ELF")
+            include = root / "include"; include.mkdir()
+            for name in ("ppc.h", "wwhd_guest_abi.h"):
+                shutil.copy(Path(REPO, "runtime", "include", name), include)
+            cc = ["clang"]; base = 0x7F000000
+            key = builder.cache_key(b"fixture ELF", "fixture", base, cc, include, version="compiler one")
+            module = root / "cache" / key / ("fixture" + builder.module_ext())
+            module.parent.mkdir(parents=True); module.write_bytes(b"fixture module")
+            request = {"id": "fixture", "package": str(pkg), "base": base, "module": str(module)}
+            with mock.patch.object(builder.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="compiler one")) as probe:
+                result = builder.check_cached([request, {**request, "id": "other"}], root / "cache", cc, include)
+                self.assertEqual(result["valid"], ["fixture"])
+                self.assertEqual(probe.call_count, 1)  # one version probe, no compile per package
+                self.assertEqual(probe.call_args.args[0], ["clang", "--version"])
+                with mock.patch.object(builder.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="compiler two")):
+                    self.assertEqual(builder.check_cached([request], root / "cache", cc, include)["valid"], [])
+                for changed in ({"base": base + 65536}, {"module": str(root / "unrelated")}, {"base": True}):
+                    self.assertEqual(builder.check_cached([{**request, **changed}], root / "cache", cc, include)["valid"], [])
+                (pkg / "mod.elf").write_bytes(b"changed ELF")
+                self.assertEqual(builder.check_cached([request], root / "cache", cc, include)["valid"], [])
+                (pkg / "mod.elf").write_bytes(b"fixture ELF")
+                with (include / "ppc.h").open("a") as header:
+                    header.write("\n/* ABI changed */\n")
+                self.assertEqual(builder.check_cached([request], root / "cache", cc, include)["valid"], [])
+            self.assertEqual(module.read_bytes(), b"fixture module")
+            self.assertEqual([p.name for p in (root / "cache").iterdir()], [key])
+
+    def test_package_paths_and_ids(self):
+        with tempfile.TemporaryDirectory() as d:
+            pkg = Path(d, "pkg"); pkg.mkdir()
+            (pkg / "mod.elf").write_bytes(b"test-elf")
+            man = {"id": "valid-id", "kind": "guest", "guest": {"api_version": 1}}
+            def write():
+                (pkg / "manifest.json").write_text(json.dumps(man))
+            write()
+            self.assertEqual(builder.package_elf(pkg)[1], b"test-elf")
+            for name in ("../mod.elf", "/mod.elf", "C:/mod.elf", "a\\b", "a//b", "./mod.elf"):
+                man["guest"]["elf"] = name; write()
+                with self.subTest(path=name), self.assertRaises(guestmod.ModError):
+                    builder.package_elf(pkg)
+            man["guest"]["elf"] = "mod.elf"
+            for mod_id in ("../bad", "", ".bad", "bad/id", 1):
+                man["id"] = mod_id; write()
+                with self.subTest(id=mod_id), self.assertRaises(guestmod.ModError):
+                    builder.package_elf(pkg)
+            man["id"] = "valid-id"; write()
+            (pkg / "mod.elf").unlink()
+            Path(d, "outside.elf").write_bytes(b"outside")
+            try:
+                (pkg / "mod.elf").symlink_to(Path(d, "outside.elf"))
+            except OSError:
+                return # Windows runners without symlink privileges still exercise path validation.
+            with self.assertRaises(guestmod.ModError):
+                builder.package_elf(pkg)
+
+    def test_cache_invalidation(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("ppc.h", "wwhd_guest_abi.h"):
+                shutil.copy(Path(REPO, "runtime", "include", name), d)
+            with mock.patch.object(builder.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="clang test")):
+                def key(elf=b"elf", mod_id="mod", base=0x7F000000, cc=None):
+                    return builder.cache_key(elf, mod_id, base, cc or ["clang"], d)
+                initial = key()
+                self.assertEqual(initial, key())
+                self.assertNotEqual(initial, key(elf=b"changed"))
+                self.assertNotEqual(initial, key(mod_id="other"))
+                self.assertNotEqual(initial, key(base=0x7F100000))
+                self.assertNotEqual(initial, key(cc=["zig", "cc"]))
+                for name in ("ppc.h", "wwhd_guest_abi.h"):
+                    p = Path(d, name); before = p.read_bytes()
+                    p.write_bytes(before + b"\n/* changed ABI source */\n")
+                    self.assertNotEqual(initial, key())
+                    p.write_bytes(before)
+                with mock.patch.object(guestmod, "TRANSLATOR_VERSION", "new-version"):
+                    self.assertNotEqual(initial, key())
+                read_bytes = Path.read_bytes
+                def changed_source(path):
+                    data = read_bytes(path)
+                    return data + b"changed" if path.name == "ppc2c.py" else data
+                with mock.patch.object(Path, "read_bytes", changed_source):
+                    self.assertNotEqual(initial, key())
+                with mock.patch.object(builder.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="clang newer")):
+                    self.assertNotEqual(initial, key())
+
+    def test_truncated_elf_errors(self):
+        for length in range(52):
+            data = (b"\x7fELF\x01\x02" + bytes(52))[:length]
+            with self.subTest(length=length), self.assertRaises(guestmod.ModError):
+                builder.translator_for(data, 0x7F000000)
+
+    def test_invalid_base(self):
+        for base in (0, 0x7F000001, 0x80000000, -1):
+            with self.subTest(base=base), self.assertRaises(guestmod.ModError):
+                builder.translator_for(b"unused", base)
+
+
+if __name__ == "__main__":
+    unittest.main()

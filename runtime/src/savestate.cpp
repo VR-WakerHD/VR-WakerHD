@@ -1,0 +1,2375 @@
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <cstdarg>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <cstdlib>
+#include <ctime>
+#include <exception>
+#include <filesystem>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <string>
+#include <system_error>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include "state_load_result.h"
+#include "mods/fast_forward.h"
+#include "mods/story_store.h"
+#include "mods/mod_stages.h"
+#include "editor/stage_files.h"
+#include "mods/mods.h"
+// Save states: snapshot the whole running game into one of 5 slots and restore it, also in a new
+// process.
+//
+// The recompiled game runs on host threads with native call stacks, so a snapshot can only be taken
+// (and restored) when every guest thread is at a point whose complete state is guest memory, its Cpu
+// registers and the HLE objects:
+//   - the game's main thread at the top of the per-frame function (0203593C; interp.cpp calls
+//     service() there), which requests the save/load;
+//   - every other guest thread parked in an HLE wait (OSReceiveMessage, OSWaitEvent, OSLockMutex,
+//     OSSleepThread, OSSleepTicks, GX2WaitForVsync, ...: park_wait in threads.cpp). A parked thread
+//     re-checks its condition after waking and only then consumes anything, so the HLE objects
+//     decide where it continues;
+//   - service threads (alarms, AX frame) idle between their callbacks.
+// threads::quiesce() freezes the game in that state (other threads keep running until they park).
+//
+// Restoring into a running process requires each thread to be parked at the same place it was
+// saved at (same stack pointer, return address and guest back chain => same host call stack); the
+// main thread always is. Worker threads normally idle at the same wait. If not, the load is retried
+// on the following frames and finally refused with a message; nothing is changed then.
+//
+// Slot file: unchanged platform fast compression or checksummed streaming zstd chunks,
+// with a common decoded payload: tagged sections from each module
+// (threads + HLE sync objects + alarms + guest clock, heaps, open files, AX voices, GX2 registers,
+// runtime allocations) and guest memory (MEM2, runtime objects, fixed slots, foreground bucket,
+// MEM1; all-zero 64 KiB chunks are left out).
+#include "savestate.h"
+#include "aspect.h"
+#include "savestate_native_gate.h"
+#include "mods/story_native_restore_resume.h"
+// The issuer exists only in the actual full-load pipeline, never a caller
+// boolean, snapshot decoder or generic native-gate success adapter.
+namespace ss {class NativeRestorePipelineIssuer {public:
+ static std::unique_ptr<story_native_restore_resume::LoadWindow>begin(Cpu*c){return std::unique_ptr<story_native_restore_resume::LoadWindow>(new story_native_restore_resume::LoadWindow(c));}
+ static void threads_loaded(story_native_restore_resume::LoadWindow&w){w.threads_loaded();}
+ static void after_thaw(story_native_restore_resume::LoadWindow&w){w.after_thaw();}
+};}
+#include "guest_addr.h"
+#include "randomizer_identity.h"
+#include "full_state_header.h"
+#include "full_state_stream.h"
+#include "input.h"
+
+#ifdef __APPLE__
+#include <compression.h>
+#include <mach-o/ldsyms.h>
+#include <mach-o/loader.h>
+#else
+#include <lz4.h>
+#endif
+#include "platform/host.h"
+#include "platform/memory_trim.h"
+#include "gfx/renderer.h"
+#include <sys/stat.h>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
+
+
+#include "runtime.h"
+#include "build_info.h"
+#include "controller_reapply.h"
+#include "crashrec.h"
+#include "portable_state.h"
+#include "portable_restart.h"
+#include "fixed_seed.h"
+#include "hle/os_time.h"
+#include "state_memory.h"
+#include "state_file_section.h"
+#include "mods/guest_mods.h"
+#include "mods/native_actor_profiles.h"
+#include "mods/guest_profile_state.h"
+#include "mods/mods.h"
+#include "mods/guest_state_section.h"
+#include "mods/save_profile.h"
+#include "mods/save_profile_state.h"
+#include "mods/story_chart.h"
+#include "quit_prompt.h"
+#include "rumble.h"
+#include "save_convenience.h"
+#include "mods/player_models.h"
+#include "mods/player_models_core.h"
+
+// module sections
+bool threads_ss_save(ss::Writer& w, std::string& why);
+bool threads_ss_check(ss::Reader r, std::string& why);
+bool threads_ss_validate(ss::Reader r,std::string& why);
+void threads_ss_load(ss::Reader& r);
+void threads_ss_targets(ss::Reader r);
+void mem_ss_save(ss::Writer& w);
+bool mem_ss_check(ss::Reader r, std::string& why);
+bool mem_ss_validate(ss::Reader r,std::string& why);
+void mem_ss_load(ss::Reader& r);
+void fs_ss_save(ss::Writer& w);
+bool fs_ss_check(ss::Reader r,std::string& why);
+void fs_ss_load(ss::Reader& r);
+void ax_ss_save(ss::Writer& w);
+bool ax_ss_check(ss::Reader r, std::string& why);
+void ax_ss_load(ss::Reader& r);
+void gx2_ss_drain();
+void gx2_ss_save(ss::Writer& w);
+bool gx2_ss_check(ss::Reader r, std::string& why);
+bool gx2_ss_validate(ss::Reader r,std::string& why);
+void gx2_ss_load(ss::Reader& r);
+namespace interp { void ss_reset(); }
+namespace aspect { void ss_reset(); }
+namespace button_glyphs { void ss_reset(); }
+namespace dispatch { std::vector<std::pair<uint32_t, std::string>> host_functions(); }
+
+namespace interp { uint64_t logic_steps(); }
+namespace ss {
+namespace {
+
+mods::save_profile::Selection g_save_profile;
+mods::save_profile::Paths g_save_profile_paths;
+bool g_save_profile_configured=false,g_profile_state_dir_used=false;
+std::string g_profile_state_directory;
+mods::save_profile::StateIdentity current_profile_identity() {
+    return {g_save_profile.namespace_key(),g_save_profile.owner,g_save_profile.fingerprint};
+}
+
+constexpr char kMagic[8] = {'W', 'W', 'H', 'D', 'S', 'T', 'A', 'T'};
+constexpr uint32_t kVersion = kStreamVersion;
+#ifdef __APPLE__
+constexpr uint32_t kFastVersion = 1;
+#else
+constexpr uint32_t kFastVersion = 2;
+#endif
+constexpr uint32_t kChunk = 0x10000;
+constexpr uint32_t kBlock = 8 << 20;  // unchanged fast-format block size
+
+using Header = FullStateHeader;
+
+enum : uint32_t {
+    kSecThreads = 'THRD',
+    kSecHeaps = 'HEAP',
+    kSecFiles = 'FILE',
+    kSecAudio = 'AX  ',
+    kSecGx2 = 'GX2 ',
+    kSecAllocs = 'RALC',
+    kSecDispatch = 'DSPT',
+    kSecMemory = 'MEM ',
+    kSecGuestMods = 'GMOD',
+    kSecGuestProfiles = 'GPRF',
+    kSecSaveProfile = 'SPID',
+    kSecAspectParticles = 'APAR',
+    kSecOsTime = 'OSTB',  // the calendar clock's bias (hle/os_time.h); absent in older states
+};
+
+using Region=MemoryRegion;
+
+std::vector<Region> regions() {
+    uint32_t top = (mem::runtime_top() + kChunk - 1) & ~(kChunk - 1);
+    std::vector<Region> r = {{mem::kMem2Start, mem::kMem2End - mem::kMem2Start},
+            {mem::kRuntimeStart, top - mem::kRuntimeStart},
+            {mem::kFixedStart, mem::kFixedSize},
+            {mem::kFgBucket, mem::kFgBucketSize},
+            {mem::kMem1, mem::kMem1Size},
+            {guestmods::kRegionStart,guestmods::kRegionSize}};
+    // a GameCube player model's appended data while one is in (mods/player_models.h); states without one are as before
+    uint32_t pmUsed = 0;
+    const uint32_t pm = player_models::area(&pmUsed);
+    if (pmUsed) r.push_back({pm, (pmUsed + kChunk - 1) & ~(kChunk - 1)});
+    return r;
+}
+
+// A snapshot in memory: header + payload (sections); memory chunks point into the payload.
+struct Snapshot {
+    LoadResult load_result;
+    bool load_applied=false;
+    Header h{};
+    std::vector<uint8_t> payload;
+    std::map<uint32_t, std::pair<size_t, size_t>> sections;  // tag -> (offset, size)
+    std::unordered_map<uint32_t, const uint8_t*> chunks;      // chunk address -> data (absent = zero)
+    std::vector<Region> regs;
+    int slot = 0;
+    std::vector<guestmods::ModIdentity> guest_mods;
+
+    Reader section(uint32_t tag) const {
+        auto it = sections.find(tag);
+        if (it == sections.end()) return Reader(nullptr, 0);
+        return Reader(payload.data() + it->second.first, it->second.second);
+    }
+    bool parse() {
+        Reader r(payload.data(), payload.size());
+        while (r.ok && !r.at_end()) {
+            uint32_t tag = r.u32();
+            uint64_t n = r.u64();
+            size_t off = r.p - payload.data();
+            if (!r.bytes(nullptr, n)) return false;
+            if (!sections.emplace(tag,std::make_pair(off,size_t(n))).second) return false;
+        }
+        if (!r.ok || !sections.count(kSecMemory) || !sections.count(kSecFiles)) return false;
+        std::string fileWhy;
+        if(!check_file_section(section(kSecFiles),fileWhy))return false;
+        if(!guestmods::read_mod_set(section(kSecGuestMods),guest_mods))return false;
+        mods::save_profile::StateIdentity profile;
+        if(!mods::save_profile::read_state_identity(section(kSecSaveProfile),profile))return false;
+        if(!mods::save_profile::valid_state_requirement(h.reserved,profile))return false;
+        Reader m=section(kSecMemory);
+        if(!read_regions(m,regs,chunks))return false;
+        // Never allow file-provided regions to select host-only/unmapped memory.
+        const std::vector<Region> allowed={{mem::kMem2Start,mem::kMem2End-mem::kMem2Start},
+            {mem::kRuntimeStart,mem::kHostStart-mem::kRuntimeStart},{mem::kFixedStart,mem::kFixedSize},
+            {mem::kFgBucket,mem::kFgBucketSize},{mem::kMem1,mem::kMem1Size},
+            {guestmods::kRegionStart,guestmods::kRegionSize},{player_models::kArea,player_models::kAreaSize}};
+        for(const auto& region:regs) {
+            bool valid=false;
+            for(const auto& range:allowed)if(region.base>=range.base && uint64_t(region.base)+region.size<=uint64_t(range.base)+range.size)valid=true;
+            if(!valid)return false;
+        }
+        return true;
+    }
+};
+
+std::mutex g_mu;  // messages, pending requests
+std::mutex g_io;  // one slot file operation at a time
+std::string g_message;
+std::chrono::steady_clock::time_point g_message_time;
+std::atomic<int> g_save_req{0};
+int g_done_slot = 0;                       // request_save(slot, done): whose `done` is waiting
+std::function<void(bool, const std::string&)> g_done;
+std::shared_ptr<Snapshot> g_load_ready;   // decompressed, waiting for the frame boundary
+std::atomic<bool> g_loading{false};       // a slot file is being read
+int g_attempts = 0;
+const Snapshot* g_check = nullptr;        // snapshot whose memory snap_ld32 reads
+
+void message(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
+void message(const char* fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    LOG("[savestate] %s", buf);
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_message = buf;
+    g_message_time = std::chrono::steady_clock::now();
+}
+
+void append_mod_warning(bool differs) {
+    if(!differs)return;
+    LOG("[savestate] %s",guestmods::kModWarning);
+    std::lock_guard<std::mutex> lock(g_mu);
+    g_message+="; ";g_message+=guestmods::kModWarning;
+    g_message_time=std::chrono::steady_clock::now();
+}
+
+// the waiting `done` of request_save(slot, done), taken out (empty if it is for another slot)
+std::function<void(bool, const std::string&)> take_done(int slot) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_done_slot != slot) return {};
+    g_done_slot = 0;
+    return std::move(g_done);
+}
+void report_done(int slot, bool ok, const std::string& why) {
+    if (auto d = take_done(slot)) d(ok, why);
+}
+
+std::string state_dir() {
+    static const std::string dir = [] {
+        std::string d;
+        if (const char* e = getenv("WWHD_STATE_DIR")) d = e;
+        else {
+#ifdef __APPLE__
+            d=std::string(getenv("HOME")?getenv("HOME"):".")+"/Library/Application Support/wwhd/states";
+#else
+            d=host::config_dir()+"/states";
+#endif
+        }
+        // Declarative SDK profiles already selected and validated their owned
+        // state location. Ordinary/translated seeds retain the existing layout.
+        if(!g_save_profile.empty())d=g_profile_state_directory;
+        else d=randomizer::seed_directory(d);
+        g_profile_state_dir_used=true;
+        std::error_code ec; std::filesystem::create_directories(d,ec);
+        return d;
+    }();
+    return dir;
+}
+bool is_auto(int slot) { return slot > crashrec::kAutoBase && slot <= crashrec::kAutoBase + crashrec::kAutoSlots; }
+namespace conv = convenience;
+std::string slot_label(int slot) {
+    if(slot==-1)return "Editor state";
+    if (slot == conv::kLastSessionSlot) return "Last session";
+    if (conv::is_auto_save(slot)) return "Auto save " + std::to_string(slot - conv::kAutoSaveBase);
+    return is_auto(slot) ? "Automatic state " + std::to_string(slot - crashrec::kAutoBase) : "Slot " + std::to_string(slot);
+}
+std::string slot_path(int slot, const char* ext = "bin") {
+    // the convenience slots (save_convenience.h) hold portable states only
+    if (slot == conv::kLastSessionSlot) return state_dir() + "/last_session." + ext;
+    if (conv::is_auto_save(slot)) {
+        std::error_code ec;
+        std::filesystem::create_directories(state_dir() + "/autosave", ec);
+        return state_dir() + "/autosave/autosave" + std::to_string(slot - conv::kAutoSaveBase) + "." + ext;
+    }
+    if (is_auto(slot)) return state_dir() + "/auto/auto" + std::to_string(slot - crashrec::kAutoBase) + "." + ext;  // crashrec.cpp
+    return state_dir() + "/slot" + std::to_string(slot) + "." + ext;
+}
+
+void build_uuid(uint8_t out[16]) {
+    memset(out, 0, 16);
+#ifdef __APPLE__
+    const auto* h = (const mach_header_64*)&_mh_execute_header;
+    const uint8_t* p = (const uint8_t*)(h + 1);
+    for (uint32_t i = 0; i < h->ncmds; i++) {
+        const auto* lc = (const load_command*)p;
+        if (lc->cmd == LC_UUID) { memcpy(out, ((const uuid_command*)lc)->uuid, 16); return; }
+        p += lc->cmdsize;
+    }
+#else
+    // Hash the complete executable so an incompatible rebuild is never accepted merely because
+    // its CPU structure size happens to match. Addresses are ASLR independent.
+    uint64_t first=0xcbf29ce484222325ull,second=0x84222325cbf29ce4ull;
+    FILE* f=fopen(host::executable_path().c_str(),"rb");
+    if(!f) { LOG("[savestate] cannot identify executable; state compatibility is unavailable"); return; }
+    unsigned char buf[65536];size_t n;
+    while((n=fread(buf,1,sizeof buf,f)))for(size_t i=0;i<n;i++){first=(first^buf[i])*0x100000001b3ull;second=(second+buf[i])*0x100000001b3ull;}
+    fclose(f);memcpy(out,&first,8);memcpy(out+8,&second,8);
+#endif
+}
+
+uint64_t game_id() {
+    static const uint64_t id = [] {
+        uint64_t h = 0xcbf29ce484222325ull;
+        FILE* f = fopen(randomizer::game_rpx(config::game_dir).c_str(), "rb");
+        if (!f) return h;
+        std::vector<uint8_t> buf(1 << 20);
+        size_t n;
+        while ((n = fread(buf.data(), 1, buf.size(), f)) > 0)
+            for (size_t i = 0; i < n; i++) h = (h ^ buf[i]) * 0x100000001b3ull;
+        fclose(f);
+        return h;
+    }();
+    return id;
+}
+
+// current stage (dComIfG_gameInfo.play: the start stage, 8 chars)
+const uint32_t kStageName = GD(0x1046F0B0) + 0x5134;  // dStage_startStage_c (next stage at +0x5140)
+std::string stage_name() {
+    if (const char* e = getenv("WWHD_STATE_STAGE_ADDR")) {
+        uint32_t a = (uint32_t)strtoul(e, nullptr, 16);
+        return std::string((const char*)mem::ptr(a), strnlen((const char*)mem::ptr(a), 8));
+    }
+    const char* p = (const char*)mem::ptr(kStageName);
+    size_t n = strnlen(p, 8);
+    for (size_t i = 0; i < n; i++)
+        if (p[i] < 0x20 || p[i] > 0x7E) return "";
+    return std::string(p, n);
+}
+
+// ---------------------------------------------------------------- memory
+void capture_memory(Writer& w) {
+    capture_regions(w,regions(),[](uint32_t a){return mem::ptr(a);},
+                    [](const uint8_t* p,size_t n){return host::memory_touched(const_cast<uint8_t*>(p),n);});
+}
+
+void restore_memory(const Snapshot& s) {
+    restore_regions(s.regs,s.chunks,[](uint32_t a){return mem::ptr(a);},
+                    [](const uint8_t* p,size_t n){return host::memory_touched(const_cast<uint8_t*>(p),n);});
+}
+
+// ---------------------------------------------------------------- slot files
+bool write_slot(int slot, const Header& h0, const std::vector<uint8_t>& payload, const std::string& destination = {}) {
+    Header h = h0;
+    size_t nblocks = (payload.size() + kBlock - 1) / kBlock;
+    h.blocks = (uint32_t)nblocks;
+    h.raw_size = payload.size();
+    std::vector<std::vector<uint8_t>> out(nblocks);
+    std::vector<std::thread> pool;
+    std::atomic<size_t> next{0};
+    unsigned nt = std::max(1u, std::min(8u, std::thread::hardware_concurrency()));
+    for (unsigned t = 0; t < nt; t++)
+        pool.emplace_back([&] {
+#ifdef __APPLE__
+            std::vector<uint8_t> scratch(compression_encode_scratch_buffer_size(COMPRESSION_LZ4));
+#endif
+            for (size_t i; (i = next++) < nblocks;) {
+                size_t raw = std::min<size_t>(kBlock, payload.size() - i * kBlock);
+                std::vector<uint8_t>& o = out[i];
+                o.resize(8 + raw + raw / 8 + 1024);
+#ifdef __APPLE__
+                size_t n = compression_encode_buffer(o.data() + 8, o.size() - 8, payload.data() + i * kBlock, raw, scratch.data(), COMPRESSION_LZ4);
+#else
+                size_t n = (size_t)LZ4_compress_default((const char*)payload.data()+i*kBlock,(char*)o.data()+8,(int)raw,(int)o.size()-8);
+#endif
+                uint32_t hdr[2] = {(uint32_t)raw, (uint32_t)n};
+                if (!n || n >= raw) {  // incompressible: stored
+                    memcpy(o.data() + 8, payload.data() + i * kBlock, raw);
+                    hdr[1] = 0;
+                    n = raw;
+                }
+                memcpy(o.data(), hdr, 8);
+                o.resize(8 + n);
+            }
+        });
+    for (auto& t : pool) t.join();
+    std::string tmp = (destination.empty()?slot_path(slot,"tmp"):destination+".tmp");
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) return false;
+    bool ok = fwrite(&h, sizeof h, 1, f) == 1;
+    for (auto& o : out) ok = ok && fwrite(o.data(), 1, o.size(), f) == o.size();
+    ok = fclose(f) == 0 && ok;
+    if (ok) ok = host::replace_file(tmp,(destination.empty()?slot_path(slot):destination));
+    else remove(tmp.c_str());
+    return ok;
+}
+
+// commit (optional) runs after the whole state is written to the temporary file and
+// before it replaces the slot; false discards the file and keeps the old slot.
+template<class Pointer,class Touched>
+bool write_memory_slot(int slot,const Header& h,const Writer& metadata,const std::vector<Region>& regs,
+                       Pointer pointer,Touched touched,uint64_t& rawSize,
+                       const std::function<bool()>& commit = {}, const std::string& destination = {}) {
+    const auto plan=plan_regions(regs,pointer,touched);
+    const std::string tmp=(destination.empty()?slot_path(slot,"tmp"):destination+".tmp");
+    struct Temporary {
+        std::string path;FILE* file=nullptr;
+        ~Temporary(){if(file)fclose(file);remove(path.c_str());}
+    } temp{tmp,fopen(tmp.c_str(),"wb")};
+    if(!temp.file)return false;
+    FullStateStreamWriter stream(temp.file,h);
+    const uint32_t tag=kSecMemory;
+    if(!stream.bytes(metadata.b.data(),metadata.b.size()) || !stream.bytes(&tag,sizeof tag) ||
+       !stream.bytes(&plan.size,sizeof plan.size) || !stream_regions(stream,plan,pointer))return false;
+    rawSize=stream.raw_size();
+    if(!stream.finish())return false;
+    const bool closed=fclose(temp.file)==0;temp.file=nullptr;
+    if(!closed || (commit && !commit()))return false;
+    return host::replace_file(tmp,(destination.empty()?slot_path(slot):destination));
+}
+
+bool read_header(FILE* f, Header& h, std::string& why) {
+    if (!read_full_state_header(f, h, why)) return false;
+    if (!full_state_version_supported(h.version)) { why = "saved by another version"; return false; }
+    if (!memchr(h.area,0,sizeof h.area)) {why="invalid state area";return false;}
+    if (h.cpu_size != sizeof(Cpu)) { why = "saved by an incompatible build"; return false; }
+    if (h.game_id != game_id()) { why = "saved with a different game executable"; return false; }
+    return true;
+}
+std::shared_ptr<Snapshot> read_slot(int slot, std::string& why, const std::string& source = {}) {
+    try {
+    std::unique_ptr<FILE,decltype(&fclose)> file(fopen((source.empty()?slot_path(slot):source).c_str(),"rb"),fclose);
+    if(!file){why="empty";return nullptr;}
+    auto state=std::make_shared<Snapshot>();state->slot=slot;
+    if(!read_header(file.get(),state->h,why) || !read_full_state_payload(file.get(),state->h,state->payload,why))return nullptr;
+    if(!state->parse()){why="file is corrupt";return nullptr;}
+    return state;
+    } catch(const std::exception&) {why="state is corrupt or exceeds available memory";return nullptr;}
+}
+
+// ---------------------------------------------------------------- save / load at the frame boundary
+void put_section(Writer& w, uint32_t tag, const Writer& sec) {
+    w.u32(tag);
+    w.u64(sec.b.size());
+    w.bytes(sec.b.data(), sec.b.size());
+}
+
+void save_allocs(Writer& w) {
+    auto log = mem::runtime_alloc_log();
+    w.u32(mem::runtime_top());
+    w.u32((uint32_t)log.size());
+    for (auto& a : log) w.pod(a);
+}
+
+bool check_allocs(Reader r, std::string& why) {
+    uint32_t top = r.u32();
+    uint32_t n = r.u32();
+    if(!r.ok || top<mem::kRuntimeStart || top>mem::kHostStart ||
+       n!=size_t(r.e-r.p)/sizeof(mem::AllocRec) || size_t(r.e-r.p)%sizeof(mem::AllocRec)) {
+        why="corrupt runtime allocation section";return false;
+    }
+    auto cur = mem::runtime_alloc_log();
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+        mem::AllocRec a = r.pod<mem::AllocRec>();
+        if(a.addr<mem::kRuntimeStart || uint64_t(a.addr)+a.size>top) {
+            why="invalid runtime allocation range";return false;
+        }
+        if (i >= cur.size()) continue; // still validate later saved allocations
+        const mem::AllocRec& b = cur[i];
+        // (the allocating code address, a.tag, changes with every rebuild: only logged)
+        if (a.tag != b.tag && i < 4) LOG("[savestate] runtime object #%u allocated by different code (rebuilt?)", i);
+        if (a.addr != b.addr || a.size != b.size) {
+            char buf[160];
+            snprintf(buf, sizeof buf, "runtime objects are laid out differently (#%u: %08X+%X vs %08X+%X)", i, a.addr, a.size, b.addr,
+                     b.size);
+            why = buf;
+            return false;
+        }
+    }
+    return r.ok;
+}
+
+void save_dispatch(Writer& w) {
+    auto v = dispatch::host_functions();
+    w.u32((uint32_t)v.size());
+    for (auto& [a, n] : v) {
+        w.u32(a);
+        w.str(n);
+    }
+}
+
+bool check_dispatch(Reader r, std::string& why) {
+    std::unordered_map<uint32_t, std::string> cur;
+    for (auto& [a, n] : dispatch::host_functions()) cur[a] = n;
+    uint32_t n = r.u32();
+    if(!r.ok || n>size_t(r.e-r.p)/8){why="corrupt dispatch section";return false;}
+    for (uint32_t i = 0; i < n && r.ok; i++) {
+        uint32_t a = r.u32();
+        std::string name = r.str();
+        auto it = cur.find(a);
+        if (it == cur.end() || it->second != name) {
+            why = "host function " + name + " is not registered at the same address";
+            return false;
+        }
+    }
+    if(!r.ok || !r.at_end()){why="corrupt dispatch section";return false;}
+    return true;
+}
+
+std::string area_label(const char* stage) {
+    static const std::map<std::string, std::string> names = {
+        {"sea", "Great Sea"}, {"LinkRM", "Link's House"}, {"MajyuE", "Forsaken Fortress"}, {"M_NewD2", "Dragon Roost Cavern"},
+        {"kindan", "Forbidden Woods"}, {"Siren", "Tower of the Gods"}, {"Asoko", "Tetra's Ship"},
+    };
+    auto it = names.find(stage);
+    if (it != names.end()) return it->second;
+    mod_stages::Info mod;  // a mod stage: its package's id for it, never the port's name
+    return mod_stages::find(stage, mod) ? mod.id + " (" + mod.mod + ")" : std::string(stage);
+}
+
+// true when done (saved or failed for good); false to retry on the next frame
+bool do_save_fast(int slot, const std::string& destination, std::function<void(bool,const std::string&)> done) {
+    auto report=[&](bool ok,const std::string& why){if(done)done(ok,why);else report_done(slot,ok,why);};
+    mods::fast_forward_reset();
+    mods::lock_on_reset();
+    mods::quick_use_reset();
+    mods::item_ring_reset();
+    mods::touch_talk_reset();
+    mods::steer_reset();
+    std::string busy, why;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!threads::quiesce(250, busy, 1, 30)) {
+        threads::thaw();
+        if (++g_attempts < 30) return false;
+        if (!is_auto(slot)) message("Slot %d: not saved (game busy:%s)", slot, busy.c_str());
+        report(false, "game busy:" + busy);
+        return true;
+    }
+    // A registered native controller retains its own entry fence through the
+    // complete RALC and guest-memory capture, including its final receipt
+    // commit before any captured payload can be written.
+    std::unique_ptr<native_gate::Hold> native_hold;
+    auto* native_controller = native_gate::controller();
+    if (native_controller) {
+        native_hold = native_gate::try_begin_save(native_controller);
+        if (!native_hold) {
+            threads::thaw();
+            if (!is_auto(slot)) message("Slot %d: not saved (native event transaction busy)", slot);
+            report(false, "native event transaction busy");
+            return true;
+        }
+    }
+    gx2_ss_drain();
+    Writer threads_w;
+    if (!threads_ss_save(threads_w, why)) {
+        native_hold.reset(); // workers are still parked; thaw may wait for one
+        threads::thaw();
+        if (++g_attempts < 30) return false;
+        if (!is_auto(slot)) message("Slot %d: not saved (%s)", slot, why.c_str());
+        report(false, why);
+        return true;
+    }
+    auto payload = std::make_shared<Writer>();
+    payload->b.reserve(512u << 20);
+    put_section(*payload, kSecThreads, threads_w);
+    Writer w;
+    mem_ss_save(w);
+    put_section(*payload, kSecHeaps, w);
+    w = Writer();
+    fs_ss_save(w);
+    put_section(*payload, kSecFiles, w);
+    w = Writer();
+    ax_ss_save(w);
+    put_section(*payload, kSecAudio, w);
+    w = Writer();
+    gx2_ss_save(w);
+    put_section(*payload, kSecGx2, w);
+    w = Writer();
+    save_allocs(w);
+    put_section(*payload, kSecAllocs, w);
+    w = Writer();
+    save_dispatch(w);
+    put_section(*payload, kSecDispatch, w);
+    w=Writer();guestmods::save_mod_set(w,guestmods::enabled_mods());
+    put_section(*payload,kSecGuestMods,w);
+    w=Writer();w.str(native_actor_profiles::guest_identity());
+    put_section(*payload,kSecGuestProfiles,w);
+    if(!g_save_profile.empty()) {
+        w=Writer();mods::save_profile::write_state_identity(w,current_profile_identity());
+        put_section(*payload,kSecSaveProfile,w);
+    }
+    w=Writer();aspect::ss_save_particles(w);
+    put_section(*payload,kSecAspectParticles,w);
+    w=Writer();w.u64((uint64_t)os_time::bias());
+    put_section(*payload,kSecOsTime,w);
+    // memory last, written straight into the payload
+    payload->u32(kSecMemory);
+    size_t len_at = payload->b.size();
+    payload->u64(0);
+    story_chart::capture_begin();  // the sea chart's story marks as the game left them (mod markers off)
+    capture_memory(*payload);
+    story_chart::capture_end();
+    uint64_t mlen = payload->b.size() - len_at - 8;
+    memcpy(&payload->b[len_at], &mlen, 8);
+    Header h{};
+    memcpy(h.magic, kMagic, 8);
+    h.version = kFastVersion;
+    h.reserved = g_save_profile.empty() ? 0 : kRequiresSaveProfile;
+    h.header_size = sizeof(Header);
+    h.created = (uint64_t)time(nullptr);
+    std::string stage = stage_name();
+    snprintf(h.area, sizeof h.area, "%s", stage.c_str());
+    build_uuid(h.build);
+    h.game_id = game_id();
+    h.cpu_size = sizeof(Cpu);
+    h.controller = input::pro_controller() ? 2 : 1;
+    if (native_controller && !native_gate::try_finish_save(native_controller)) {
+        native_hold.reset();
+        threads::thaw();
+        if (!is_auto(slot)) message("Slot %d: not saved (native capture receipt changed)", slot);
+        report(false, "native capture receipt changed");
+        return true;
+    }
+    native_hold.reset(); // completed capture; release before thaw reacquires the core
+    threads::thaw();
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    LOG("[savestate] slot %d: captured %.1f MB in %.1f ms (stage %s)", slot, payload->b.size() / 1048576.0, ms, stage.c_str());
+    if (!is_auto(slot)) render::request_tv_dump(destination.empty()?slot_path(slot,"png"):destination+".png", 0);
+    else crashrec::on_auto_saved(slot - crashrec::kAutoBase);
+    // compress and write in the background; the game continues
+    std::thread([slot, h, payload, stage, destination, done = done?done:take_done(slot)] {
+        auto t1 = std::chrono::steady_clock::now();
+        bool ok;
+        {
+            std::lock_guard<std::mutex> io(g_io);
+            ok = write_slot(slot, h, payload->b,destination);
+        }
+        double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        struct stat st{};
+        stat((destination.empty()?slot_path(slot):destination).c_str(), &st);
+        LOG("[savestate] slot %d: %s (%.1f MB on disk, %.0f ms)", slot, ok ? "written" : "WRITE FAILED", st.st_size / 1048576.0, ms);
+        if (done) done(ok, ok ? "" : "write failed");
+        if (is_auto(slot)) return;  // automatic states stay quiet
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_message = destination.empty()?(ok ? "Saved to slot " + std::to_string(slot) + (stage.empty() ? "" : " (" + area_label(stage.c_str()) + ")")
+                       : "Slot " + std::to_string(slot) + ": write failed"):(ok?"Editor state saved":"Editor state: write failed");
+        g_message_time = std::chrono::steady_clock::now();
+    }).detach();
+    return true;
+}
+
+bool do_save_streaming(int slot, const std::string& destination, std::function<void(bool,const std::string&)> done) {
+    auto report=[&](bool ok,const std::string& why){if(done)done(ok,why);else report_done(slot,ok,why);};
+    mods::fast_forward_reset();
+    mods::lock_on_reset();
+    mods::quick_use_reset();
+    mods::item_ring_reset();
+    mods::touch_talk_reset();
+    mods::steer_reset();
+    std::string busy, why;
+    // Defer before freezing if a previous slot read is still in progress.
+    std::unique_lock<std::mutex> io(g_io,std::try_to_lock);
+    if(!io.owns_lock())return false;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!threads::quiesce(250, busy, 1, 30)) {
+        threads::thaw();
+        if (++g_attempts < 30) return false;
+        if (!is_auto(slot)) message("Slot %d: not saved (game busy:%s)", slot, busy.c_str());
+        report(false, "game busy:" + busy);
+        return true;
+    }
+    struct ThawGuard {bool active=true;~ThawGuard(){if(active)threads::thaw();}} thaw;
+    // The same native entry fence as the fast path, held through the streamed
+    // capture; its receipt commit runs before the written file replaces the slot.
+    std::unique_ptr<native_gate::Hold> native_hold;
+    auto* native_controller = native_gate::controller();
+    if (native_controller) {
+        native_hold = native_gate::try_begin_save(native_controller);
+        if (!native_hold) {
+            threads::thaw();thaw.active=false;
+            if (!is_auto(slot)) message("Slot %d: not saved (native event transaction busy)", slot);
+            report(false, "native event transaction busy");
+            return true;
+        }
+    }
+    gx2_ss_drain();
+    Writer threads_w;
+    if (!threads_ss_save(threads_w, why)) {
+        native_hold.reset(); // workers are still parked; thaw may wait for one
+        threads::thaw();thaw.active=false;
+        if (++g_attempts < 30) return false;
+        if (!is_auto(slot)) message("Slot %d: not saved (%s)", slot, why.c_str());
+        report(false, why);
+        return true;
+    }
+    Writer metadata;
+    auto* payload=&metadata;
+    put_section(*payload, kSecThreads, threads_w);
+    Writer w;
+    mem_ss_save(w);
+    put_section(*payload, kSecHeaps, w);
+    w = Writer();
+    fs_ss_save(w);
+    put_section(*payload, kSecFiles, w);
+    w = Writer();
+    ax_ss_save(w);
+    put_section(*payload, kSecAudio, w);
+    w = Writer();
+    gx2_ss_save(w);
+    put_section(*payload, kSecGx2, w);
+    w = Writer();
+    save_allocs(w);
+    put_section(*payload, kSecAllocs, w);
+    w = Writer();
+    save_dispatch(w);
+    put_section(*payload, kSecDispatch, w);
+    w=Writer();guestmods::save_mod_set(w,guestmods::enabled_mods());
+    put_section(*payload,kSecGuestMods,w);
+    w=Writer();w.str(native_actor_profiles::guest_identity());
+    put_section(*payload,kSecGuestProfiles,w);
+    if(!g_save_profile.empty()) {
+        w=Writer();mods::save_profile::write_state_identity(w,current_profile_identity());
+        put_section(*payload,kSecSaveProfile,w);
+    }
+    w=Writer();aspect::ss_save_particles(w);
+    put_section(*payload,kSecAspectParticles,w);
+    w=Writer();w.u64((uint64_t)os_time::bias());
+    put_section(*payload,kSecOsTime,w);
+    Header h{};
+    memcpy(h.magic, kMagic, 8);
+    h.version = kVersion;
+    h.reserved = g_save_profile.empty() ? 0 : kRequiresSaveProfile;
+    h.header_size = sizeof(Header);
+    h.created = (uint64_t)time(nullptr);
+    std::string stage = stage_name();
+    snprintf(h.area, sizeof h.area, "%s", stage.c_str());
+    build_uuid(h.build);
+    h.game_id = game_id();
+    h.cpu_size = sizeof(Cpu);
+    h.controller = input::pro_controller() ? 2 : 1;
+    uint64_t rawSize=0;
+    bool ok=false,receipt_refused=false;
+    try {
+        struct ChartCaptureGuard { ChartCaptureGuard(){story_chart::capture_begin();} ~ChartCaptureGuard(){story_chart::capture_end();} } chartCapture;
+        ok=write_memory_slot(slot,h,metadata,regions(),[](uint32_t a){return mem::ptr(a);},
+             [](const uint8_t* p,size_t n){return host::memory_touched(const_cast<uint8_t*>(p),n);},rawSize,
+             [&]{
+                 if(!native_controller || native_gate::try_finish_save(native_controller))return true;
+                 receipt_refused=true;return false;
+             },destination);
+    } catch(const std::exception&) {ok=false;}
+    native_hold.reset(); // completed capture; release before thaw reacquires the core
+    threads::thaw();thaw.active=false;io.unlock();
+    if(receipt_refused) {
+        if (!is_auto(slot)) message("Slot %d: not saved (native capture receipt changed)", slot);
+        report(false, "native capture receipt changed");
+        return true;
+    }
+    const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t0).count();
+    LOG("[savestate] slot %d: %s %.1f MB streamed in %.1f ms (guest paused)",slot,ok?"written":"WRITE FAILED",rawSize/1048576.0,ms);
+    if(ok) {
+        if(!is_auto(slot))render::request_tv_dump(destination.empty()?slot_path(slot,"png"):destination+".png",0);
+        else crashrec::on_auto_saved(slot-crashrec::kAutoBase);
+    }
+    if(auto notify=done?done:take_done(slot))notify(ok,ok?"":"write failed");
+    if(!is_auto(slot)) {
+        std::lock_guard<std::mutex> lock(g_mu);
+        g_message=destination.empty()?(ok?"Saved to slot "+std::to_string(slot)+(stage.empty()?"":" ("+area_label(stage.c_str())+")")
+                    :"Slot "+std::to_string(slot)+": write failed"):(ok?"Editor state saved":"Editor state: write failed");
+        g_message_time=std::chrono::steady_clock::now();
+    }
+    return true;
+}
+
+// Android about to end the game for lack of memory (memory_trim.h, save_refused): the save is refused with a message
+// instead of being started (GreenNaugahyde/ZeldaWWHDRecompAndroid v0.9.9, issue #51). Automatic states stay quiet.
+int save_min_headroom_mb() {
+    static const int v = getenv("WWHD_STATE_MIN_HEADROOM_MB") ? atoi(getenv("WWHD_STATE_MIN_HEADROOM_MB")) : memory_trim::kSaveMinHeadroomMb;
+    return v;
+}
+bool do_save(int slot,const std::string& destination = {},std::function<void(bool,const std::string&)> done = {}) {
+    if (const int headroom = memory_trim::headroom_mb(); memory_trim::save_refused(headroom, save_min_headroom_mb())) {
+        LOG("[savestate] %s: not saved: %d MB above the system's low-memory line (needs %d)", slot_label(slot).c_str(), headroom,
+            save_min_headroom_mb());
+        if (!is_auto(slot) && slot != -1) message("%s: not saved (too little free memory, close other apps)", slot_label(slot).c_str());
+        const std::string why = "too little free memory";
+        if (done) done(false, why); else report_done(slot, false, why);
+        return true;
+    }
+    return use_streaming_save(save_path()) ? do_save_streaming(slot,destination,std::move(done)) : do_save_fast(slot,destination,std::move(done));
+}
+
+void cancel_portable_arrival(const std::string&);
+
+bool do_load(const std::shared_ptr<Snapshot>& s) {
+    auto refused=[&](const std::string& why){s->load_result.complete(false,why);return true;};
+    if(!mods::save_profile::compatible_full_state(s->section(kSecSaveProfile),current_profile_identity())) {
+        message("%s: save profile or trusted package differs",slot_label(s->slot).c_str());
+        return refused("save profile or trusted package differs");
+    }
+    for(uint32_t tag:{kSecThreads,kSecHeaps,kSecFiles,kSecAudio,kSecGx2,kSecAllocs,kSecDispatch})
+        if(!s->sections.count(tag)){message("%s: incomplete state",slot_label(s->slot).c_str());return refused("incomplete state");}
+    {
+        if(!native_actor_profiles::compatible_state(s->section(kSecGuestProfiles),native_actor_profiles::guest_identity())){
+            message("%s: actor profile/code fingerprint differs; use a portable state",slot_label(s->slot).c_str());
+            return refused("actor profile/code fingerprint differs");
+        }
+    }
+    // a state made in a mod stage needs the package that makes the stage (its rooms load from the stage cache)
+    if(mod_stages::missing(std::string(s->h.area,strnlen(s->h.area,sizeof s->h.area)))){message("%s: made in a mod stage that no installed package makes",slot_label(s->slot).c_str());return refused("made in a mod stage that no installed package makes");}
+    mods::fast_forward_reset();
+    mods::quick_use_reset();
+    mods::item_ring_reset();
+    mods::touch_talk_reset();
+    mods::steer_reset();
+    std::string busy, why;
+    // Structural checks precede targets: that helper changes thread wait state.
+    try {
+        if(!aspect::ss_validate_particles(s->section(kSecAspectParticles)) ||
+           !gx2_ss_validate(s->section(kSecGx2),why) || !mem_ss_validate(s->section(kSecHeaps),why) ||
+           !threads_ss_validate(s->section(kSecThreads),why)) {
+            message("%s: invalid state metadata",slot_label(s->slot).c_str());return refused("invalid state metadata");
+        }
+    } catch(const std::exception&) {
+        message("%s: insufficient memory to validate state",slot_label(s->slot).c_str());return refused("insufficient memory to validate state");
+    }
+    auto t0 = std::chrono::steady_clock::now();
+    threads_ss_targets(s->section(kSecThreads));
+    if (!threads::quiesce(250, busy, 2, 0)) {
+        threads::thaw();
+        if (++g_attempts < 30) return false;
+        message("%s: not loaded (game busy:%s)", slot_label(s->slot).c_str(), busy.c_str());
+        return refused("game busy: "+busy);
+    }
+    struct ThawGuard {bool active=true;~ThawGuard(){if(active)threads::thaw();}} thaw;
+    gx2_ss_drain();
+    g_check = s.get();
+    struct CheckGuard {~CheckGuard(){g_check=nullptr;}} checkGuard;
+    bool ok=false,layout_ok=false;
+    try {
+        ok=fs_ss_check(s->section(kSecFiles),why) && check_allocs(s->section(kSecAllocs),why) &&
+           check_dispatch(s->section(kSecDispatch),why) && mem_ss_check(s->section(kSecHeaps),why) &&
+           ax_ss_check(s->section(kSecAudio),why) && gx2_ss_check(s->section(kSecGx2),why);
+        layout_ok=ok;
+        ok=ok && threads_ss_check(s->section(kSecThreads),why);
+    } catch(const std::exception&) {
+        why="insufficient memory to validate state";ok=false;layout_ok=false;
+    }
+    g_check=nullptr;
+    if (!ok) {
+        threads::thaw();thaw.active=false;
+        // threads at other waits right now may be where they were saved on a later frame
+        if (layout_ok && ++g_attempts < 30) {
+            if (g_attempts == 1) LOG("[savestate] slot %d: waiting for the game threads (%s)", s->slot, why.c_str());
+            return false;
+        }
+        message("%s: cannot load here (%s)", slot_label(s->slot).c_str(), why.c_str());
+        return refused(why);
+    }
+    // All saved inputs are owned by Snapshot::payload. This is the last
+    // no-mutation point before restore_memory; the controller must validate
+    // its saved journal and retain a real fence through restore, until thaw.
+    std::unique_ptr<native_gate::Hold> native_hold;
+    auto* native_controller = native_gate::controller();
+    if (native_controller) {
+        native_hold = native_gate::try_begin_load(native_controller,
+            {s->section(kSecAllocs), s->regs, s->chunks});
+        if (!native_hold) {
+            threads::thaw();thaw.active=false;
+            message("%s: cannot load here (native event transaction)", slot_label(s->slot).c_str());
+            return refused("native event transaction");
+        }
+    }
+    restore_memory(*s);s->load_applied=true;  // the host's controller choice stays (controller_reapply: the game follows it)
+    Reader r = s->section(kSecAllocs);
+    mem::raise_runtime_top(r.u32());
+    r = s->section(kSecHeaps);
+    mem_ss_load(r);
+    r = s->section(kSecFiles);
+    fs_ss_load(r);
+    r = s->section(kSecAudio);
+    ax_ss_load(r);
+    r = s->section(kSecGx2);
+    gx2_ss_load(r);
+    guestmods::state_loaded();
+    interp::ss_reset();
+    aspect::ss_load_particles(s->section(kSecAspectParticles));
+    {  // the calendar clock continues from the state's (os_time::restored_bias)
+        Reader t = s->section(kSecOsTime);
+        const bool has = s->sections.count(kSecOsTime) != 0;
+        const int64_t state_bias = has ? (int64_t)t.u64() : 0;
+        os_time::set_bias(os_time::restored_bias(os_time::bias(), has && t.ok, state_bias));
+    }
+    aspect::ss_reset();
+    button_glyphs::ss_reset();
+    rumble::reset();     // an effect running before the load is not the restored game's
+    // A failed rehydrate cannot undo the restored memory. The controller's
+    // begin/finish contract must keep native admission quarantined on failure.
+    auto native_resume_window=NativeRestorePipelineIssuer::begin(threads::current());
+    const bool native_reconciled = !native_controller || native_gate::try_finish_load(native_controller,
+        {s->section(kSecAllocs), s->regs, s->chunks});
+    r = s->section(kSecThreads);
+    threads_ss_load(r);  // last: wakes the parked threads (they continue after the thaw)
+    if(native_reconciled&&r.ok)NativeRestorePipelineIssuer::threads_loaded(*native_resume_window);
+    native_hold.reset(); // completed restore; no held fence across core reacquire
+    threads::thaw();thaw.active=false;
+    if(native_reconciled)NativeRestorePipelineIssuer::after_thaw(*native_resume_window);
+    cancel_portable_arrival("superseded by a full-state load");
+    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    std::string area = s->h.area[0] ? " (" + area_label(s->h.area) + ")" : "";
+    const bool mods_differ=guestmods::different_mods(s->guest_mods,guestmods::enabled_mods());
+    message("Loaded %s%s%s", (is_auto(s->slot)||s->slot==-1) ? slot_label(s->slot).c_str() : ("slot " + std::to_string(s->slot)).c_str(),
+            area.c_str(), native_reconciled ? "" : " (native event transaction quarantined)");
+    append_mod_warning(mods_differ);
+    LOG("[savestate] slot %d: restored in %.1f ms", s->slot, ms);
+    controller_reapply::request("full load");
+    s->load_result.complete(native_reconciled&&r.ok,native_reconciled?(r.ok?"":"restored thread state invalid"):"native event transaction quarantined");
+    return true;
+}
+
+// ---------------------------------------------------------------- portable states (portable_state.h)
+// Made and applied on the game's main thread at the frame boundary, with the game's own save
+// functions (wwhd_src d_save_5.cpp, d_menu_save_card.cpp; GameCube names from zeldaret/tww):
+//   save: dSv_info_c::putSave(current stage) and dComIfGs_setGameStartStage, as the in-game save
+//         does before writing (both undone afterwards: making a portable state changes nothing),
+//         dSv_info_c::memory_to_card into a scratch buffer = this Quest Log's block of cking.sav;
+//         the HD per-file sections through the SaveMgr's own copy functions.
+//   load: dSv_info_c::card_to_memory, then dSv_info_c::getSave(current stage) (the stage's own
+//         memory bits must be the loaded ones when dStage_Delete puts them back), a fresh dungeon
+//         and temporary-flag state, the HD sections, the SaveMgr's refresh (item buttons), and a
+//         stage change the way the game restarts a room after a void-out: dSv_restart_c holds
+//         Link's room, position and angle, and the next stage gets point -1 (dStage_playerInit
+//         creates Link there).
+// The addresses of the game's own globals and functions are canonical (USA) ids: GD()/GC() turn
+// them into this build's (runtime/include/guest_addr.h). An offset inside an object does not
+// change with the build, so only the base of each object is translated.
+const uint32_t kSaveInfoPtr = GD(0x101F84DC);       // dComIfGs save area (dSv_info_c at +0x20)
+const uint32_t kPlay = GD(0x1046F0B0);              // g_dComIfG_gameInfo.play (dComIfG_getGameInfo 025200D4)
+const uint32_t kStartStage = kPlay + 0x5134;    // dStage_startStage_c: name[8], point s16, room s8, layer s8
+const uint32_t kNextStage = kPlay + 0x5140;     // dStage_nextStage_c: the same + enabled, wipe
+const uint32_t kStageData = kPlay + 0x5150;     // dStage_stageDt_c (getStagInfo: vtable +0x15C)
+const uint32_t kLinkPtr = kPlay + 0x5B34;       // mpPlayerPtr[0]: daPy_lk_c
+const uint32_t kShipPtr = kPlay + 0x5B3C;       // dComIfGp_getShipActor: daShip_c (0 without a boat)
+constexpr uint32_t kActorPos = 0x314, kActorRoom = 0x326, kShapeAngleY = 0x32A;  // fopAc_ac_c (WWHD)
+constexpr uint32_t kLinkProc = 0x65F0;              // daPy_lk_c::mCurProc
+constexpr uint32_t kInfo = 0x20;                    // dSv_info_c in the save area
+const uint32_t kDataNum = kInfo + 0x1290;       // dSv_info_c::mDataNum (Quest Log 0..2)
+constexpr uint32_t kReturnPlace = 0x50;             // dSv_player_return_place_c (0xC bytes)
+const uint32_t kMemoryTable = kInfo + 0x380;    // dSv_save_c::mSave[16] (dSv_memory_c, 0x24 each)
+const uint32_t kTurnRestart = kInfo + 0x1258;   // dSv_turnRestart_c: pos 0, param 0xC, angle 0x10, room 0x12, ship pos 0x24, ship angle 0x30, has ship 0x34
+const uint32_t kRestart = kInfo + 0x1128;       // dSv_restart_c: room 0, angle 0x16, pos 0x18, param 0x24, last speed 0x28, last mode 0x2C
+constexpr uint32_t kHdArea = 0x12C0;                // HD per-file data (SaveMgr getters 027200A0..)
+constexpr uint32_t kCardStatusB = 0x18;             // status B in the card block: time 0xC (f32), date 0x10 (u16)
+// game functions
+const uint32_t fn_memory_to_card = GC(0x025BA9FC), fn_card_to_memory = GC(0x025BA7B0), fn_putSave = GC(0x025B9D24),
+               fn_getSave = GC(0x025B9C9C), fn_setGameStartStage = GC(0x025217F8), fn_danInit = GC(0x025B9174),
+               fn_eventInit = GC(0x025B8B10), fn_refreshGame = GC(0x02721880), fn_turnRestartSet = GC(0x025B998C);
+// HD sections: (slot getter, live getter, live <- slot copy) and size in the file (SaveMgr read/write 02724764..)
+struct HdSection { uint32_t slot_get, live_get, copy; size_t size; std::vector<uint8_t> pstate::State::*field; };
+const HdSection kHdSections[] = {
+    {GC(0x027200A0), GC(0x027200D0), GC(0x0271FCB4), pstate::kHdPlayerSize, &pstate::State::hd_player},
+    {GC(0x027200D8), GC(0x027200F4), GC(0x0271FAC0), pstate::kHdStatusSize, &pstate::State::hd_status},
+    {GC(0x027200FC), GC(0x02720118), GC(0x0271F914), pstate::kHdEventSize, &pstate::State::hd_event},
+    {GC(0x02720180), GC(0x0272019C), GC(0x027208F4), pstate::kHdMapSize, &pstate::State::hd_map},
+};
+const uint32_t fn_name_obj = GC(0x02720154);  // per-file player name (SafeString: +0 UTF-16 text)
+
+bool in_mem2(uint32_t a) { return a >= mem::kMem2Start && a < mem::kMem2End; }
+
+uint32_t scratch() {  // host-only guest buffer for the game's card functions (not part of full states)
+    static const uint32_t s = mem::host_alloc(0x2000, 64);
+    return s;
+}
+
+// guest calls from the frame boundary: every register is put back afterwards
+struct CallScope {
+    Cpu* c;
+    Cpu saved;
+    explicit CallScope(Cpu* cpu) : c(cpu), saved(*cpu) {}
+    ~CallScope() {
+        uint32_t core = c->core;
+        void* th = c->thread;
+        *c = saved;
+        c->core = core;
+        c->thread = th;
+    }
+};
+
+// the stage's save-table index (dStage_stagInfo_GetSaveTbl), as dStage_Delete computes it
+int current_stage_no(Cpu* c) {
+    uint32_t vt = ld32(kStageData);
+    if (!in_mem2(vt)) return -1;
+    uint32_t stag = guest_call(c, ld32(vt + 0x15C), {kStageData});
+    if (!in_mem2(stag)) return -1;
+    return (ld8(stag + 9) >> 1) & 0x7F;
+}
+
+// a Quest Log is being played (not the title screen or file select) and nothing is changing stage
+bool gameplay_ready(std::string& why, bool& retry) {
+    retry = false;
+    uint32_t sv = ld32(kSaveInfoPtr);
+    if (!in_mem2(sv)) { why = "no game in progress"; return false; }
+    std::string st = stage_name();
+    if (st.empty() || st == "sea_T" || st == "Name" || st == "ENDumi") {
+        why = "no game in progress (start or continue a Quest Log first)";
+        retry = true;
+        return false;
+    }
+    uint32_t link = ld32(kLinkPtr);
+    if (!in_mem2(link)) { why = "Link is not in the scene"; retry = true; return false; }
+    if (ld8(kNextStage + 12)) { why = "a stage change is in progress"; retry = true; return false; }
+    if (ld8(sv + kDataNum) > 2) { why = "no Quest Log loaded"; retry = true; return false; }
+    return true;
+}
+
+// Link is under the player's control: the conditions under which the game opens its pause menu
+// (dMw_c, d_menu_window.cpp: no event for 5 frames, no message box, no menu, no stage change or
+// wipe in progress, Link is the controlled actor, Link is not on a rope). The menu also refuses
+// while the Telescope or the Picto Box aims; that is left out (Link restarts standing, harmless).
+// Updated every frame for the event delay.
+const uint32_t kEventRun = kPlay + 0x5292;     // dComIfGp_event_runCheck (dEvt_control_c mode)
+const uint32_t kMesgStatus = kPlay + 0x5BB2;   // dComIfGp_getMesgStatus (messageState 025F795C)
+const uint32_t kScopeMesgStatus = kPlay + 0x5BB3;
+const uint32_t kMenuFlag = GD(0x101EA069);         // dMenu_flag (025986BC)
+const uint32_t kPlayerPtr = kPlay + 0x5B2C;    // mpPlayer[0]: the controlled actor
+const uint32_t kPlayerStatus0 = kPlay + 0x5CD8; // dComIfGp_checkPlayerStatus0 (mPlayerStatus[0][0])
+constexpr uint32_t kSttsRope = 0x00800000;          // daPyStts0_UNK800000_e: set by Link's rope procedures (procRope*)
+const uint32_t fn_ovlpDoingReq = GC(0x025DBE38);   // fopOvlpM_IsDoingReq (a wipe or scene overlap runs)
+int g_event_wait = 0;                              // d_menu_window.cpp event_wait_frame
+void track_events() {
+    if (ld8(kEventRun)) g_event_wait = 5;
+    else if (g_event_wait > 0) g_event_wait--;
+}
+// test aid: WWHD_TEST_WARP_FORCE=1 lets WWHD_TEST_WARP_AT warps through cutscenes, events and messages (a scripted
+// tour through many places must not stop at the first event a place starts)
+static bool g_warp_force = false;
+bool player_has_control(Cpu* c, std::string& why) {
+    if (!g_warp_force) {
+        if (ld8(kEventRun) || g_event_wait > 0) { why = "a cutscene or event is running"; return false; }
+        if (ld8(kMesgStatus) || ld8(kScopeMesgStatus)) { why = "a message or dialogue is open"; return false; }
+    }
+    if (ld8(kMenuFlag)) { why = "a game menu is open"; return false; }
+    if (ld8(kNextStage + 12)) { why = "a stage change is in progress"; return false; }
+    if (ld32(kPlayerPtr) != ld32(kLinkPtr)) { why = "Link is not the controlled character"; return false; }
+    // on a rope or swinging from the Grappling Hook (the menu checks it too): he would restart in mid-air
+    if (ld32(kPlayerStatus0) & kSttsRope) { why = "Link is on a rope"; return false; }
+    CallScope scope(c);
+    if (guest_call(c, fn_ovlpDoingReq) & 0xFF) { why = "a scene transition is in progress"; return false; }
+    return true;
+}
+
+std::string meta_value(const char* key) {
+    static const std::string meta = [] {
+        std::string s;
+        if (FILE* f = fopen((config::game_dir + "/meta/meta.xml").c_str(), "rb")) {
+            char buf[4096];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, f)) > 0 && s.size() < (1u << 20)) s.append(buf, n);
+            fclose(f);
+        }
+        return s;
+    }();
+    std::string open = std::string("<") + key;
+    size_t p = meta.find(open);
+    if (p == std::string::npos) return "";
+    p = meta.find('>', p);
+    size_t e = meta.find('<', p);
+    if (p == std::string::npos || e == std::string::npos) return "";
+    return meta.substr(p + 1, e - p - 1);
+}
+std::string title_id() { std::string t = meta_value("title_id"); return t.empty() ? "0005000010143500" : t; }
+
+std::string hex64(uint64_t v) { char b[20]; snprintf(b, sizeof b, "%016llx", (unsigned long long)v); return b; }
+
+std::string utf8_from_utf16be(uint32_t p, int max) {
+    std::string s;
+    for (int i = 0; i < max && in_mem2(p); i++, p += 2) {
+        uint16_t ch = ld16(p);
+        if (!ch) break;
+        if (ch < 0x80) s += (char)ch;
+        else if (ch < 0x800) { s += (char)(0xC0 | ch >> 6); s += (char)(0x80 | (ch & 0x3F)); }
+        else { s += (char)(0xE0 | ch >> 12); s += (char)(0x80 | (ch >> 6 & 0x3F)); s += (char)(0x80 | (ch & 0x3F)); }
+    }
+    return s;
+}
+
+std::string now_text() {
+    time_t t = time(nullptr);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    char buf[32];
+    strftime(buf, sizeof buf, "%Y-%m-%d %H:%M:%S", &tmv);
+    return buf;
+}
+
+float be_f32(const uint8_t* p) { return u32_as_f32((uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3]); }
+
+// the current game as a portable state (main thread, frame boundary)
+bool capture_portable(Cpu* c, pstate::State& s, std::string& why) {
+    mods::quick_use_reset();
+    mods::item_ring_reset();
+    mods::touch_talk_reset();
+    mods::steer_reset();
+    bool retry;
+    if (!gameplay_ready(why, retry)) return false;
+    CallScope scope(c);
+    const uint32_t sv = ld32(kSaveInfoPtr), info = sv + kInfo, buf = scratch();
+    std::string stage = stage_name();
+    int stage_no = current_stage_no(c);
+    // what the in-game save does first (SaveMgr 02721C44), on a copy: the live game stays unchanged
+    uint8_t rp[0xC], entry[0x24];
+    memcpy(rp, mem::ptr(sv + kReturnPlace), sizeof rp);
+    if (stage_no >= 0 && stage_no < 16) {
+        memcpy(entry, mem::ptr(sv + kMemoryTable + stage_no * 0x24), sizeof entry);
+        guest_call(c, fn_putSave, {info, (uint32_t)stage_no});
+    }
+    if (stage != "PShip") guest_call(c, fn_setGameStartStage);  // (PShip would also set the next time of day)
+    memset(mem::ptr(buf), 0, pstate::kSaveDataSize);
+    int32_t r;
+    {
+        story_store::Quiet quiet;  // a scratch buffer: not a game save (story progress stays as it is)
+        r = (int32_t)guest_call(c, fn_memory_to_card, {info, buf, 0});
+    }
+    memcpy(mem::ptr(sv + kReturnPlace), rp, sizeof rp);
+    if (stage_no >= 0 && stage_no < 16) memcpy(mem::ptr(sv + kMemoryTable + stage_no * 0x24), entry, sizeof entry);
+    if (r == -1) { why = "the game's save function failed"; return false; }
+    s.savedata.assign(mem::ptr(buf), mem::ptr(buf) + pstate::kSaveDataSize);
+    pstate::seal_savedata(s.savedata);
+    // HD per-file sections: this file's stored copy with the live data copied over (SaveMgr 02721B34)
+    const uint32_t hd = sv + kHdArea;
+    const int slot = ld8(sv + kDataNum);
+    for (auto& h : kHdSections) {
+        uint32_t stored = guest_call(c, h.slot_get, {hd, (uint32_t)slot}), live = guest_call(c, h.live_get, {hd});
+        memcpy(mem::ptr(buf), mem::ptr(stored), h.size);
+        guest_call(c, h.copy, {buf, live});
+        (s.*h.field).assign(mem::ptr(buf), mem::ptr(buf) + h.size);
+    }
+    uint32_t name_obj = guest_call(c, fn_name_obj, {hd, (uint32_t)slot});
+    s.player_name = utf8_from_utf16be(ld32(name_obj), 8);
+    // header and place
+    s.title_id = title_id();
+    s.title_version = (uint32_t)strtoul(meta_value("title_version").c_str(), nullptr, 10);
+    s.game_hash = hex64(game_id());
+    s.runtime = std::string(build::version()) + " (" + build::commit() + ")";
+    s.guest_mods=guestmods::enabled_mods();
+    s.save_profile=g_save_profile.namespace_key();
+    s.created = now_text();
+    s.file_slot = slot;
+    s.controller = input::pro_controller() ? 2 : 1;
+    s.stage = stage;
+    s.start_point = (int16_t)ld16(kStartStage + 8);
+    s.start_room = (int8_t)ld8(kStartStage + 10);
+    s.layer = (int8_t)ld8(kStartStage + 11);
+    const uint32_t link = ld32(kLinkPtr);
+    for (int i = 0; i < 3; i++) s.pos[i] = (float)ldf32(link + kActorPos + 4 * i);
+    s.room = (int8_t)ld8(link + kActorRoom);
+    s.angle_y = (int16_t)ld16(link + kShapeAngleY);
+    s.link_proc = (int)ld32(link + kLinkProc);
+    const uint32_t ship = ld32(kShipPtr);
+    s.has_ship = in_mem2(ship);
+    if (s.has_ship) {
+        for (int i = 0; i < 3; i++) s.ship_pos[i] = (float)ldf32(ship + kActorPos + 4 * i);
+        s.ship_angle_y = (int16_t)ld16(ship + kShapeAngleY);
+    }
+    // daPyProc_SHIP_READY..SHIP_RESTART (not SHIP_GET_OFF): riding the boat
+    s.on_ship = s.has_ship && s.link_proc >= 0x86 && s.link_proc <= 0x91 && s.link_proc != 0x90;
+    s.time_of_day = be_f32(&s.savedata[kCardStatusB + 0xC]);
+    s.date = s.savedata[kCardStatusB + 0x10] << 8 | s.savedata[kCardStatusB + 0x11];
+    return true;
+}
+
+// the HD per-file sections into the live game (SaveMgr 02720D34 direction: live <- stored)
+void apply_hd_sections(Cpu* c, const pstate::State& s) {
+    const uint32_t hd = ld32(kSaveInfoPtr) + kHdArea, buf = scratch();
+    for (auto& h : kHdSections) {
+        memcpy(mem::ptr(buf), (s.*h.field).data(), h.size);
+        guest_call(c, h.copy, {guest_call(c, h.live_get, {hd}), buf});
+    }
+}
+
+// puts a portable state into the running game; false + retry when the game is not ready yet
+const uint32_t kCreateQueue = GD(0x101F39A4);  // g_fpcCtTg_Queue (f_pc_create_tag.cpp): node_list_class, mSize at +8
+constexpr int kCreateWaitMax = 600;             // frames
+int g_create_wait = 0;
+bool apply_portable(Cpu* c, const pstate::State& s, std::string& why, bool& retry) {
+    if(!mods::save_profile::portable_compatible(s.save_profile,g_save_profile.namespace_key())) {
+        why="portable state belongs to another save profile";retry=false;return false;
+    }
+    mods::quick_use_reset();
+    mods::item_ring_reset();
+    mods::touch_talk_reset();
+    mods::steer_reset();
+    if (mod_stages::missing(s.stage)) { why = "it was made in a mod stage that no installed package makes"; retry = false; return false; }
+    if (!gameplay_ready(why, retry)) return false;
+    // nothing still being created: leaving the stage deletes every process, and one still loading its resources halts
+    // the game (dComIfG_resDelete asserts i_phase->id != 1: daNpc_Btsw2, Last session loaded at start while the Quest
+    // Log's stage still created its actors). A stage that never stops creating is entered anyway after kCreateWaitMax
+    if (const int32_t creating = int32_t(ld32(kCreateQueue + 8)); creating > 0) {
+        if (g_create_wait < kCreateWaitMax) {
+            if (g_create_wait++ == 0) LOG("[savestate] portable load waits: %d processes still being created", creating);
+            why = "the stage is still loading";
+            retry = true;
+            return false;
+        }
+        LOG("[savestate] portable load: %d processes still being created after %d frames; loading anyway", creating, g_create_wait);
+    } else if (g_create_wait) {
+        LOG("[savestate] portable load: the stage's processes were created after %d frames", g_create_wait);
+    }
+    g_create_wait = 0;
+    // Portable states do not overwrite the runtime arena. Prove clean owned
+    // unpublished lineage while workers are parked, or revoke/quarantine the
+    // previous native publication before copying any portable progress.
+    struct ProgressPark { bool held=false; ~ProgressPark(){if(held)threads::thaw();} } parked;
+    std::unique_ptr<native_gate::Hold> native_hold;
+    if (auto* gate = native_gate::controller()) {
+        std::string busy;
+        if(!threads::quiesce(250,busy,2,0)){
+            threads::thaw();why="game busy: "+busy;retry=true;return false;
+        }
+        parked.held=true;
+        native_hold = native_gate::try_begin_progress_load(gate);
+        if (!native_hold) {
+            why = "native event transaction";
+            retry = false;
+            return false;
+        }
+    }
+    // All native revocation/preservation is complete on this game boundary.
+    // Drop Session fences before reacquiring the guest core. The following
+    // save-data copy/restart calls neither publish nor overwrite an arena;
+    // native admission still requires a fresh main-thread readiness proof.
+    native_hold.reset();
+    if(parked.held){parked.held=false;threads::thaw();}
+    CallScope scope(c);
+    const uint32_t sv = ld32(kSaveInfoPtr), info = sv + kInfo, buf = scratch();
+    memcpy(mem::ptr(buf), s.savedata.data(), pstate::kSaveDataSize);
+    {
+        story_store::Quiet quiet;  // story progress is not part of a portable state
+        if ((int32_t)guest_call(c, fn_card_to_memory, {info, buf, 0}) == -1) { why = "the game refused the save data"; return false; }
+    }
+    int stage_no = current_stage_no(c);
+    if (stage_no >= 0 && stage_no < 16) guest_call(c, fn_getSave, {info, (uint32_t)stage_no});
+    guest_call(c, fn_danInit, {info + 0x79C, 0xFFFFFFFFu});  // dSv_danBit_c::init(-1): the next stage starts fresh
+    guest_call(c, fn_eventInit, {info + 0x1158});             // dSv_info_c::mTmp (temporary flags)
+    apply_hd_sections(c, s);
+    guest_call(c, fn_refreshGame, {0});  // SaveMgr: item buttons and equipment from the loaded data (does not use its object)
+    // Keep the ordinary restart record coherent, but enter through the independent turn-restart
+    // record below. Leaving the old stage can overwrite the ordinary room restart before the
+    // new Link reads it; that would put a dungeon resume at the previous sea position.
+    const uint32_t rs = sv + kRestart;
+    st8(rs + 0, (uint8_t)s.room);
+    st16(rs + 0x16, (uint16_t)s.angle_y);
+    for (int i = 0; i < 3; i++) stf32(rs + 0x18 + 4 * i, s.pos[i]);
+    // Native player entry: keep crawl states low enough for their saved tunnel position.
+    st32(rs + 0x24, (uint32_t)(s.room & 0x3F) | (pstate::restore_crawl(s) ? 5u << 12 : 0u) | 0xFF000000u);
+    stf32(rs + 0x28, 0.0);  // no automatic movement through the saved tunnel
+    st32(rs + 0x2C, pstate::restart_scene_mode(s));
+    char name[8] = {};
+    memcpy(name, s.stage.data(), std::min<size_t>(s.stage.size(), 7));
+    for (int i = 0; i < 8; i++) st8(kNextStage + i, (uint8_t)name[i]);
+    const uint16_t point = 0xFFFD;  // dStage_playerInit reads the independent turn-restart record
+    {
+        // daPy_lk_c::getDayNightParamData without the Wind Waker parts (event 0xCC, flag 0x40: the
+        // conducting animation): standing, native crawl entry, or a restored boat; no start event.
+        // A foot-player restore must not create or reposition a boat.
+        uint32_t param = pstate::restart_parameters(s);
+        for (int i = 0; i < 3; i++) {
+            stf32(buf + 4 * i, s.pos[i]);
+            stf32(buf + 0x10 + 4 * i, s.ship_pos[i]);
+        }
+        guest_call(c, fn_turnRestartSet, {sv + kTurnRestart, buf, (uint32_t)(uint16_t)s.angle_y, (uint32_t)(uint8_t)s.room, param,
+                                          buf + 0x10, (uint32_t)(uint16_t)s.ship_angle_y, (uint32_t)s.has_ship});
+    }
+    st16(kNextStage + 8, point);
+    st8(kNextStage + 10, (uint8_t)s.room);
+    st8(kNextStage + 11, (uint8_t)s.layer);
+    st8(kNextStage + 13, 0);  // wipe: fade
+    mods::moon_jump_reset();
+    mods::jump_reset();
+    st8(kNextStage + 12, 1);  // enabled
+    return true;
+}
+
+std::string portable_label(int slot) { return slot > 0 ? slot_label(slot) : std::string("Portable state"); }
+
+bool read_text(const std::string& path, std::string& out, std::string& why) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) { why = "empty"; return false; }
+    out.clear();
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        out.append(buf, n);
+        if (out.size() > pstate::kMaxFileSize) { fclose(f); why = "file is too large to be a portable state"; return false; }
+    }
+    fclose(f);
+    return true;
+}
+
+bool read_portable(const std::string& path, pstate::State& s, std::string& why) {
+    std::string text;
+    if (!read_text(path, text, why)) return false;
+    if (!pstate::read(text, s, why)) return false;
+    if (s.title_id != title_id()) { why = "made with another game (title " + s.title_id + ")"; return false; }
+    if(!mods::save_profile::portable_compatible(s.save_profile,g_save_profile.namespace_key())) {
+        why="portable state belongs to another save profile";return false;
+    }
+    return true;
+}
+
+bool write_portable(const std::string& path, const pstate::State& s, std::string& why) {
+    std::string text = pstate::write(s, why);  // refuses anything that is not small (the guard)
+    if (text.empty()) return false;
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "wb");
+    if (!f) { why = "cannot write " + tmp; return false; }
+    bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+    ok = fclose(f) == 0 && ok;
+    if (ok) ok = host::replace_file(tmp, path);
+    else remove(tmp.c_str());
+    if (!ok) why = "write failed";
+    return ok;
+}
+
+struct PendingPortable { std::shared_ptr<pstate::State> s; int slot = 0; std::string path; LoadResult result; };
+std::atomic<int> g_psave_req{0};
+PendingPortable g_pload;          // under g_mu
+bool g_pload_waiting = false;     // the "waiting for gameplay" message was shown
+std::string g_last_portable;      // newest portable state written or loaded (under g_mu)
+// after a portable load: the old Link's process id (a new Link has a new one), the state for the HD sections
+// TV frame at which the last portable load arrived (Link settled in the restored stage; 0: none). Full
+// loads keep their own marker (g_last_load_frame), which crash recovery reads; test aids that count
+// frames after "a load" take the newer of the two (dynres.cpp).
+std::atomic<uint64_t> g_last_arrival_frame{0};
+struct Arrival { std::string stage; float pos[3]; uint64_t frame = 0; uint32_t link_id = 0; int frames = 0; std::shared_ptr<pstate::State> s; LoadResult result; bool crawl_stopped = false; } g_arrival;
+
+void cancel_portable_arrival(const std::string&why){
+    auto result=g_arrival.result;
+    g_arrival=Arrival{};
+    result.complete(false,why);
+}
+
+std::atomic<int> g_conv_result{0};  // a convenience slot's save finished: +slot written, -slot not
+
+void do_portable_save(Cpu* c, int slot) {
+    // the convenience slots (last session, auto saves) save quietly: a log line, no message
+    const bool quiet = conv::is_convenience(slot);
+    auto fail = [&](const std::string& shown, const std::string& why) {
+        if (quiet) {
+            LOG("[savestate] %s: not saved (%s)", slot_label(slot).c_str(), why.c_str());
+            g_conv_result = -slot;
+        } else {
+            message("%s", shown.c_str());
+        }
+    };
+    mods::lock_on_reset();
+    pstate::State s;
+    std::string why;
+    bool retry;
+    // only while the player controls Link (decision: no portable states mid-cutscene/dialogue; full states stay allowed)
+    if (gameplay_ready(why, retry) && !player_has_control(c, why)) {
+        LOG("[savestate] slot %d: portable state refused: %s", slot, why.c_str());
+        fail("Slot " + std::to_string(slot) + ": can't save during a cutscene or dialogue - try again when you have control of Link", why);
+        report_done(slot, false, "Can't save during a cutscene or dialogue (" + why + "): try again when you have control of Link.");
+        return;
+    }
+    if (!capture_portable(c, s, why)) {
+        fail("Slot " + std::to_string(slot) + ": not saved (" + why + ")", why);
+        report_done(slot, false, why);
+        return;
+    }
+    std::string path = slot_path(slot, pstate::kExtension);
+    if (!write_portable(path, s, why)) {
+        fail("Slot " + std::to_string(slot) + ": not saved (" + why + ")", why);
+        report_done(slot, false, why);
+        return;
+    }
+    struct stat st{};
+    stat(path.c_str(), &st);
+    LOG("[savestate] slot %d: portable state written (%lld bytes; %s room %d at %.1f %.1f %.1f, angle %d, Quest Log %d%s)", slot,
+        (long long)st.st_size, s.stage.c_str(), s.room, s.pos[0], s.pos[1], s.pos[2], s.angle_y, s.file_slot + 1,
+        s.on_ship ? ", on the boat" : s.has_ship ? ", boat nearby" : "");
+    if (s.has_ship)
+        LOG("[savestate] slot %d: boat at %.1f %.1f %.1f, angle %d", slot, s.ship_pos[0], s.ship_pos[1], s.ship_pos[2], s.ship_angle_y);
+    if (quiet) {
+        LOG("[savestate] %s written (%s)", slot_label(slot).c_str(), path.c_str());
+        g_conv_result = slot;
+        return;
+    }
+    // decision: an older full state in the same slot is kept (never deleted), but the player is told
+    struct stat full{};
+    std::string older;
+    if (stat(slot_path(slot).c_str(), &full) == 0) {
+        char b[96];
+        snprintf(b, sizeof b, "; the slot also keeps an older full state (%.0f MB)", full.st_size / 1048576.0);
+        older = b;
+        LOG("[savestate] slot %d also holds an older full state (%s, %.0f MB); it is kept", slot, slot_path(slot).c_str(),
+            full.st_size / 1048576.0);
+    }
+    render::request_tv_dump(slot_path(slot, "png"), 0);  // the slot's picture (stays on this computer)
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_last_portable = path;
+    }
+    message("Saved to slot %d (%s)%s", slot, area_label(s.stage.c_str()).c_str(), older.c_str());
+    report_done(slot, true, "");
+}
+
+// test aid WWHD_TEST_FIXED_SEED=1 (fixed_seed.h): fixed random seeds and loading-frame offset at
+// the first gameplay frame and after each state load, for repeatable comparison runs
+const bool g_fixed_seed = fixed_seed::enabled();
+fixed_seed::BootGate g_fixed_seed_boot;
+fixed_seed::LoadGate g_fixed_seed_load;
+void apply_fixed_seed(const char* when) {
+    if (!g_fixed_seed) return;
+    g_fixed_seed_boot.mark();
+    const auto a = fixed_seed::apply([](uint32_t ea) { return ld32(ea); }, [](uint32_t ea, uint32_t v) { st32(ea, v); },
+                                     GD(0x101FF9D4), GD(0x104B5730), GD(0x101FF558),
+                                     GD(0x101FF560));  // cM_rnd seeds, JPA emitter seed, g_Counter.mCounter0, mTimer
+    LOG("[test] WWHD_TEST_FIXED_SEED: %s: cM_rnd seeds %u %u %u (were %u %u %u), particle seed %u (was %08X), mCounter0 %u "
+        "(was %u, mTimer %u)",
+        when, fixed_seed::kSeeds[0], fixed_seed::kSeeds[1], fixed_seed::kSeeds[2], a.seeds_before[0], a.seeds_before[1],
+        a.seeds_before[2], fixed_seed::kParticleSeed, a.particle_seed_before, a.counter0_after, a.counter0_before, a.timer);
+}
+
+// a pending portable load at the frame boundary
+void service_portable_load(Cpu* c) {
+    PendingPortable p;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        p = g_pload;
+    }
+    if (!p.s) return;
+    mods::lock_on_reset();
+    std::string why;
+    bool retry = false;
+    const uint32_t sv0 = ld32(kSaveInfoPtr);
+    const int current_log = in_mem2(sv0) ? ld8(sv0 + kDataNum) : -1;
+    if (!apply_portable(c, *p.s, why, retry)) {
+        if (retry) {
+            if (!g_pload_waiting) message("%s: waiting to load (%s)", portable_label(p.slot).c_str(), why.c_str());
+            g_pload_waiting = true;
+            return;
+        }
+        message("%s: cannot load (%s)", portable_label(p.slot).c_str(), why.c_str());
+        p.result.complete(false,why);
+    } else {
+        LOG("[savestate] %s: portable state applied: entering %s room %d layer %d at %.1f %.1f %.1f", portable_label(p.slot).c_str(),
+            p.s->stage.c_str(), p.s->room, p.s->layer, p.s->pos[0], p.s->pos[1], p.s->pos[2]);
+        if (g_fixed_seed) {
+            g_fixed_seed_boot.mark();
+            g_fixed_seed_load.start(ld32(GD(0x101FF560)));  // written once the old stage is gone (service)
+        }
+        if (current_log >= 0 && current_log <= 2 && current_log != p.s->file_slot) {
+            // decision: loading goes into the Quest Log being played; say so when the state is from another one
+            LOG("[savestate] %s: this state is from Quest Log %d; it is loaded into Quest Log %d", portable_label(p.slot).c_str(),
+                p.s->file_slot + 1, current_log + 1);
+            message("This state is from Quest Log %d; it is loaded into Quest Log %d (saving in game will write it there).",
+                    p.s->file_slot + 1, current_log + 1);
+        } else {
+            message("Loaded %s (%s; progress and position)",
+                    p.slot ? (conv::is_convenience(p.slot) ? slot_label(p.slot) : "slot " + std::to_string(p.slot)).c_str() : "portable state",
+                    area_label(p.s->stage.c_str()).c_str());
+        }
+        append_mod_warning(guestmods::different_mods(p.s->guest_mods,guestmods::enabled_mods()));
+        g_arrival.result.complete(false,"superseded by a newer portable load");
+        g_arrival = Arrival{p.s->stage, {p.s->pos[0], p.s->pos[1], p.s->pos[2]}, render::frame_count(), ld32(ld32(kLinkPtr) + 4), 0, p.s, p.result};
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_last_portable = p.path;
+    }
+    g_pload_waiting = false;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if(g_pload.s==p.s)g_pload = PendingPortable{};
+}
+
+// after a portable load: once the new Link exists, the HD sections once more (leaving the old stage
+// updates the live sea-chart position), then log where Link arrived (scripted tests read this line)
+void watch_arrival(Cpu* c) {
+    if (g_arrival.stage.empty()) return;
+    uint32_t link = ld32(kLinkPtr);
+    if (stage_name() != g_arrival.stage || !in_mem2(link) || ld32(link + 4) == g_arrival.link_id) {  // fpcBs mBsPcId
+        if (render::frame_count() - g_arrival.frame > 30 * 60) {
+            LOG("[savestate] portable load: did not arrive in %s", g_arrival.stage.c_str());
+            g_arrival.result.complete(false,"did not arrive in the restored stage");
+            message("Portable state: did not arrive in the restored stage");
+            g_arrival = Arrival{};
+        }
+        return;
+    }
+    if (g_arrival.frames++ == 0) {
+        CallScope scope(c);
+        apply_hd_sections(c, *g_arrival.s);
+    }
+    // The new actor can exist before its procedure is initialized. Wait for native
+    // crawl entry, then stop its initial moving cycle once; with no input it would
+    // otherwise coast ~30 units to the next half-cycle on every reload. Native
+    // crawl input restarts the animation normally. HD frame-control rate is +0.
+    if (!g_arrival.crawl_stopped && pstate::restore_crawl(*g_arrival.s) && ld32(link+kLinkProc)==0x10 &&
+        ld16(link+0x420)==4 && ld32(link+0x430)==0x0E) {
+        stf32(link+0x5898,0.0f); // mFrameCtrlUnder[0].mRate
+        g_arrival.crawl_stopped = true;
+        LOG("[savestate] portable load: crawl entry animation stopped at arrival frame %d",g_arrival.frames);
+    }
+    if (g_arrival.frames < 30) return;  // let Link settle (start animation, ground check)
+    float p[3];
+    for (int i = 0; i < 3; i++) p[i] = (float)ldf32(link + kActorPos + 4 * i);
+    float dx = p[0] - g_arrival.pos[0], dy = p[1] - g_arrival.pos[1], dz = p[2] - g_arrival.pos[2];
+    LOG("[savestate] portable load: arrived in %s room %d at %.1f %.1f %.1f (distance %.1f from the saved position)",
+        stage_name().c_str(), (int8_t)ld8(link + kActorRoom), p[0], p[1], p[2], sqrtf(dx * dx + dy * dy + dz * dz));
+    if (pstate::restore_crawl(*g_arrival.s)) {
+        const int proc=(int)ld32(link+kLinkProc);
+        LOG("[savestate] portable load: crawl entry %s (procedure 0x%X)",
+            pstate::crawl_procedure(proc) ? "restored" : "has ended", proc);
+    }
+    if (g_arrival.s->has_ship) {
+        const uint32_t ship = ld32(kShipPtr);
+        const int proc = (int)ld32(link + kLinkProc);
+        if (!in_mem2(ship)) LOG("[savestate] portable load: no boat in the stage");
+        else {
+            float q[3];
+            for (int i = 0; i < 3; i++) q[i] = (float)ldf32(ship + kActorPos + 4 * i) - g_arrival.s->ship_pos[i];
+            LOG("[savestate] portable load: boat at %.1f %.1f %.1f angle %d (distance %.1f), Link %s the boat (procedure 0x%X)",
+                ldf32(ship + kActorPos), ldf32(ship + kActorPos + 4), ldf32(ship + kActorPos + 8), (int16_t)ld16(ship + kShapeAngleY),
+                sqrtf(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]), proc >= 0x86 && proc <= 0x91 && proc != 0x90 ? "on" : "not on", proc);
+        }
+    }
+    auto result=g_arrival.result;
+    g_arrival = Arrival{};
+    g_last_arrival_frame = render::frame_count();
+    controller_reapply::request("progress load");
+    result.complete(true,"");
+}
+
+// full states: the setting, the environment and the scripted tests
+int g_save_path_setting = -1;
+std::string save_path_cfg_path() { return state_dir() + "/full_save_path.cfg"; }
+int g_full_setting = -1;  // -1: not read yet
+std::string full_cfg_path() { return state_dir() + "/full_save_states.cfg"; }
+int full_env() {  // 1 / 0 forced by the environment, -1 not forced
+    static const int v = [] {
+        if (const char* e = getenv("WWHD_FULL_SAVE_STATES")) return atoi(e) != 0 ? 1 : 0;
+        for (const char* t : {"WWHD_STATE_SAVE_AT", "WWHD_STATE_LOAD_AT", "WWHD_TEST_SAVE", "WWHD_TEST_LOAD"})
+            if (getenv(t)) return 1;
+        return -1;
+    }();
+    return v;
+}
+
+// which file of a slot to load: the newer one
+bool newer_is_portable(int slot) {
+    struct stat a{}, b{};
+    bool full = stat(slot_path(slot).c_str(), &a) == 0, port = stat(slot_path(slot, pstate::kExtension).c_str(), &b) == 0;
+    if (full && port) {
+#ifdef __APPLE__
+        return b.st_mtimespec.tv_sec > a.st_mtimespec.tv_sec ||
+               (b.st_mtimespec.tv_sec == a.st_mtimespec.tv_sec && b.st_mtimespec.tv_nsec >= a.st_mtimespec.tv_nsec);
+#else
+        return b.st_mtime >= a.st_mtime;
+#endif
+    }
+    return port;
+}
+
+// test aid: WWHD_STATE_SAVE_AT=frame:slot,...  WWHD_STATE_LOAD_AT=frame:slot,... (TV frames)
+struct Timed { uint64_t frame; int slot; };
+std::vector<Timed> parse_timed(const char* var) {
+    std::vector<Timed> v;
+    const char* e = getenv(var);
+    unsigned long long f;
+    int s, n;
+    while (e && sscanf(e, "%llu:%d%n", &f, &s, &n) == 2) {
+        v.push_back({f, s});
+        e += n;
+        if (*e != ',') break;
+        e++;
+    }
+    return v;
+}
+
+}  // namespace
+
+uint32_t snap_ld32(uint32_t ea) {
+    if (!g_check) return ld32(ea);
+    uint32_t base = ea & ~(kChunk - 1);
+    auto it = g_check->chunks.find(base);
+    if (it == g_check->chunks.end()) {
+        for (auto& g : g_check->regs)
+            if (ea - g.base < g.size) return 0;
+        return ld32(ea);  // not part of the snapshot (code, host-only memory)
+    }
+    uint32_t v;
+    memcpy(&v, it->second + (ea - base), 4);
+    return __builtin_bswap32(v);
+}
+
+namespace {
+SlotInfo full_slot_info(int slot) {
+    SlotInfo info;
+    info.path = slot_path(slot);
+    FILE* f = fopen(info.path.c_str(), "rb");
+    if (!f) return info;
+    Header h{};
+    std::string why;
+    info.used = true;
+    info.compatible = read_header(f, h, why);
+    fclose(f);
+    if (info.compatible) info.controller = controller_label(h.controller);
+    if (info.compatible || memcmp(h.magic, kMagic, 8) == 0) {
+        time_t t = (time_t)h.created;
+        struct tm tmv;
+#ifdef _WIN32
+        localtime_s(&tmv,&t);
+#else
+        localtime_r(&t, &tmv);
+#endif
+        char buf[64];
+        strftime(buf, sizeof buf, "%b %d %H:%M:%S", &tmv);
+        info.when = buf;
+        h.area[sizeof h.area - 1] = 0;
+        if (h.area[0]) info.area = area_label(h.area);
+    }
+    return info;
+}
+
+SlotInfo portable_slot_info(int slot) {
+    SlotInfo info;
+    info.portable = true;
+    info.path = slot_path(slot, pstate::kExtension);
+    std::string text, why;
+    if (!read_text(info.path, text, why)) {
+        info.used = why != "empty";
+        info.compatible = false;
+        return info;
+    }
+    info.used = true;
+    pstate::State s;
+    info.compatible = pstate::read(text, s, why) && s.title_id == title_id() &&
+        mods::save_profile::portable_compatible(s.save_profile,g_save_profile.namespace_key());
+    if (info.compatible) {
+        // "2026-10-08 14:03:11" -> "Oct 08 14:03:11" like the full states
+        static const char* mon[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
+        int y, mo, d;
+        char rest[16];
+        if (sscanf(s.created.c_str(), "%d-%d-%d %15s", &y, &mo, &d, rest) == 4 && mo >= 1 && mo <= 12) {
+            char buf[48];
+            snprintf(buf, sizeof buf, "%s %02d %s", mon[mo - 1], d, rest);
+            info.when = buf;
+        } else info.when = s.created;
+        info.area = area_label(s.stage.c_str());
+        info.controller = controller_label(s.controller);
+    }
+    return info;
+}
+
+}  // namespace
+
+SlotInfo slot_info(int slot) {
+    if (is_auto(slot)) return full_slot_info(slot);
+    if (conv::is_convenience(slot)) return portable_slot_info(slot);
+    SlotInfo info = newer_is_portable(slot) ? portable_slot_info(slot) : full_slot_info(slot);
+    // the slot's other, older file (kept; shown so it is not forgotten)
+    struct stat st{};
+    if (stat(slot_path(slot, info.portable ? "bin" : pstate::kExtension).c_str(), &st) == 0) {
+        info.older_other = true;
+        info.older_bytes = (uint64_t)st.st_size;
+    }
+    return info;
+}
+
+void request_save_full(int slot) {
+    if ((slot < 1 || slot > kSlots) && !is_auto(slot)) return;
+    g_save_req = slot;
+}
+
+void request_save_portable(int slot) {
+    if (slot < 1 || slot > kSlots) return;
+    g_psave_req = slot;
+}
+
+// the kind full_states() selects (automatic states: always full); `done` once the file is written or
+// the save gave up (a portable state is also refused while Link is not under the player's control)
+void request_save(int slot, std::function<void(bool ok, const std::string& why)> done) {
+    if ((slot < 1 || slot > kSlots) && !is_auto(slot)) {
+        if (done) done(false, "no such slot");
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_done_slot = slot;
+        g_done = std::move(done);
+    }
+    if (is_auto(slot) || full_states()) g_save_req = slot;
+    else g_psave_req = slot;
+}
+
+void request_save(int slot) { request_save(slot, nullptr); }
+
+bool in_gameplay() { return quitprompt::gameplay_stage(stage_name()); }
+
+void request_load_portable_file(const std::string& path) { request_load_portable_file(path,{}); }
+
+void request_load_portable_file(const std::string& path, std::function<void(bool,const std::string&)> done) {
+    LoadResult result(std::move(done));
+    auto s = std::make_shared<pstate::State>();
+    std::string why;
+    if (!read_portable(path, *s, why)) {
+        message("Portable state: %s", why.c_str());
+        result.complete(false,why);return;
+    }
+    if (s->runtime != std::string(build::version()) + " (" + build::commit() + ")")
+        LOG("[savestate] portable state from %s (this build: %s %s)", s->runtime.c_str(), build::version(), build::commit());
+    if(guestmods::different_mods(s->guest_mods,guestmods::enabled_mods()))message("%s",guestmods::kModWarning);
+    int slot = 0;
+    for (int i = 1; i <= kSlots; i++)
+        if (path == slot_path(i, pstate::kExtension)) slot = i;
+    for (int i = conv::kLastSessionSlot; i <= conv::kAutoSaveBase + conv::kAutoSaves; i++)
+        if (path == slot_path(i, pstate::kExtension)) slot = i;
+    LoadResult replaced;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        replaced=g_pload.result;
+        g_pload = PendingPortable{s, slot, path, result};
+    }
+    replaced.complete(false,"superseded by a newer load request");
+}
+
+namespace {void request_full_load(int,const std::string&,std::function<void(bool,const std::string&)>);}
+void request_load(int slot) { request_load(slot,{}); }
+
+void request_load(int slot, std::function<void(bool,const std::string&)> done) {
+    if (conv::is_convenience(slot)) {
+        request_load_portable_file(slot_path(slot, pstate::kExtension),std::move(done));
+        return;
+    }
+    if ((slot < 1 || slot > kSlots) && !is_auto(slot)) {if(done)done(false,"no such slot");return;}
+    if (!is_auto(slot) && newer_is_portable(slot)) {
+        request_load_portable_file(slot_path(slot, pstate::kExtension),std::move(done));
+        return;
+    }
+    request_full_load(slot,{},std::move(done));
+}
+
+namespace {
+void request_full_load(int slot,const std::string&source,std::function<void(bool,const std::string&)> done){
+    LoadResult result(std::move(done));
+    if (g_loading.exchange(true)) {message("State not loaded: another state is being loaded");result.complete(false,"another state is being loaded");return;}
+    try {std::thread([slot,source,result] {
+        try {
+        auto t0 = std::chrono::steady_clock::now();
+        std::string why;
+        std::shared_ptr<Snapshot> s;
+        {
+            std::lock_guard<std::mutex> io(g_io);
+            s = read_slot(slot, why,source);
+        }
+        if (!s) {
+            message("%s: %s", slot_label(slot).c_str(), why.c_str());
+            g_loading = false;
+            result.complete(false,why);return;
+        }
+        if(guestmods::different_mods(s->guest_mods,guestmods::enabled_mods()))message("%s",guestmods::kModWarning);
+        LOG("[savestate] slot %d: read and decompressed %.1f MB in %.0f ms", slot, s->payload.size() / 1048576.0,
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        std::lock_guard<std::mutex> lk(g_mu);
+        s->load_result=result;g_load_ready = s;
+        } catch(const std::exception&) {
+            g_loading=false;
+            result.complete(false,"invalid state data or insufficient memory");
+            try {message("State could not be loaded (invalid data or insufficient memory)");}catch(...) {}
+        }
+    }).detach();}catch(const std::exception&){
+        g_loading=false;
+        result.complete(false,"could not start the state reader");
+        message("State not loaded: could not start the state reader");
+    }
+}
+} // namespace
+void request_load_full_file(const std::string&path,std::function<void(bool,const std::string&)> done){
+    if(path.empty()){if(done)done(false,"state path is empty");return;}
+    request_full_load(-1,path,std::move(done));
+}
+
+bool full_states_forced() { return full_env() >= 0; }
+
+bool full_states() {
+    if (full_env() >= 0) return full_env() == 1;
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_full_setting < 0) {
+        g_full_setting = 0;
+        if (FILE* f = fopen(full_cfg_path().c_str(), "r")) {
+            int v = 0;
+            if (fscanf(f, "%d", &v) == 1) g_full_setting = v ? 1 : 0;
+            fclose(f);
+        }
+    }
+    return g_full_setting == 1;
+}
+
+void set_full_states(bool on) {
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        g_full_setting = on ? 1 : 0;
+    }
+    if (FILE* f = fopen(full_cfg_path().c_str(), "w")) {
+        fprintf(f, "%d\n", on ? 1 : 0);
+        fclose(f);
+    }
+    LOG("[savestate] full save states %s", on ? "on" : "off");
+}
+
+SavePath save_path() {
+    std::lock_guard<std::mutex> lock(g_mu);
+    if (g_save_path_setting < 0) {
+        g_save_path_setting = int(SavePath::Auto);
+        if (FILE* file=fopen(save_path_cfg_path().c_str(),"r")) {
+            char value[32]{};
+            if (fscanf(file,"%31s",value)==1) g_save_path_setting=int(parse_save_path(value));
+            fclose(file);
+        }
+    }
+    return SavePath(g_save_path_setting);
+}
+void set_save_path(SavePath path) {
+    path=parse_save_path(save_path_name(path));
+    { std::lock_guard<std::mutex> lock(g_mu);g_save_path_setting=int(path); }
+    if (FILE* file=fopen(save_path_cfg_path().c_str(),"w")) {
+        fprintf(file,"%s\n",save_path_name(path));fclose(file);
+    }
+}
+
+std::string bug_report_text() {
+    std::string pstate_path;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        pstate_path = g_last_portable;
+    }
+    if (pstate_path.empty()) {  // the newest portable slot file
+        std::filesystem::file_time_type best{};
+        for (int i = 1; i <= kSlots; i++) {
+            std::error_code ec;
+            std::string p = slot_path(i, pstate::kExtension);
+            auto t = std::filesystem::last_write_time(p, ec);
+            if (!ec && (pstate_path.empty() || t > best)) { best = t; pstate_path = p; }
+        }
+    }
+    std::string save = config::save_dir + "/user/cking.sav";
+    auto absolute = [](const std::string& p) {
+        std::error_code ec;
+        auto a = std::filesystem::absolute(p, ec);
+        return ec ? p : a.lexically_normal().string();
+    };
+    if (!pstate_path.empty()) pstate_path = absolute(pstate_path);
+    save = absolute(save);
+    std::string out;
+    if (!pstate_path.empty()) out += "Portable save state (attach): " + pstate_path + "\n";
+    else out += "Portable save state: none yet (Save a state first: it is small and contains no game data)\n";
+    out += "Save file (attach): " + save + "\n";
+    out += "Never attach full save states (.bin): they contain game data.\n";
+    return out;
+}
+
+void notice(const std::string& text) { message("%s", text.c_str()); }
+
+std::string last_message() {
+    std::lock_guard<std::mutex> lk(g_mu);
+    if (g_message.empty() || std::chrono::steady_clock::now() - g_message_time > std::chrono::seconds(g_message.size() > 60 ? 7 : 4)) return "";
+    return g_message;
+}
+
+std::atomic<uint64_t> g_last_load_frame{0}, g_last_load_step{0};
+std::atomic<uint32_t> g_last_load_counter{0};
+uint32_t last_load_counter() { return g_last_load_counter.load(); }
+uint64_t last_load_frame() { return g_last_load_frame.load(); }
+uint64_t last_arrival_frame() { return g_last_arrival_frame.load(); }
+uint64_t last_load_step() { return g_last_load_step.load(); }
+std::atomic<uint64_t> g_seeded_arrival_frame{0}, g_seeded_arrival_step{0};
+std::atomic<uint32_t> g_seeded_arrival_counter{0};
+uint64_t seeded_arrival_frame() { return g_seeded_arrival_frame.load(); }
+uint64_t seeded_arrival_step() { return g_seeded_arrival_step.load(); }
+uint32_t seeded_arrival_counter() { return g_seeded_arrival_counter.load(); }
+
+void set_save_profile(const mods::save_profile::Selection& selected,const mods::save_profile::Paths& paths) {
+    const mods::save_profile::StateIdentity identity{selected.namespace_key(),selected.owner,selected.fingerprint};
+    if(!identity.valid()||paths.namespace_key!=selected.namespace_key())
+        throw mods::save_profile::Error("Invalid frozen state save-profile identity");
+    if(g_save_profile_configured) {
+        if(selected!=g_save_profile)throw mods::save_profile::Error("State save profile cannot change during a session");
+        return;
+    }
+    if(g_profile_state_dir_used&&!selected.empty())
+        throw mods::save_profile::Error("Save profile must be selected before any state-slot access");
+    if(!selected.empty()) {
+        std::filesystem::path directory;
+        if(const char* configured=getenv("WWHD_STATE_DIR"))directory=configured;
+        else {
+#ifdef __APPLE__
+            directory=std::string(getenv("HOME")?getenv("HOME"):".")+"/Library/Application Support/wwhd/states";
+#else
+            directory=host::config_dir()+"/states";
+#endif
+        }
+        const auto key=selected.namespace_key();
+        if(!mods::save_profile::owned_basename(directory,key))
+            directory=mods::save_profile::sibling(directory,key);
+        auto protected_roots=paths.protected_roots;
+        protected_roots.push_back(paths.save);
+        protected_roots.push_back(paths.backups);
+        std::string why;
+        if(!mods::save_profile::owned_location(directory,key,protected_roots,why))
+            throw mods::save_profile::Error(why);
+#ifdef _WIN32
+        if(!mods::save_profile::windows_budget(mods::save_profile::path_units(directory),32))
+            throw mods::save_profile::Error("The state profile folder is too long for Windows; choose a shorter state location");
+#endif
+        g_profile_state_directory=directory.string();
+    }
+    g_save_profile=selected;g_save_profile_paths=paths;g_save_profile_configured=true;
+}
+
+std::string states_dir() { return state_dir(); }
+
+// ---- conveniences (save_convenience.h) ----
+namespace {
+std::mutex g_conv_mu;
+bool g_conv_read = false;
+conv::Options g_conv;
+std::string conv_cfg_path() { return state_dir() + "/save_options.cfg"; }
+conv::Options conv_options() {
+    std::lock_guard<std::mutex> lk(g_conv_mu);
+    if (!g_conv_read) {
+        g_conv_read = true;
+        std::string text, why;
+        if (read_text(conv_cfg_path(), text, why)) g_conv = conv::parse_options(text);
+    }
+    return g_conv;
+}
+void store_conv(const conv::Options& o) {
+    {
+        std::lock_guard<std::mutex> lk(g_conv_mu);
+        g_conv = o;
+        g_conv_read = true;
+    }
+    const std::string text = conv::format_options(o), tmp = conv_cfg_path() + ".tmp";
+    if (FILE* f = fopen(tmp.c_str(), "wb")) {
+        const bool ok = fwrite(text.data(), 1, text.size(), f) == text.size();
+        if (fclose(f) == 0 && ok) host::replace_file(tmp, conv_cfg_path());
+        else remove(tmp.c_str());
+    }
+}
+double conv_now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
+conv::AutoSaveTimer g_auto_timer;  // game thread
+std::atomic<bool> g_auto_paused{false};  // set_auto_save_paused
+int g_auto_slot = 0;               // the auto save being written (game thread)
+
+// At start, once the title screen or the file select is up (the game finished booting). Scripted
+// runs (WWHD_NO_HOST_INPUT) ignore the setting; WWHD_AT_START=intro|last|slotN sets it for one start.
+void service_at_start() {
+    static bool done = false;
+    if (done) return;
+    const std::string st = stage_name();
+    if (st != "sea_T" && st != "Name" && !quitprompt::gameplay_stage(st)) return;
+    done = true;
+    conv::StartChoice choice;
+    if (const char* e = getenv("WWHD_AT_START")) choice = conv::parse_start(e);
+    else if (!getenv("WWHD_NO_HOST_INPUT")) choice = conv_options().start;
+    if (choice.what == conv::Start::kIntro) return;
+    const int slot = choice.what == conv::Start::kLastSession ? conv::kLastSessionSlot : choice.slot;
+    if (!slot_info(slot).used) {
+        LOG("[savestate] at start: %s is empty; the game starts as usual", slot_label(slot).c_str());
+        return;
+    }
+    LOG("[savestate] at start: loading %s once a Quest Log is being played", slot_label(slot).c_str());
+    request_load(slot);
+}
+
+// Auto save: the timer, and the result of the save it asked for
+void service_auto_save() {
+    // do_portable_save runs right after this in the same service call, so by the next call the result
+    // is there; without it another request replaced ours (tried again a little later)
+    if (g_auto_slot) {
+        const int result = g_conv_result.load();
+        const bool ours = result == g_auto_slot || result == -g_auto_slot;
+        if (ours) g_conv_result = 0;
+        g_auto_timer.done(conv_now(), ours && result > 0);
+        g_auto_slot = 0;
+    }
+    const bool gameplay = in_gameplay() && !g_loading.load() && !g_save_req.load() && !g_psave_req.load() &&
+                          !g_auto_paused.load();
+    if (g_auto_timer.due(conv_now(), conv_options().autosave_minutes, gameplay)) {
+        g_auto_slot = conv::kAutoSaveBase + g_auto_timer.next;
+        g_conv_result = 0;
+        g_psave_req = g_auto_slot;
+    }
+}
+}  // namespace
+
+std::string at_start() { return conv::format_start(conv_options().start); }
+void set_at_start(const std::string& choice) {
+    conv::Options o = conv_options();
+    o.start = conv::parse_start(choice);
+    store_conv(o);
+    LOG("[savestate] at start: %s", conv::format_start(o.start).c_str());
+}
+int auto_save_minutes() { return conv_options().autosave_minutes; }
+void set_auto_save_paused(bool paused) { g_auto_paused = paused; }
+std::mutex g_last_source_mu;
+std::string g_last_source;  // set_last_session_source (under g_last_source_mu)
+void set_last_session_source(const std::string& path) {
+    std::lock_guard<std::mutex> lk(g_last_source_mu);
+    g_last_source = path;
+}
+void set_auto_save_minutes(int minutes) {
+    conv::Options o = conv_options();
+    o.autosave_minutes = conv::valid_auto_save_minutes(minutes) ? minutes : 0;
+    store_conv(o);
+    LOG("[savestate] auto save: %s", o.autosave_minutes ? (std::to_string(o.autosave_minutes) + " min").c_str() : "off");
+}
+
+bool save_last_session(int timeout_ms) {
+    if (!conv::last_session_enabled(getenv("WWHD_LAST_SESSION"), getenv("WWHD_NO_HOST_INPUT") != nullptr)) return false;
+    {
+        // the VR test environment: the player's own world, as it was before entering (set_last_session_source)
+        std::string source;
+        {
+            std::lock_guard<std::mutex> lk(g_last_source_mu);
+            source = g_last_source;
+        }
+        if (!source.empty()) {
+            std::error_code ec;
+            std::filesystem::copy_file(source, slot_path(conv::kLastSessionSlot, pstate::kExtension),
+                                       std::filesystem::copy_options::overwrite_existing, ec);
+            LOG("[savestate] last session: the world from before the VR test environment (%s)", ec ? ec.message().c_str() : "copied");
+            return !ec;
+        }
+    }
+    if (!in_gameplay() || g_loading.load()) return false;
+    g_conv_result = 0;
+    g_psave_req = conv::kLastSessionSlot;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < until) {
+        const int r = g_conv_result.load();
+        if (r == conv::kLastSessionSlot) return true;
+        if (r == -conv::kLastSessionSlot) return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    LOG("[savestate] last session: the game did not save within %d ms", timeout_ms);
+    return false;
+}
+
+namespace {
+void service_warp(Cpu* c);       // world editor (below)
+void service_file_save(Cpu* c);
+}  // namespace
+
+void service(Cpu* c) {
+    crashrec::service();
+    if (g_fixed_seed && g_fixed_seed_boot.due(ld32(GD(0x101FF560)))) {
+        fixed_seed::set_boot_frame(render::frame_count());
+        LOG("[test] WWHD_TEST_FIXED_SEED: TV frame %llu counts as frame %llu for scripted test aids",
+            (unsigned long long)render::frame_count(), (unsigned long long)fixed_seed::kBootFrame);
+        apply_fixed_seed("first gameplay frame");
+    }
+    // test aids (TV frames): WWHD_STATE_SAVE_AT / WWHD_STATE_LOAD_AT for full states,
+    // WWHD_PORTABLE_SAVE_AT / WWHD_PORTABLE_LOAD_AT for portable ones; WWHD_PORTABLE_LOAD=file loads
+    // that portable state as soon as a Quest Log is being played (a state from a bug report)
+    static const std::vector<Timed> save_at = parse_timed("WWHD_STATE_SAVE_AT"), load_at = parse_timed("WWHD_STATE_LOAD_AT"),
+                                    psave_at = parse_timed("WWHD_PORTABLE_SAVE_AT"), pload_at = parse_timed("WWHD_PORTABLE_LOAD_AT");
+    if (!save_at.empty() || !load_at.empty() || !psave_at.empty() || !pload_at.empty()) {
+        static uint64_t last = 0;
+        uint64_t f = fixed_seed::script_frame(render::frame_count());
+        for (auto& t : save_at)
+            if (t.frame > last && t.frame <= f) request_save_full(t.slot);
+        for (auto& t : load_at)
+            if (t.frame > last && t.frame <= f) request_load(t.slot);
+        for (auto& t : psave_at)
+            if (t.frame > last && t.frame <= f) request_save_portable(t.slot);
+        for (auto& t : pload_at)
+            if (t.frame > last && t.frame <= f) request_load_portable_file(slot_path(t.slot, pstate::kExtension));
+        last = f;
+    }
+    static bool env_load = [] {
+        if (const char* e = getenv("WWHD_PORTABLE_LOAD")) request_load_portable_file(e);
+        return true;
+    }();
+    (void)env_load;
+    track_events();
+    service_at_start();
+    service_auto_save();
+    // test aid: WWHD_TEST_WARP_AT=frame:stage:room:point[,...] enters that stage (the world editor's warp, the game's
+    // own stage change at a spawn point) at each TV frame; a warp the game refuses then (no control yet) is retried
+    // every 30 frames until the next one is due
+    static std::vector<std::pair<uint64_t, Warp>> warps = [] {
+        std::vector<std::pair<uint64_t, Warp>> v;
+        const char* e = getenv("WWHD_TEST_WARP_AT");
+        for (std::string all = e ? e : ""; !all.empty();) {
+            const size_t comma = all.find(',');
+            const std::string item = all.substr(0, comma);
+            all = comma == std::string::npos ? "" : all.substr(comma + 1);
+            unsigned long long frame = 0;
+            char stage[16] = {};
+            int room = 0, point = 0;
+            if (sscanf(item.c_str(), "%llu:%15[^:]:%d:%d", &frame, stage, &room, &point) == 4) {
+                Warp w;
+                w.stage = stage, w.room = room, w.point = point;
+                v.push_back({frame, w});
+            }
+        }
+        return v;
+    }();
+    if (!warps.empty()) {
+        static size_t next = 0;
+        static std::atomic<bool> pending{false}, done{false};
+        static uint64_t tried = 0;
+        const uint64_t f = fixed_seed::script_frame(render::frame_count());
+        if (next < warps.size() && f >= warps[next].first) {
+            if (done.exchange(false) || (next + 1 < warps.size() && f >= warps[next + 1].first)) {
+                pending = false;
+                ++next;
+            } else if (!pending && f >= tried + 30) {
+                tried = f;
+                pending = true;
+                static const bool force = getenv("WWHD_TEST_WARP_FORCE") && atoi(getenv("WWHD_TEST_WARP_FORCE"));
+                g_warp_force = force;
+                request_warp(warps[next].second, [](bool ok, const std::string&) {
+                    if (ok) done = true;
+                    pending = false;
+                    g_warp_force = false;
+                });
+            }
+        }
+    }
+    service_warp(c);       // world editor
+    service_file_save(c);  // world editor test states
+    if (int slot = g_psave_req.exchange(0)) do_portable_save(c, slot);
+    if (g_fixed_seed) {  // (before service_portable_load: a load applied now is followed from the next boundary on)
+        switch (g_fixed_seed_load.step(ld32(GD(0x101FF560)))) {
+        case fixed_seed::LoadGate::kLoading: apply_fixed_seed("portable state: loading the new stage"); break;
+        case fixed_seed::LoadGate::kArrived:
+            apply_fixed_seed("portable state: first frame in the new stage");
+            // the load-relative capture's start after a portable load (WWHD_TEST_CAPTURE_LOAD_STEP; gx2_core.cpp)
+            g_seeded_arrival_step = interp::logic_steps();
+            g_seeded_arrival_counter = ld32(GD(0x101FF560));
+            g_seeded_arrival_frame = render::frame_count();
+            break;
+        case fixed_seed::LoadGate::kTimedOut: LOG("[test] WWHD_TEST_FIXED_SEED: portable state: no stage change seen"); break;
+        default: break;
+        }
+    }
+    service_portable_load(c);
+    watch_arrival(c);
+    controller_reapply::service(c);
+    guestmods::service(c);  // story layouts dropped by a load: built for the loaded item screen
+    // test aid: WWHD_STATE_DUMP=n dumps the n TV frames after each save/load (state_<save|load><slot>_<k>.png)
+    static const int dump = getenv("WWHD_STATE_DUMP") ? atoi(getenv("WWHD_STATE_DUMP")) : 0;
+    if (int slot = g_save_req.load()) {
+        if (do_save(slot)) {
+            g_save_req = 0;
+            g_attempts = 0;
+            for (int k = 1; k <= dump; k++)
+                render::request_tv_dump("state_save" + std::to_string(slot) + "_" + std::to_string(k) + ".png", k);
+        }
+        return;
+    }
+    std::shared_ptr<Snapshot> s;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        s = g_load_ready;
+    }
+    if (s && do_load(s)) {
+        if(s->load_applied){
+            g_last_load_frame = render::frame_count();
+            g_last_load_step = interp::logic_steps();
+            g_last_load_counter = ld32(GD(0x101FF560));  // g_Counter.mTimer: the game's own step counter, part of the state
+            apply_fixed_seed("full state loaded");
+        } // g_Counter.mTimer is guest state; a refused load must not advance these markers.
+        {
+            std::lock_guard<std::mutex> lk(g_mu);
+            g_load_ready.reset();
+        }
+        g_loading = false;
+        g_attempts = 0;
+        for (int k = 1; s->load_applied && k <= dump; k++)
+            render::request_tv_dump("state_load" + std::to_string(s->slot) + "_" + std::to_string(k) + ".png", k);
+    }
+}
+
+// ---------------------------------------------------------------- world editor (savestate.h)
+namespace {
+struct PendingWarp { bool set = false; Warp w; std::function<void(bool, const std::string&)> done; };
+PendingWarp g_warp;  // under g_mu
+struct PendingFileSave { std::string path; std::function<void(bool, const std::string&)> done; bool full=false; };
+PendingFileSave g_file_save;  // under g_mu
+
+bool warp_stage_loadable(const std::string& stage, int room, std::string& why) {
+    if (stage.empty() || stage.size() > 7 || stage.find_first_of(":/") != std::string::npos)
+        return why = "\"" + stage + "\" is not a stage name the game knows", false;
+    if (room < 0 || room > 63) return why = "a room is 0..63", false;
+    mod_stages::Info info;
+    if (mod_stages::find(stage, info)) {
+        if (std::find(info.rooms.begin(), info.rooms.end(), unsigned(room)) != info.rooms.end()) return true;
+        return why = "the stage " + info.id + " (" + info.mod + ") has no room " + std::to_string(room), false;
+    }
+    // the game's stages: its loose Stage files and the packs' (the sea's archives are in a pack); read once
+    static const std::set<std::string> game = [] {
+        std::set<std::string> names;
+        for (const auto& [name, rooms] : editor::game_stage_rooms(config::game_dir)) names.insert(name);
+        return names;
+    }();
+    // a game without a readable list (no files found): only the mod stage names are known to be missing
+    if (game.count(stage) || (game.empty() && !mod_stages::missing(stage))) return true;
+    return why = mod_stages::missing(stage) ? "the stage " + stage + " is a mod stage that no installed package makes"
+                                            : "the game has no stage " + stage, false;
+}
+
+void service_warp(Cpu* c) {
+    PendingWarp p;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (!g_warp.set) return;
+        p = std::move(g_warp);
+        g_warp = PendingWarp{};
+    }
+    auto finish = [&](bool ok, const std::string& why) {
+        if (!ok) message("Warp: %s", why.c_str());
+        LOG("[editor] warp to %s room %d %s: %s", p.w.stage.c_str(), p.w.room,
+            p.w.at_position ? "(position)" : ("point " + std::to_string(p.w.point)).c_str(), ok ? "started" : why.c_str());
+        if (p.done) p.done(ok, why);
+    };
+    std::string why;
+    bool retry = false;
+    // the game loads the stage's Stage archive (dStage_infoCreate halts the game without its stage.dzs): only a
+    // stage it can load, an installed mod stage or one of the game's files, is ever written as the next stage
+    if (!warp_stage_loadable(p.w.stage, p.w.room, why)) return finish(false, why);
+    if (!gameplay_ready(why, retry) || !player_has_control(c, why)) return finish(false, why);
+    const uint32_t sv = ld32(kSaveInfoPtr);
+    char name[8] = {};
+    memcpy(name, p.w.stage.data(), std::min<size_t>(p.w.stage.size(), 7));
+    // the current stage's layer when staying in it; otherwise the game picks the layer (-1)
+    const int8_t layer = p.w.stage == stage_name() ? (int8_t)ld8(kStartStage + 11) : -1;
+    uint16_t point = (uint16_t)(int16_t)p.w.point;
+    if (p.w.at_position) {
+        const uint32_t rs = sv + kRestart;  // dSv_restart_c, as apply_portable sets it
+        st8(rs + 0, (uint8_t)p.w.room);
+        st16(rs + 0x16, (uint16_t)p.w.angle);
+        for (int i = 0; i < 3; i++) stf32(rs + 0x18 + 4 * i, p.w.pos[i]);
+        st32(rs + 0x24, (uint32_t)(p.w.room & 0x3F) | 0xFF000000u);
+        stf32(rs + 0x28, 0.0);
+        st32(rs + 0x2C, 0);
+        point = 0xFFFF;
+    }
+    for (int i = 0; i < 8; i++) st8(kNextStage + i, (uint8_t)name[i]);
+    st16(kNextStage + 8, point);
+    st8(kNextStage + 10, (uint8_t)p.w.room);
+    st8(kNextStage + 11, (uint8_t)layer);
+    st8(kNextStage + 13, 0);  // wipe: fade
+    mods::moon_jump_reset();
+    st8(kNextStage + 12, 1);  // enabled
+    finish(true, "");
+}
+
+void service_file_save(Cpu* c) {
+    PendingFileSave p;
+    {
+        std::lock_guard<std::mutex> lk(g_mu);
+        if (g_file_save.path.empty()) return;
+        p = std::move(g_file_save);
+        g_file_save = PendingFileSave{};
+    }
+    if(p.full){
+        if(!do_save(-1,p.path,p.done)){
+            bool replaced=false;
+            {std::lock_guard lock(g_mu);if(g_file_save.path.empty())g_file_save=p;else replaced=true;}
+            if(replaced&&p.done)p.done(false,"superseded by another file save");
+        }else g_attempts=0;
+        return;
+    }
+    mods::lock_on_reset();
+    pstate::State s;
+    std::string why;
+    bool retry;
+    bool ok = gameplay_ready(why, retry) && player_has_control(c, why) && capture_portable(c, s, why) && write_portable(p.path, s, why);
+    LOG("[editor] state %s: %s", p.path.c_str(), ok ? "written" : why.c_str());
+    if (p.done) p.done(ok, why);
+}
+}  // namespace
+
+void request_warp(const Warp& w, std::function<void(bool ok, const std::string& why)> done) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_warp = PendingWarp{true, w, std::move(done)};
+}
+
+void request_save_portable_file(const std::string& path, std::function<void(bool ok, const std::string& why)> done) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_file_save = PendingFileSave{path, std::move(done)};
+}
+
+void request_save_full_file(const std::string&path,std::function<void(bool,const std::string&)> done){
+    if(path.empty()){if(done)done(false,"state path is empty");return;}
+    PendingFileSave replaced;
+    {std::lock_guard lock(g_mu);replaced=std::move(g_file_save);g_file_save={path,std::move(done),true};}
+    if(replaced.done)replaced.done(false,"superseded by another file save");
+}
+
+std::string control_problem() {
+    const uint32_t sv = ld32(kSaveInfoPtr);
+    if (!in_mem2(sv)) return "no game in progress";
+    const std::string st = stage_name();
+    if (st.empty() || st == "sea_T" || st == "Name" || st == "ENDumi") return "no game in progress";
+    if (!in_mem2(ld32(kLinkPtr))) return "Link is not in the scene";
+    if (ld8(kEventRun) || g_event_wait > 0) return "a cutscene or event is running";
+    if (ld8(kMesgStatus) || ld8(kScopeMesgStatus)) return "a message or dialogue is open";
+    if (ld8(kMenuFlag)) return "a game menu is open";
+    if (ld8(kNextStage + 12)) return "a stage change is in progress";
+    if (ld32(kPlayerPtr) != ld32(kLinkPtr)) return "Link is not the controlled character";
+    return "";
+}
+
+LinkPlace link_place() {
+    LinkPlace p;
+    const uint32_t link = ld32(kLinkPtr);
+    const std::string st = stage_name();
+    if (!in_mem2(link) || st.empty()) return p;
+    p.valid = true;
+    p.stage = st;
+    p.room = (int8_t)ld8(link + kActorRoom);
+    p.angle = ld16(link + kShapeAngleY);
+    for (int i = 0; i < 3; i++) p.pos[i] = (float)ldf32(link + kActorPos + 4 * i);
+    return p;
+}
+
+}  // namespace ss

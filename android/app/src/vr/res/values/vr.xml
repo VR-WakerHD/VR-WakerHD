@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- the VR variant: the game starts in VR (WwhdActivity.getArguments adds the vr argument) -->
+    <bool name="wwhd_vr">true</bool>
+</resources>

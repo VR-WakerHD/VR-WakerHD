@@ -1,0 +1,103 @@
+// GX2 command stream.
+//
+// Every GX2 API call that affects the GPU produces a command. Outside of
+// display-list recording, commands execute immediately against the current
+// register file and the renderer. While a display list is being recorded
+// (GX2BeginDisplayListEx .. GX2EndDisplayList), commands are appended to the
+// guest buffer instead and execute whenever the list is called.
+//
+// The encoding is our own (native-endian 32-bit words):
+//   word 0: op | (payload word count << 8)
+//   word 1..n: payload
+#pragma once
+#include <cstdint>
+#include <initializer_list>
+#include <string>
+
+namespace gx2 {
+
+enum Op : uint32_t {
+    OP_NOP = 0,
+    OP_SET_REGS,        // first register, values...
+    OP_DRAW,            // prim, count, baseVertex, instances
+    OP_DRAW_INDEXED,    // prim, count, indexType, indexAddr, baseVertex, instances
+    OP_CLEAR_COLOR,     // GX2ColorBuffer*, r, g, b, a (float bits)
+    OP_CLEAR_DEPTH,     // GX2DepthBuffer*, depth (float bits), stencil, flags
+    OP_CLEAR_BUFFERS,   // GX2ColorBuffer*, GX2DepthBuffer*, r, g, b, a, depth, stencil, flags
+    OP_COPY_SURFACE,    // src GX2Surface*, srcMip, srcSlice, dst GX2Surface*, dstMip, dstSlice
+    OP_COPY_TO_SCAN,    // GX2ColorBuffer*, target (1 = TV, 4 = DRC)
+    OP_CALL,            // display list address, size in bytes
+    OP_SET_CONTEXT,     // GX2ContextState* (0 = none)
+    OP_INVALIDATE,      // flags, address, size
+    OP_EXPAND_COLOR,    // GX2ColorBuffer*
+    OP_EXPAND_DEPTH,    // GX2DepthBuffer*
+    // host-only (render queue)
+    OP_FLUSH,           // submit queued GPU work
+    OP_DRAW_DONE,       // wait for the GPU to finish
+    OP_SWAP,            // present
+    OP_SETUP_CONTEXT,   // GX2ContextState*: allocate shadow state and make it current
+    OP_FENCE,           // fence id: the game thread waits until the render thread got here
+    // aspect ratio (aspect.cpp), appended to keep the numbers of recorded display lists
+    OP_SET_PROJ_REGS,   // first register, 16 values: a layout projection matrix (narrowed when drawing to the TV)
+    OP_LAYOUT_ROOT,     // nw::lyt root pane: drawn into the target bound now (which screen it goes to)
+    OP_PEEK_Z,          // signed x/y in 640x480 space, guest result address (triples)
+    OP_LAYOUT_CONTENT,  // DrawSelf scope: clip TV menu content to the native layout region
+    // cloud research prototype (cloud_proto.cpp): brackets drawVrkumo's draws; payload: snapshot seq
+    OP_CLOUDS_BEGIN,
+    OP_CLOUDS_END,
+    // debug (WWHD_VK_PIPELINE_WHO): the drawing code's context id for the next draws (host-only, never recorded)
+    OP_DEBUG_CONTEXT,
+    // host-only, never recorded: the uniform blocks of the next display-list call as submitted
+    // (submitted_uniforms.h; payload: Snapshot* as two words, 0: none from here on)
+    OP_SUBMITTED_UNIFORMS,
+    OP_GAMEPAD_BACKDROP, // exact background Picture::DrawSelf scope: begin (1) / end (0)
+    // 60 fps (generated, framegen.h; emitted only while WWHD_FRAMEGEN=1):
+    // host-only, never recorded: the 3D camera of the frame being drawn (framegen::kCameraWords words)
+    OP_FRAMEGEN_CAMERA,
+    // a layout root pane is about to be drawn into the target bound now (aspect.cpp hook_02877100, as
+    // OP_LAYOUT_ROOT, also with the original aspect): the first one on the TV picture ends the scene
+    OP_FRAMEGEN_LAYOUT,
+    // (VR fork, weather_quads.cpp) recorded into display lists like the draws it brackets: the weather packets' draw functions (rain, snow, the
+    // sparkles, poison mist, cloud shadows, waves, stars, sun, sky clouds) begin (1) / end (0): their one-quad draws
+    // whose only changes are the vertex buffer and its fetch shader's copy are drawn as one draw (gx2_core.cpp)
+    OP_WEATHER_QUADS,
+    OP_COUNT
+};
+
+// debug draw provenance (WWHD_VK_PIPELINE_WHO): a provider (set by dsweep.cpp) describes the guest code issuing a
+// draw or display-list call; the render thread knows the description of the draw it executes
+extern std::string (*g_draw_context_provider)();
+std::string current_draw_context();
+// emit a command (records into the active display list, or executes now)
+void emit(Op op, const uint32_t* payload, uint32_t n);
+inline void emit(Op op, std::initializer_list<uint32_t> payload) { emit(op, payload.begin(), (uint32_t)payload.size()); }
+// Producer-thread state: recorded commands may be replayed after a mode change.
+bool recording_display_list();
+
+// a uniform block bound by GX2Set*UniformBlock (noted for the display list being recorded)
+void note_uniform_block(uint32_t addr, uint32_t size);
+// render thread: the bytes the block at addr held when the display list being executed was submitted
+// (submitted_uniforms.h); nullptr: read guest memory. id: changes with every submission (0: none).
+const uint8_t* submitted_uniform_block(uint32_t addr, uint32_t size);
+uint64_t submitted_uniforms_id();
+bool submitted_uniforms_enabled();  // (VR fork) the switch above, for the draws to skip the lookup
+
+// register writes
+void set_reg(uint32_t reg, uint32_t value);
+void set_regs(uint32_t first, const uint32_t* values, uint32_t count);
+
+// the live register file used for execution
+uint32_t* regs();
+
+// execute a sequence of encoded commands
+void execute(const uint32_t* words, uint32_t count);
+
+// 60 fps (generated, framegen.h): OP_FRAMEGEN_CAMERA, in order with the game thread's commands (never
+// into a display list being recorded)
+void framegen_camera(const uint32_t* words, uint32_t n);
+
+// float <-> bits helpers for command payloads
+inline uint32_t fbits(float f) { uint32_t u; __builtin_memcpy(&u, &f, 4); return u; }
+inline float bitsf(uint32_t u) { float f; __builtin_memcpy(&f, &u, 4); return f; }
+
+}  // namespace gx2

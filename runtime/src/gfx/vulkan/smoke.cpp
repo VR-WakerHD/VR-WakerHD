@@ -1,0 +1,1943 @@
+#include "vr_vulkan.h"
+#include "record_worker.h"
+#include "pass.h"
+#ifdef __ANDROID__
+#include "overlay/overlay.h"
+#include "platform/input_sdl.h"
+#endif
+#include "deferred_dispatch.h"
+#include "../../exception_report.h"
+#include "bc_decode.h"
+#include "bc_reference.h"
+// No game assets: assertions inspect data returned by the actual Vulkan device.
+#include "backend.h"
+#include "gfx/renderer.h"
+#include "gfx/depth_peek.h"
+#include "stereo.h"
+#include "../stereo_projection.h"
+#include "android_shared_image.h"
+#include "pipeline_trace.h"
+#include "present.h"
+#include "vr_upscale.h"
+#include "buffer_cache.h"
+#include "render_prof.h"
+#include "perf_metrics.h"
+#include "write_watch.h"
+#include "shaders.h"
+#include "gx2/gx2.h"
+#include "Cafe/HW/Latte/ISA/RegDefines.h"
+#include "runtime.h"
+#include "Cafe/HW/Latte/LatteAddrLib/LatteAddrLib.h"
+#include "input.h"
+#include "input_map.h"
+#include "gfx/display_modes.h"
+#include "gfx/texture_pack.h"
+#include "texture_pack_vk.h"
+#include "transfer_wait.h"
+#include "settings.h"
+#include "draw_threads.h"
+#define XXH_INLINE_ALL
+#include "../../../third_party/xxhash/xxhash.h"
+#include "platform/dual_display.h"
+#include "overlay/hostui.h"
+#ifdef __ANDROID__
+#include <SDL3/SDL.h>
+#endif
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <zlib.h>
+#include <stdexcept>
+#include <string>
+#include <thread>
+
+namespace gx2 { void request_background_vulkan_cache_checkpoint(); }
+namespace gfxvk {
+extern uint64_t g_stat_full_checks, g_stat_uploads;
+void request_tv_dump(const std::string&,int);
+// (draw.cpp) a draw's texture and sampler resolution, and the create info of the last sampler the cache made
+Surface* resolve_texture_for_test(const uint32_t* r,vk::Shader* sh,uint32_t unit,const std::array<Surface*,8>& colors,const Surface* depth,bool* substituted,Surface** guest);
+VkSampler resolve_sampler_for_test(const uint32_t* r,vk::Shader* sh,uint32_t unit,const Surface* s,const Surface* guest=nullptr);
+VkSamplerCreateInfo& last_sampler_create_info_for_test();
+namespace {
+void require(bool condition,const char* message) { if(!condition)exception_report::raise(message); }
+struct Image {
+ Surface s;
+ Image(uint32_t w,uint32_t h,uint32_t format,bool depth=false,uint32_t layers=1,uint32_t mips=1) {
+  s.width=w;s.height=h;s.pitch=w;s.format=format;s.isDepth=depth;s.slices=layers;s.mips=mips;s.dim=layers>1?5:1;s.fmt=format_info(format,depth);create_surface_image(&s,true);
+ }
+ ~Image(){destroy_surface_image(&s);}
+};
+std::vector<uint8_t> read_image(Surface& s,VkImageAspectFlags aspect,uint32_t bytes,uint32_t mip=0,uint32_t layer=0) {
+ uint32_t w=std::max(1u,s.extent.width>>mip),h=std::max(1u,s.extent.height>>mip);
+ Buffer b=create_readback_buffer(size_t(w)*h*bytes);
+ transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
+ VkBufferImageCopy copy{};copy.imageSubresource={aspect,mip,layer,1};copy.imageExtent={w,h,1};
+ auto cmd=command_buffer();record::vkCmdCopyImageToBuffer(cmd,s.image,s.layout,b.buffer,1,&copy);
+ VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+ try {flush();std::vector<uint8_t> result(size_t(w)*h*bytes);memcpy(result.data(),b.mapped,result.size());defer_buffer(b);return result;}
+ catch(...){defer_buffer(b);throw;}
+}
+void rgba_is(const std::vector<uint8_t>& data,const uint8_t rgba[4],const char* message) {
+ for(size_t i=0;i<data.size();++i)require(data[i]==rgba[i%4],message);
+}
+void clear_image(Surface& s,const float rgba[4]) {
+ transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+ VkClearColorValue value{};std::copy(rgba,rgba+4,value.float32);VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT,0,s.mips,0,s.arrayLayers};
+ record::vkCmdClearColorImage(command_buffer(),s.image,s.layout,&value,1,&range);mark_gpu_written(&s);
+}
+// A colour placeholder used by a comparison instruction must retain colour tiling while
+// providing a Vulkan depth image. A subsequently rendered depth alias takes precedence.
+void colour_comparison_check() {
+ for (uint32_t tile : {1u,2u}) {
+  uint32_t addr=mem::host_alloc(4096,256);
+  memset(mem::ptr(addr),0,4096);
+  auto offset=[&](uint32_t x,uint32_t y) {
+   if(tile==1)return (y*8+x)*4;
+   return LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x,y,0,32,8,8,
+       Latte::E_HWTILEMODE::TM_1D_TILED_THIN1,false);
+  };
+  for(uint32_t y=0;y<4;++y)for(uint32_t x=0;x<4;++x) {
+   uint8_t rgba[4]={uint8_t((x+y*4)*17),uint8_t(255-x*17),uint8_t(y*31),255};
+   memcpy(mem::ptr(addr)+offset(x,y),rgba,4);
+  }
+  uint32_t words[7]={1u|(tile<<3)|(3u<<19),3u|(0x1au<<26),addr>>8,0,
+                    (1u<<19)|(2u<<22)|(3u<<25),0,0};
+  auto* color=sampled_texture(words,false);
+  require(color&&!color->fmt.depth,"comparison fixture colour upload failed");
+  auto* compared=sampled_texture(words,true);
+  require(compared&&compared!=color&&compared->fmt.pixel==VK_FORMAT_D32_SFLOAT,
+          "RGBA8 comparison texture was not converted to depth");
+  auto data=read_image(*compared,VK_IMAGE_ASPECT_DEPTH_BIT,4);
+  for(uint32_t i=0;i<16;++i) {
+   float value;memcpy(&value,data.data()+i*4,4);
+   require(std::abs(value-float(i)/15.0f)<0.000001f,"colour comparison upload/tiling differs");
+  }
+  SurfaceDesc depth;depth.addr=addr;depth.width=depth.height=4;depth.pitch=8;
+  depth.format=0x11;depth.isDepth=true;depth.tileMode=tile;
+  auto* rendered=find_or_create_surface(depth,true);
+  transition_image(rendered,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+  VkClearDepthStencilValue value{0.25f,0};VkImageSubresourceRange range{rendered->aspect,0,1,0,1};
+  record::vkCmdClearDepthStencilImage(command_buffer(),rendered->image,rendered->layout,&value,1,&range);
+  mark_gpu_written(rendered);
+  require(sampled_texture(words,true)==rendered,"rendered depth alias lost to the colour comparison placeholder");
+ }
+ fprintf(stderr,"[renderer smoke] colour comparison conversion, colour tiling and rendered depth alias passed\n");
+}
+
+// Texture upload paths against the guest bytes (the CPU side): a linear and a micro-tiled RGBA8 texture with random
+// texels, staged through own buffers and through the upload arena (WWHD_VK_TEXTURE_STAGING), and once more after the
+// texture budget released its image and the next lookup made it again (WWHD_VK_TEXTURE_BUDGET).
+void texture_path_check() {
+ constexpr uint32_t W=64,H=64;
+ uint32_t seed=0x2545F491u;
+ auto next=[&]{seed=seed*1664525u+1013904223u;return uint8_t(seed>>24);};
+ for(uint32_t tile:{1u,2u}) for(int staging:{0,1}) {
+  const uint32_t addr=mem::host_alloc(W*H*4,256);
+  auto offset=[&](uint32_t x,uint32_t y) {
+   if(tile==1)return (y*W+x)*4;
+   return LatteAddrLib::ComputeSurfaceAddrFromCoordMicroTiled(x,y,0,32,W,H,Latte::E_HWTILEMODE::TM_1D_TILED_THIN1,false);
+  };
+  std::vector<uint8_t> expected(W*H*4);
+  for(uint32_t y=0;y<H;++y)for(uint32_t x=0;x<W;++x)for(uint32_t c=0;c<4;++c){
+   const uint8_t v=next();expected[(y*W+x)*4+c]=v;mem::ptr(addr)[offset(x,y)+c]=v;
+  }
+  SurfaceDesc d;d.addr=addr;d.width=W;d.height=H;d.pitch=W;d.format=0x1a;d.tileMode=tile;d.dim=1;
+  g_texture_staging_override=staging;
+  auto* s=find_or_create_surface(d,false);
+  upload_surface(s);
+  require(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4)==expected,staging?"texture staged through the upload arena differs":"texture staged through its own buffer differs");
+  release_texture_image(s);
+  require(s->evicted&&!s->image,"texture budget did not release the image");
+  require(find_or_create_surface(d,false)==s&&s->image&&!s->evicted,"released texture was not made again by its lookup");
+  upload_surface(s);
+  require(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4)==expected,"texture made again after its release differs");
+ }
+ g_texture_staging_override=-1;
+ fprintf(stderr,"[renderer smoke] texture uploads through own buffers and the upload arena, and after a budget release, match the guest bytes\n");
+}
+// one level of an image as its raw bytes (`bytes` of them: a BC level's blocks too, down to a 1x1 level's one block)
+std::vector<uint8_t> read_level(Surface& s,uint32_t mip,size_t bytes) {
+ const uint32_t w=std::max(1u,s.extent.width>>mip),h=std::max(1u,s.extent.height>>mip);
+ Buffer b=create_readback_buffer(bytes);
+ transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
+ VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,mip,0,1};copy.imageExtent={w,h,1};
+ auto cmd=command_buffer();record::vkCmdCopyImageToBuffer(cmd,s.image,s.layout,b.buffer,1,&copy);
+ VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+ try {flush();std::vector<uint8_t> result(bytes);memcpy(result.data(),b.mapped,bytes);defer_buffer(b);return result;}
+ catch(...){defer_buffer(b);throw;}
+}
+// Replacement texture packs (texture_pack_vk.cpp, draw.cpp resolve_texture): a pack written here (index.json and a
+// x4 DDS with its levels) for a BC1 texture (BC7, 7 levels) and an RGBA8 one (RGBA8, 3 levels) uploaded from known
+// bytes, keyed by the XXH3 of their level-0 guest bytes. The loader and the frame step make the replacement images
+// (extent x4, the DDS's levels and bytes, scale 4, two levels in front); a draw's resolution binds them with a sampler
+// LOD range two levels on, and keeps the original for a unit that needs the guest's own levels, for a texture the
+// draw renders into, after the game rewrote the bytes (the replacement then goes at the next step), after the GPU
+// drew into it, and while the budget has released it (asked for again by that bind). The forced anisotropy follows
+// the guest's levels (a single-level original gets none with its replacement). The budget caps: over it a finished
+// load is refused (no image, the original bound) and not asked for again until there is room, then made; a released
+// texture the game rewrites with other contents keeps no stale key. Made on the upload thread and its queue where the
+// device has one (texture_pack_vk.cpp: the render thread copies nothing, the graphics submissions wait for its
+// copies), and once more on the render thread (`renderThread`, the path of devices without it).
+void texture_pack_check(bool renderThread) {
+ namespace tp=::gfx::texture_pack;
+ using Latte::REGADDR;
+ if(!R.enabledFeatures.textureCompressionBC){fprintf(stderr,"[renderer smoke] texture pack replacements skipped: no BC formats\n");return;}
+ const bool uploads=!renderThread&&texture_pack_uploads_available();
+ if(renderThread&&!texture_pack_uploads_available())return;  // (the first run took the render thread's path already)
+ texture_pack_set_render_uploads_for_test(renderThread);
+ const uint64_t renderCopies=g_stat_texpack_render_copy_bytes.load(),uploaded=g_stat_texpack_uploaded.load();
+ struct Case { uint32_t format,dxgi,levels; const char* file; uint32_t addr=0; Surface* guest=nullptr; std::vector<std::vector<uint8_t>> data; };
+ Case cases[2]={{0x31,98,7,"bc1.dds"},{0x1a,28,3,"rgba8.dds"}};
+ constexpr uint32_t W=16,H=16,kScale=4;
+ // the draw's registers: unit 0 of a pixel shader sampled through sampler 0 (bilinear, linear mips, LOD 1 to 3 5/64)
+ std::vector<uint32_t> regs(0x10000,0);
+ regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0]=(1u<<9)|(1u<<12)|(2u<<17);
+ regs[REGADDR::SQ_TEX_SAMPLER_WORD0_0+1]=64u|((3u*64+5)<<10);
+ LatteDecompilerShader dec(LatteConst::ShaderType::Pixel);
+ vk::Shader sh;sh.vertex=false;sh.dec=&dec;
+ uint32_t seed=0x9E3779B9u;
+ auto next=[&]{seed=seed*1664525u+1013904223u;return uint8_t(seed>>24);};
+ auto words_of=[&](const Case& c){
+  return std::array<uint32_t,7>{1u|(1u<<3)|(1u<<8)|((W-1)<<19),(H-1)|(c.format<<26),c.addr>>8,0,(1u<<19)|(2u<<22)|(3u<<25),0,0};
+ };
+ auto resolve=[&](const Case& c,const std::array<Surface*,8>& colors=std::array<Surface*,8>{}){
+  const auto w=words_of(c);std::copy(w.begin(),w.end(),regs.begin()+REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS);
+  bool substituted=false;Surface* guest=nullptr;
+  Surface* s=resolve_texture_for_test(regs.data(),&sh,0,colors,nullptr,&substituted,&guest);
+  require(!substituted&&(s==c.guest?guest==nullptr:guest==c.guest),"texture pack resolution named the wrong guest texture");
+  return s;
+ };
+ auto fill=[&](const Case& c,uint8_t salt){for(uint32_t i=0;i<65536;++i)mem::ptr(c.addr)[i]=uint8_t(i*7+salt);invalidate(2,c.addr,65536);};
+ const auto root=std::filesystem::temp_directory_path()/("wwhd-texpack-smoke-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+ std::filesystem::create_directories(root);
+ struct Cleanup { std::filesystem::path root; ~Cleanup(){ std::error_code e; std::filesystem::remove_all(root,e); } } cleanup{root};
+ std::string index="{\"format_version\":1,\"entries\":[";
+ for(auto& c:cases) {
+  // the guest texture, uploaded with packs off: its level-0 key as the pack would name it
+  c.addr=mem::host_alloc(65536,256);fill(c,uint8_t(c.format));
+  const auto w=words_of(c);
+  c.guest=sampled_texture(w.data(),false);
+  require(c.guest&&c.guest->mips==1&&c.guest->width==W&&c.guest->format==c.format,"texture pack guest lookup failed");
+  if(c.guest->bcDecoded){fprintf(stderr,"[renderer smoke] texture pack replacements skipped: BC1 decoded on this device\n");return;}
+  upload_surface(c.guest);
+  const uint64_t hash=XXH3_64bits(mem::ptr(c.addr),c.guest->dataSize);
+  require(c.guest->dataSize>0&&hash==c.guest->level0Hash,"texture pack key differs from the XXH3 of the level-0 guest bytes");
+  // the DDS: DX10 header, then the levels largest first, from known bytes
+  std::vector<uint8_t> dds(148,0);
+  auto put=[&](size_t at,uint32_t v){memcpy(dds.data()+at,&v,4);};
+  put(0,0x20534444u);put(4,124);put(8,0x1|0x2|0x4|0x1000|0x20000);put(12,H*kScale);put(16,W*kScale);put(28,c.levels);
+  put(76,32);put(80,4);put(84,0x30315844u);put(128,c.dxgi);put(132,3);put(140,1);
+  for(uint32_t level=0;level<c.levels;++level) {
+   const uint32_t lw=std::max(1u,W*kScale>>level),lh=std::max(1u,H*kScale>>level);
+   const size_t bytes=c.dxgi==98?size_t((lw+3)/4)*((lh+3)/4)*16:size_t(lw)*lh*4;
+   std::vector<uint8_t> data(bytes);for(auto& b:data)b=next();
+   dds.insert(dds.end(),data.begin(),data.end());c.data.push_back(std::move(data));
+  }
+  std::ofstream(root/c.file,std::ios::binary).write(reinterpret_cast<const char*>(dds.data()),std::streamsize(dds.size()));
+  char entry[256];
+  std::snprintf(entry,sizeof entry,"%s{\"format\":%u,\"width\":%u,\"height\":%u,\"hash\":\"%016llx\",\"scale\":%u,\"file\":\"%s\",\"archives\":[\"Common/Smoke/TexPack.szs\"]}",
+                &c==cases?"":",",c.format,W,H,(unsigned long long)hash,kScale,c.file);
+  index+=entry;
+ }
+ index+="]}";
+ std::ofstream(root/"index.json",std::ios::binary)<<index;
+ require(tp::load({root},R.properties.limits.maxImageDimension2D)&&tp::stats().entries==2,"texture pack index did not load");
+ texture_pack_set_budget_for_test(256ull<<20);
+ g_texture_packs_on=true;
+ struct Off { ~Off(){ texture_pack_shutdown();g_texture_packs_on=false;texture_pack_set_budget_for_test(0);texture_pack_set_render_uploads_for_test(false); } } off;
+ // the frame step (swap's) until the loader has given every waiting texture its replacement
+ auto made=[&](const char* message){
+  for(int i=0;i<5000;++i) {
+   texture_pack_step();
+   bool all=true;for(auto& c:cases)all&=c.guest->replacement!=nullptr;
+   if(all){flush();return;}
+   std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  require(false,message);
+ };
+ // the pack is on now: the next upload of the same bytes (an invalidation) asks for the replacements
+ for(auto& c:cases){invalidate(2,c.addr,65536);require(resolve(c)==c.guest,"texture pack bound a replacement before it was made");}
+ made("texture pack replacements were not made");
+ if(uploads)
+  require(g_stat_texpack_uploaded.load()>=uploaded+2&&g_stat_texpack_render_copy_bytes.load()==renderCopies&&transfer_wait::g_value.load()>0,
+          "texture pack replacements were not made by the upload thread (or the render thread copied, or no graphics wait)");
+ else require(g_stat_texpack_render_copy_bytes.load()>renderCopies&&g_stat_texpack_uploaded.load()==uploaded,
+              "texture pack replacements were not made on the render thread");
+ for(auto& c:cases) {
+  Surface* guest=c.guest;
+  Surface* r=guest->replacement.get();
+  {
+   draw_threads::CacheLock locked(draw_threads::surface_mutex());
+   require(replacement_for(guest)==r,"replacement_for refused a current replacement");
+  }
+  require(r->extent.width==W*kScale&&r->extent.height==H*kScale&&r->mips==c.levels&&r->sx==float(kScale)&&r->sy==float(kScale)&&
+          r->lodOffset==2&&r->layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,"texture pack replacement has the wrong shape");
+  require(read_level(*r,0,c.data.front().size())==c.data.front(),"texture pack replacement level 0 differs from the DDS");
+  require(read_level(*r,c.levels-1,c.data.back().size())==c.data.back(),"texture pack replacement last level differs from the DDS");
+  // the draw's resolution: the replacement, with its own view and a sampler two levels on (guest LOD 1..3 5/64)
+  require(resolve(c)==r,"the draw did not bind the texture pack replacement");
+  const VkSampler guestSampler=resolve_sampler_for_test(regs.data(),&sh,0,guest);
+  last_sampler_create_info_for_test()={};
+  const VkSampler replacementSampler=resolve_sampler_for_test(regs.data(),&sh,0,r);
+  if(&c==cases&&!renderThread)  // (the second run finds the first run's sampler in the cache: no create info then)
+   require(last_sampler_create_info_for_test().minLod==3.0f&&last_sampler_create_info_for_test().maxLod==2.0f+(3*64+5)/64.0f,
+           "texture pack replacement sampler LOD range is not two levels on");
+  require(replacementSampler!=guestSampler&&replacementSampler==resolve_sampler_for_test(regs.data(),&sh,0,r),"texture pack replacement sampler cache differs");
+  if(&c==cases) {
+   // forced anisotropy (the anisotropy setting): decided by the guest's levels, here one, so the replacement's sampler
+   // does not change with the setting either (the cache's key holds the forced flag: one sampler for both); without
+   // the guest, the replacement's own seven levels would force it (the old rule: two samplers)
+   const bool wasAniso=aniso_enabled();
+   auto with=[&](bool aniso,const Surface* s,const Surface* g){set_aniso(aniso);return resolve_sampler_for_test(regs.data(),&sh,0,s,g);};
+   const bool guestSame=with(false,guest,nullptr)==with(true,guest,nullptr);
+   const bool replacementSame=with(false,r,guest)==with(true,r,guest);
+   const bool ownLevelsSame=with(false,r,nullptr)==with(true,r,nullptr);
+   set_aniso(wasAniso);
+   require(guest->mips==1&&guestSame&&replacementSame,"a texture pack replacement's anisotropy differs from its original's");
+   require(!ownLevelsSame,"the anisotropy check did not tell the rules apart");
+  }
+  require(sampled_texture_view(r,regs.data()+REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS)!=VK_NULL_HANDLE,"texture pack replacement view failed");
+  // a unit that needs the guest's own levels (texel fetch, size or LOD query, explicit LOD), and a draw into it
+  const uint64_t guestLevels=g_stat_texpack_guest_levels;
+  dec.textureNeedsGuestLevels[0]=true;
+  require(resolve(c)==guest&&g_stat_texpack_guest_levels==guestLevels+1,"a unit needing the guest's levels bound the replacement");
+  dec.textureNeedsGuestLevels[0]=false;
+  std::array<Surface*,8> into{};into[0]=guest;
+  require(resolve(c,into)==guest,"a draw rendering into the texture bound its replacement");
+  require(resolve(c)==r,"the replacement was not bound again");
+ }
+ {
+  // the game rewrites the bytes: the original is bound; the replacement goes at the next step
+  Case& c=cases[0];
+  std::weak_ptr<Surface> was=c.guest->replacement;
+  fill(c,0x55);
+  require(resolve(c)==c.guest&&!c.guest->replacement,"rewritten texture still bound its replacement");
+  require(!was.expired(),"a dropped replacement went before the frame's end");
+  texture_pack_step();flush();
+  require(was.expired(),"a dropped replacement was not destroyed at the next step");
+  // the same bytes as the pack's again: the replacement is made once more
+  fill(c,uint8_t(c.format));
+  require(resolve(c)==c.guest,"texture pack bound a replacement before it was made again");
+  made("texture pack replacement was not made again for restored bytes");
+  require(resolve(c)==c.guest->replacement.get(),"texture pack replacement made again is not bound");
+ }
+ {
+  // a tiny budget: a replacement not bound for 300 frames is released once, asked for again by the next bind (the
+  // original meanwhile), and made again
+  Case& c=cases[1];
+  Case& o=cases[0];
+  texture_pack_set_budget_for_test(1);
+  R.frame+=301;R.frame+=30-R.frame%30;
+  texture_pack_step();
+  require(!c.guest->replacement&&c.guest->replacementReleased&&!o.guest->replacement,"texture pack budget did not release the replacements");
+  // a released texture the game rewrites with other contents: no key left (each bind would take the surface lock),
+  // nothing asked for; its pack bytes again are asked for by that upload
+  require(o.guest->replacementReleased&&o.guest->replacementKey.hash!=0,"a released replacement left no key to ask for it again");
+  fill(o,0x77);
+  require(resolve(o)==o.guest&&o.guest->replacementKey.hash==0&&!o.guest->replacementReleased,
+          "a released texture rewritten with other contents kept its stale replacement key");
+  fill(o,uint8_t(o.format));
+  require(resolve(o)==o.guest,"a texture pack bound a replacement it has not made");
+  texture_pack_step();
+  require(c.guest->replacementReleased,"a released replacement was asked for again without a bind");
+  require(resolve(c)==c.guest&&!c.guest->replacementReleased,"a released replacement's bind did not ask for it again");
+  // over the budget: both loads arrive and are refused, no image is made and the originals stay bound
+  const uint64_t refused=g_stat_texpack_refused;
+  for(int i=0;i<5000&&g_stat_texpack_refused<refused+2;++i){texture_pack_step();std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+  require(g_stat_texpack_refused==refused+2&&!c.guest->replacement&&!o.guest->replacement,"over the VRAM budget a new texture pack replacement was made");
+  for(auto& k:cases)require(resolve(k)==k.guest,"over the VRAM budget the original texture was not bound");
+  // a refused key is not asked for again at once: not by an upload of its bytes, not by the step before there is room
+  fill(c,uint8_t(c.format));
+  require(resolve(c)==c.guest,"a refused texture pack replacement was bound");
+  texture_pack_step();
+  require(tp::stats().pending==0&&g_stat_texpack_refused==refused+2,"a key refused for the VRAM budget was asked for again at once");
+  // room again (the budget raised): asked for again at the step's scan, and made
+  texture_pack_set_budget_for_test(256ull<<20);
+  made("texture pack replacements were not made again when the budget had room");
+  require(resolve(c)==c.guest->replacement.get()&&resolve(o)==o.guest->replacement.get(),"texture pack replacement made again after its release is not bound");
+ }
+ if(uploads) {
+  // loading with the area: the game opens the archive before any guest texture has the pack's bytes (rewritten with
+  // others here); the prefetched loads become unattached replacements, released when never attached for 3600 frames
+  // or over the budget; kept, the guests' uploads of the pack's bytes attach them at once, with no request and no
+  // load of their own, and opening the archive again loads nothing
+  for(auto& c:cases){fill(c,0x33);require(resolve(c)==c.guest&&!c.guest->replacement,"rewritten texture still bound its replacement");}
+  texture_pack_step();flush();
+  require(tp::prefetch_on()&&tp::has_archive("Common/Smoke/TexPack.szs")&&texture_pack_unattached_for_test()==0,
+          "texture pack prefetch is off on the upload thread's path");
+  auto unattached=[&](const char* message){
+   tp::prefetch("/vol/content/Common/Smoke/TEXPACK.szs");
+   for(int i=0;i<5000&&texture_pack_unattached_for_test()<2;++i){texture_pack_step();std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+   require(texture_pack_unattached_for_test()==2,message);
+   for(auto& c:cases)require(!c.guest->replacement,"an unattached texture pack replacement went to a texture of other contents");
+  };
+  unattached("prefetched texture pack replacements were not made unattached");
+  R.frame+=3600;texture_pack_step();
+  require(texture_pack_unattached_for_test()==0,"an unattached texture pack replacement outlived its 3600 frames");
+  unattached("texture pack replacements released unattached were not prefetched again");
+  texture_pack_set_budget_for_test(1);texture_pack_step();
+  require(texture_pack_unattached_for_test()==0,"over the VRAM budget unattached texture pack replacements were kept");
+  {
+   // no room even for them: the prefetched loads come back without their data (freed on the upload thread), nothing
+   // is kept, and prefetching pauses (the archive opened again reads nothing) until the budget has room
+   const uint64_t full=texture_pack_prefetch_full_for_test();
+   tp::prefetch("Common/Smoke/TexPack.szs");
+   for(int i=0;i<5000&&texture_pack_prefetch_full_for_test()<full+2;++i){texture_pack_step();std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+   require(texture_pack_prefetch_full_for_test()==full+2&&texture_pack_unattached_for_test()==0&&tp::prefetch_paused(),
+           "a texture pack prefetch over the VRAM budget was kept, or did not pause prefetching");
+   const uint64_t loaded=tp::stats().loaded;
+   tp::prefetch("Common/Smoke/TexPack.szs");
+   for(int i=0;i<20;++i){texture_pack_step();std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+   require(tp::stats().loaded==loaded&&tp::stats().pending==0,"a paused texture pack prefetch loaded replacements");
+  }
+  texture_pack_set_budget_for_test(256ull<<20);
+  texture_pack_step();
+  require(!tp::prefetch_paused(),"texture pack prefetching did not resume when the budget had room");
+  const tp::Stats before=tp::stats();
+  unattached("texture pack replacements were not prefetched with room again");
+  const tp::Stats kept=tp::stats();
+  require(kept.prefetched==before.prefetched+2&&kept.loaded==before.loaded+2&&kept.requested==before.requested,
+          "a texture pack prefetch did not load each key once, or counted as a request");
+  for(auto& c:cases) {
+   fill(c,uint8_t(c.format));
+   resolve(c);  // (the upload: attached here)
+   require(c.guest->replacement&&resolve(c)==c.guest->replacement.get(),"a guest upload did not attach its prefetched replacement at once");
+   require(read_level(*c.guest->replacement,0,c.data.front().size())==c.data.front(),"a prefetched texture pack replacement differs from the DDS");
+  }
+  const tp::Stats after=tp::stats();
+  require(after.requested==kept.requested&&after.loaded==kept.loaded&&after.pending==0&&texture_pack_unattached_for_test()==0,
+          "attaching a prefetched texture pack replacement asked for or loaded it again");
+  tp::prefetch("Common\\Smoke\\TexPack.szs");
+  for(int i=0;i<20;++i){texture_pack_step();std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+  require(tp::stats().prefetched==after.prefetched&&tp::stats().loaded==after.loaded&&texture_pack_unattached_for_test()==0,
+          "opening the archive again loaded texture pack replacements already kept");
+  fprintf(stderr,"[renderer smoke] texture pack prefetch: an opened archive's replacements made unattached, released after 3600 frames "
+                 "and over the budget, attached at the guests' uploads with no request or load, not loaded again while kept; "
+                 "with no room dropped on the upload thread and paused until there is\n");
+ }
+ {
+  // the GPU draws into the texture: the original is bound (detection's own test, at the bind)
+  Case& c=cases[1];
+  mark_gpu_written(c.guest);
+  require(resolve(c)==c.guest,"a texture the GPU drew into bound its replacement");
+ }
+ {
+  draw_threads::CacheLock locked(draw_threads::surface_mutex());
+  for(auto& c:cases)if(c.guest->replacement)texture_pack_drop(c.guest);
+ }
+ texture_pack_step();flush();
+ if(uploads)require(g_stat_texpack_render_copy_bytes.load()==renderCopies,"the render thread copied texture pack level data beside the upload thread");
+ fprintf(stderr,"[renderer smoke] texture pack replacements: made from the DDS (x4, levels, bytes), bound with a two-level LOD shift, "
+                "originals for guest-level units, targets, rewritten and GPU-drawn textures, guest anisotropy, budget release, refusal "
+                "over the budget and remake with room, no stale key passed (%s)\n",
+         uploads?"made on the upload thread's own queue, read back exact, render thread copied 0 bytes":
+         renderThread?"made on the render thread":"made on the render thread: the device has no upload queue");
+}
+void bc_surface_check() {
+ for (uint32_t format : {0x31u,0x431u,0x32u,0x432u,0x33u,0x433u,0x34u,0x234u,0x35u,0x235u}) {
+  SurfaceDesc d;d.addr=mem::host_alloc(65536,256);d.mipAddr=mem::host_alloc(65536,256);
+  d.width=16;d.height=16;d.pitch=4;d.slices=2;d.mips=2;d.format=format;d.dim=5;
+  memset(mem::ptr(d.addr),0,65536);memset(mem::ptr(d.mipAddr),0,65536);
+  auto* s=find_or_create_surface(d,false);
+  if(!s->bcDecoded)continue;
+  upload_surface(s);auto uploads=g_stat_uploads;upload_surface(s);
+  require(g_stat_uploads==uploads,"BC upload cache did not hit");
+  const unsigned type=(format&63)-0x30,mode=type|((format&0x200)?256:0);
+  auto expected=[&](uint8_t fill){std::vector<uint8_t> block(bc::block_bytes(type),fill);return bc::pixel(block.data(),type,mode&256,0);};
+  auto zero=expected(0),changed=expected(255);
+  for(unsigned level=0;level<2;++level)for(unsigned layer=0;layer<2;++layer)
+   rgba_is(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4,level,layer),zero.data(),"BC mip/layer upload differs");
+  memset(mem::ptr(d.mipAddr),255,65536);invalidate(2,d.mipAddr+16,4);upload_surface(s);
+  require(g_stat_uploads==uploads+1,"BC partial invalidation did not re-upload");
+  for(unsigned layer=0;layer<2;++layer){
+   rgba_is(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4,0,layer),zero.data(),"BC mip invalidation modified base");
+   rgba_is(read_image(*s,VK_IMAGE_ASPECT_COLOR_BIT,4,1,layer),changed.data(),"BC changed mip/layer differs");
+  }
+ }
+ fprintf(stderr,"[renderer smoke] BC production uploads, sRGB/signed views, mip/layer cache and invalidation passed\n");
+}
+void completed_scan_retention_check() {
+ require(R.tv.scan && R.tv.scan->image, "completed scan missing for repeat check");
+ const auto frame = R.frame;
+ const auto original = read_image(*R.tv.scan, VK_IMAGE_ASPECT_COLOR_BIT, 4);
+ const auto before = compose_offscreen(R.tv, 64, 64, false);
+ // The real-game diagnostic also captures GamePad. Exercise its published
+ // scan when this smoke configuration supplies one, without changing setup.
+ Surface* drcScan = R.drc.scan && R.drc.scan->image ? R.drc.scan.get() : nullptr;
+ const auto drcBefore = drcScan ? read_image(*drcScan, VK_IMAGE_ASPECT_COLOR_BIT, 4) : std::vector<uint8_t>{};
+ Image next(64, 64, 0x1a);
+ const float blue[4] = {0, 0, 1, 1};
+ clear_image(next.s, blue);
+ if (R.tv.buildingScan) destroy_surface_image(R.tv.buildingScan.get());
+ R.tv.buildingScan = std::make_unique<Surface>(std::move(next.s));
+ next.s = {};
+ R.tv.buildingScanDirty = true; R.tv.buildingScanSrgb = false;
+ begin_pipeline_pending_frame();
+ std::this_thread::sleep_for(std::chrono::milliseconds(20));
+ present_completed_frame_while_pipeline_pending();
+ require(R.frame == frame, "repeated presentation advanced guest frame state");
+ require(read_image(*R.tv.scan, VK_IMAGE_ASPECT_COLOR_BIT, 4) == original,
+         "pending presentation exposed or modified the next scan image");
+ if (drcScan) require(R.drc.scan.get() == drcScan &&
+     read_image(*drcScan, VK_IMAGE_ASPECT_COLOR_BIT, 4) == drcBefore,
+     "pending presentation modified the published GamePad scan");
+ const auto repeated = compose_offscreen(R.tv, 64, 64, false);
+ require(repeated == before, "repeated completed composition differs pixel-for-pixel");
+ swap();
+ const uint8_t rgba[4] = {0, 0, 255, 255};
+ rgba_is(read_image(*R.tv.scan, VK_IMAGE_ASPECT_COLOR_BIT, 4), rgba,
+         "completed next scan was not published at swap");
+ if (const char* path = std::getenv("WWHD_VK_PENDING_PROOF_DIR")) {
+  std::filesystem::create_directories(path);
+  write_rgba_png(std::string(path) + "/completed.png", 64, 64, before);
+  write_rgba_png(std::string(path) + "/repeated.png", 64, 64, repeated);
+  write_rgba_png(std::string(path) + "/resumed.png", 64, 64, compose_offscreen(R.tv, 64, 64, false));
+ }
+ fprintf(stderr, "[renderer smoke] pending presentation retained completed pixels; next scan published only at swap\n");
+}
+void upload_arena_check() {
+ const uint64_t before=R.drawCounters.uploadAllocations;
+ auto a=allocate_upload(16,256),b=allocate_upload(16,256);
+ require(a.buffer==b.buffer&&a.offset!=b.offset,"arena slices alias or fail pooling");
+ require(a.offset%256==0&&b.offset%256==0,"arena alignment failed");
+ memset(a.mapped,0x31,16);memset(b.mapped,0x72,16);
+ Buffer out=create_readback_buffer(32);
+ VkBufferCopy ca{a.offset,0,16},cb{b.offset,16,16};
+ auto cmd=command_buffer();record::vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&ca);record::vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&cb);
+ VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=out.buffer;barrier.size=VK_WHOLE_SIZE;
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);flush();
+ auto bytes=static_cast<uint8_t*>(out.mapped);for(int i=0;i<32;i++)require(bytes[i]==(i<16?0x31:0x72),"arena GPU snapshots corrupted");
+ auto reuse=allocate_upload(16,256);require(reuse.buffer==a.buffer&&reuse.offset==a.offset,"arena failed fence reuse");
+ require(R.drawCounters.uploadAllocations<=before+1,"arena allocated per slice");defer_buffer(out);command_buffer();flush();
+ fprintf(stderr,"[renderer smoke] immutable upload arena GPU snapshots and fence reuse passed\n");
+}
+std::vector<uint8_t> read_buffer(VkBuffer source,VkDeviceSize offset,uint32_t size) {
+ Buffer out=create_readback_buffer(size);
+ VkBufferCopy copy{offset,0,size};auto cmd=command_buffer();record::vkCmdCopyBuffer(cmd,source,out.buffer,1,&copy);
+ VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=out.buffer;barrier.size=VK_WHOLE_SIZE;
+ record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+ try {flush();std::vector<uint8_t> result(static_cast<uint8_t*>(out.mapped),static_cast<uint8_t*>(out.mapped)+size);defer_buffer(out);return result;}
+ catch(...){defer_buffer(out);throw;}
+}
+// Guest buffer cache (WWHD_VK_BUFFER_CACHE=1 only): GPU copies read back from the device after a hit,
+// an unannounced CPU write, a GX2Invalidate hint, a save-state reset and for native index data.
+void buffer_cache_check() {
+ if(!buffer_cache_enabled()){fprintf(stderr,"[renderer smoke] buffer cache off (WWHD_VK_BUFFER_CACHE=1 tests it)\n");return;}
+ const uint32_t size=8192,addr=mem::host_alloc(65536,4096);
+ for(uint32_t i=0;i<65536;++i)mem::ptr(addr)[i]=uint8_t(i*7+3);
+ auto gpu_equals_guest=[&](const UploadSlice& s,uint32_t at,uint32_t n,const char* message) {
+  auto bytes=read_buffer(s.buffer,s.offset,n);require(!memcmp(bytes.data(),mem::ptr(at),n),message);
+ };
+ UploadSlice a,b;
+ require(cached_guest_range(addr,size,rprof::kUpVertex,a),"buffer cache refused a static range");
+ gpu_equals_guest(a,addr,size,"buffer cache upload differs on the GPU");
+ require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.buffer==a.buffer&&b.offset==a.offset,"unchanged range was not a hit");
+ require(cached_guest_range(addr,size/2,rprof::kUpUbo,b)&&b.offset==a.offset,"sub-range with the same start was not a hit");
+ mem::ptr(addr)[size-3]^=0xA5;  // unannounced CPU write: page fault, newer stamp
+ require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"written range was not uploaded again");
+ gpu_equals_guest(b,addr,size,"re-uploaded range differs on the GPU");
+ gpu_equals_guest(b,addr,size,"re-uploaded range changed after a submission");
+ a=b;buffer_cache_guest_invalidate(1,addr+16,4);
+ require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"GX2Invalidate did not refresh the range");
+ a=b;buffer_cache_invalidate_all();
+ require(cached_guest_range(addr,size,rprof::kUpVertex,b)&&b.offset!=a.offset,"save-state reset did not refresh the range");
+ gpu_equals_guest(b,addr,size,"range after reset differs on the GPU");
+ UploadSlice ix;bufcache::Entry* entry=nullptr;
+ require(cached_native_indices(addr+size,4096,ix,entry)&&entry&&entry->shadow.size()==4096&&!memcmp(entry->shadow.data(),mem::ptr(addr+size),4096),"index shadow differs");
+ gpu_equals_guest(ix,addr+size,4096,"cached index data differs on the GPU");
+ command_buffer();flush();require(R.garbageCacheRegions.empty(),"replaced buffer cache regions were not retired");
+ fprintf(stderr,"[renderer smoke] buffer cache hit, write fault, GX2Invalidate, reset and index readback passed\n");
+}
+void asynchronous_submission_check() {
+ // every ring size (WWHD_VK_SUBMISSION_POOL): each slot is used at least twice
+ const uint32_t ring=uint32_t(R.submissions.size()), submissions=ring+6;
+ constexpr uint32_t payloadSize=16, regionSize=payloadSize*3;
+ Buffer out=create_readback_buffer(submissions*regionSize);
+ std::vector<UploadSlice> firstSlices(ring);
+ for(uint32_t submission=0;submission<submissions;++submission) {
+  auto a=allocate_upload(payloadSize,256),b=allocate_upload(payloadSize,256);
+  require(a.buffer==b.buffer&&a.offset!=b.offset,"async submission slices alias");
+  if(submission<firstSlices.size())firstSlices[submission]=a;
+  else {
+   const auto& previous=firstSlices[submission%firstSlices.size()];
+   require(a.buffer==previous.buffer&&a.offset==previous.offset,"async slot failed fenced arena reuse");
+  }
+  for(uint32_t byte=0;byte<payloadSize;++byte) {
+   static_cast<uint8_t*>(a.mapped)[byte]=uint8_t(submission*19+byte);
+   static_cast<uint8_t*>(b.mapped)[byte]=uint8_t(255-submission*13-byte);
+  }
+  // A temporary buffer is referenced twice and retired with this submission.
+  // Freeing it while queued, or recycling its upload bytes early, corrupts the
+  // third output region (and should also trigger Vulkan lifetime validation).
+  Buffer temporary=create_buffer(payloadSize,VK_BUFFER_USAGE_TRANSFER_SRC_BIT|VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  auto cmd=command_buffer();
+  VkBufferCopy first{a.offset,submission*regionSize,payloadSize};
+  VkBufferCopy second{b.offset,submission*regionSize+payloadSize,payloadSize};
+  VkBufferCopy toTemporary{a.offset,0,payloadSize};
+  record::vkCmdCopyBuffer(cmd,a.buffer,out.buffer,1,&first);
+  record::vkCmdCopyBuffer(cmd,b.buffer,out.buffer,1,&second);
+  record::vkCmdCopyBuffer(cmd,a.buffer,temporary.buffer,1,&toTemporary);
+  VkBufferMemoryBarrier transfer{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+  transfer.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;transfer.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+  transfer.srcQueueFamilyIndex=transfer.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+  transfer.buffer=temporary.buffer;transfer.size=VK_WHOLE_SIZE;
+  record::vkCmdPipelineBarrier(cmd,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,nullptr,1,&transfer,0,nullptr);
+  VkBufferCopy fromTemporary{0,submission*regionSize+payloadSize*2,payloadSize};
+  record::vkCmdCopyBuffer(cmd,temporary.buffer,out.buffer,1,&fromTemporary);
+  defer_buffer(temporary);
+  flush_async();
+ }
+ VkBufferMemoryBarrier host{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+ host.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;host.dstAccessMask=VK_ACCESS_HOST_READ_BIT;
+ host.srcQueueFamilyIndex=host.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;
+ host.buffer=out.buffer;host.size=VK_WHOLE_SIZE;
+ record::vkCmdPipelineBarrier(command_buffer(),VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&host,0,nullptr);
+ flush();
+ auto* bytes=static_cast<uint8_t*>(out.mapped);
+ for(uint32_t submission=0;submission<submissions;++submission)
+  for(uint32_t byte=0;byte<payloadSize;++byte) {
+   uint32_t offset=submission*regionSize+byte;
+   require(bytes[offset]==uint8_t(submission*19+byte),"async upload first snapshot differs");
+   require(bytes[offset+payloadSize]==uint8_t(255-submission*13-byte),"async upload second snapshot differs");
+   require(bytes[offset+payloadSize*2]==uint8_t(submission*19+byte),"async deferred temporary copy differs");
+  }
+ for(const auto& slot:R.submissions)
+  require(!slot.pending&&slot.garbageBuffers.empty()&&slot.garbageImages.empty()&&slot.garbageFramebuffers.empty(),"async drain left pending resources");
+ defer_buffer(out);flush();
+ fprintf(stderr,"[renderer smoke] %u async submissions on %u slots, immutable snapshots, slot wrap and deferred retirement passed\n",submissions,ring);
+}
+// The fallback must resolve framebuffer handles before capture, then invalidate
+// them at view deferral even though their native begin commands are not emitted.
+void renderpass_retirement_check() {
+ if(!R.renderPasses)return;
+ end_encoder();
+ for(uint32_t i=0;i<10;++i) {
+  Surface surface;surface.width=surface.height=8;surface.format=0x1a;surface.fmt=format_info(surface.format,false);
+  create_surface_image(&surface,true,VkExtent3D{8,8,1});
+  transition_image(&surface,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+      VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+  auto cmd=command_buffer();
+  const auto cached=pass_caches().framebuffer_count();
+  const auto retired=R.garbageFramebuffers.size();
+  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageView=surface.view;attachment.imageLayout=surface.layout;
+  attachment.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;attachment.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  rendering.renderArea.extent={8,8};rendering.layerCount=1;
+  rendering.colorAttachmentCount=1;rendering.pColorAttachments=&attachment;
+  DeferredCommands captured;
+  auto* pod = record_worker_commands();
+  const size_t commandsBefore = pod ? pod->command_count() : 0;
+  if (!pod) captured.start_capture();
+  begin_pass(cmd,rendering,[&] { return color_pass(surface.fmt.pixel,surface.layout); });
+  end_pass(cmd);
+  require((pod ? pod->command_count()-commandsBefore : captured.command_count())==2,
+      "classic begin/end did not enter the owned command stream");
+  require(pass_caches().framebuffer_count()==cached+1,"captured framebuffer was not resolved at recording time");
+  destroy_surface_image(&surface);
+  require(pass_caches().framebuffer_count()==cached,"view deferral retained a framebuffer cache entry");
+  require(R.garbageFramebuffers.size()==retired+1,"framebuffer did not share its view's submission retirement");
+  if (!pod) captured.finish_exact();
+  flush_async();
+ }
+ wait_idle();
+ for(const auto& slot:R.submissions)
+  require(slot.garbageFramebuffers.empty()&&slot.garbageImages.empty(),"framebuffer/view retirement survived the submission drain");
+ fprintf(stderr,"[renderer smoke] captured render passes, immediate invalidation and ten fenced framebuffer retirements passed\n");
+}
+// Scaled depth copies without blits (surfaces.cpp draw_depth_copy). Vulkan makes blits of depth/stencil
+// formats optional and Adreno drivers report none for some, so resizing a depth target (a resolution or
+// aspect-ratio change) threw there and aborted the game. The draws are forced here on any device and
+// checked texel by texel against the nearest-filter mapping, through resample (all depth formats, two
+// layers, up and down, a partial region) and through the real resize path of an aspect-ratio change.
+void depth_copy_check() {
+ auto depthAt=[](uint32_t x,uint32_t y,uint32_t layer){return float((x*7+y*13+layer*5)%97)/96.0f;};
+ auto d16At=[](uint32_t x,uint32_t y,uint32_t layer){return uint16_t(x*1031+y*7919+layer*3);};
+ auto stencilAt=[](uint32_t x,uint32_t y,uint32_t layer){return uint8_t(x*37+y*11+layer*101);};
+ // texel bytes of one aspect of the pattern (depth: D16 as 2 bytes, else a float; stencil: 1 byte)
+ auto pattern=[&](const Surface& s,VkImageAspectFlags aspect,uint32_t layer,uint32_t w,uint32_t h){
+  const uint32_t bytes=aspect==VK_IMAGE_ASPECT_STENCIL_BIT?1:s.fmt.pixel==VK_FORMAT_D16_UNORM?2:4;
+  std::vector<uint8_t> out(size_t(w)*h*bytes);
+  for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x) {
+   uint8_t* p=out.data()+(size_t(y)*w+x)*bytes;
+   if(bytes==1)*p=stencilAt(x,y,layer);
+   else if(bytes==2){uint16_t v=d16At(x,y,layer);memcpy(p,&v,2);}
+   else {float v=depthAt(x,y,layer);memcpy(p,&v,4);}
+  }
+  return out;
+ };
+ auto fill=[&](Surface& s,uint32_t layers){
+  std::vector<VkImageAspectFlags> aspects{VK_IMAGE_ASPECT_DEPTH_BIT};if(s.fmt.stencil)aspects.push_back(VK_IMAGE_ASPECT_STENCIL_BIT);
+  transition_image(&s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+  for(uint32_t layer=0;layer<layers;++layer)for(auto aspect:aspects) {
+   auto texels=pattern(s,aspect,layer,s.extent.width,s.extent.height);
+   Buffer staging=create_buffer(texels.size(),VK_BUFFER_USAGE_TRANSFER_SRC_BIT,VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+   require(staging.mapped!=nullptr,"depth copy staging buffer is not mapped");memcpy(staging.mapped,texels.data(),texels.size());
+   VkBufferImageCopy copy{};copy.imageSubresource={aspect,0,layer,1};copy.imageExtent={s.extent.width,s.extent.height,1};
+   record::vkCmdCopyBufferToImage(command_buffer(),staging.buffer,s.image,s.layout,1,&copy);defer_buffer(staging);
+  }
+  mark_gpu_written(&s);
+ };
+ // dst's region (0,0)-(dstW,dstH) must hold the nearest source texel of (0,0)-(srcW,srcH); outside it, `outside`
+ auto check=[&](Surface& dst,uint32_t srcW,uint32_t srcH,uint32_t dstW,uint32_t dstH,uint32_t layers,const char* what,
+                float outsideDepth=0,uint8_t outsideStencil=0){
+  // dstW/dstH 0: no region, every texel must hold `outside`
+  const float sx=dstW?float(srcW)/float(dstW):0,sy=dstH?float(srcH)/float(dstH):0;
+  const uint32_t w=dst.extent.width,h=dst.extent.height;
+  for(uint32_t layer=0;layer<layers;++layer) {
+   const bool d16=dst.fmt.pixel==VK_FORMAT_D16_UNORM;
+   auto depths=read_image(dst,VK_IMAGE_ASPECT_DEPTH_BIT,d16?2:4,0,layer);
+   std::vector<uint8_t> stencils;if(dst.fmt.stencil)stencils=read_image(dst,VK_IMAGE_ASPECT_STENCIL_BIT,1,0,layer);
+   uint32_t bad=0;
+   for(uint32_t y=0;y<h;++y)for(uint32_t x=0;x<w;++x) {
+    const size_t i=size_t(y)*w+x;const bool inside=x<dstW&&y<dstH;
+    const uint32_t tx=std::min(uint32_t((float(x)+0.5f)*sx),srcW-1),ty=std::min(uint32_t((float(y)+0.5f)*sy),srcH-1);
+    if(d16){uint16_t v;memcpy(&v,depths.data()+i*2,2);if(inside&&v!=d16At(tx,ty,layer))++bad;}
+    else {float v;memcpy(&v,depths.data()+i*4,4);if(v!=(inside?depthAt(tx,ty,layer):outsideDepth))++bad;}
+    if(dst.fmt.stencil&&stencils[i]!=(inside?stencilAt(tx,ty,layer):outsideStencil))++bad;
+   }
+   if(bad){fprintf(stderr,"[renderer smoke] %s: %u of %u texels differ (layer %u)\n",what,bad,w*h,layer);require(false,what);}
+  }
+ };
+ const auto override=g_depthCopyOverride;g_depthCopyOverride=DepthCopyOverride::Draw;
+ const uint32_t sizes[3][2]={{64,37},{17,11},{40,24}};
+ for(uint32_t format:{0x05u,0x0Eu,0x11u}) {
+  Image src(40,24,format,true,2);require(src.s.extent.width==40&&src.s.extent.height==24,"depth copy source extent differs");
+  fill(src.s,2);
+  for(auto& size:sizes) {
+   Image dst(size[0],size[1],format,true,2);
+   resample(&src.s,&dst.s,2);
+   check(dst.s,40,24,size[0],size[1],2,"drawn depth copy (resample) differs from the nearest-filter mapping");
+  }
+  // a partial region from part of the source: the rest of the destination keeps its contents
+  if(format!=0x05) {
+   Image dst(48,32,format,true,1);
+   transition_image(&dst.s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+   VkClearDepthStencilValue value{0.75f,0x33};VkImageSubresourceRange range{dst.s.aspect,0,1,0,1};
+   record::vkCmdClearDepthStencilImage(command_buffer(),dst.s.image,dst.s.layout,&value,1,&range);
+   resample(&src.s,&dst.s,1,0.5f,0.75f,30,21);
+   check(dst.s,20,18,30,21,1,"drawn partial depth copy differs",0.75f,0x33);
+  }
+ }
+ fprintf(stderr,"[renderer smoke] drawn depth copies (D16, D32F, D32F+S8; layers, up/down, partial) passed\n");
+ // the last resort, a device that can neither blit nor draw the format: the scaled copy clears a whole
+ // destination (depth 1, stencil 0) and leaves a partial one alone, instead of throwing
+ g_depthCopyOverride=DepthCopyOverride::Unsupported;
+ {
+  Image src(40,24,0x11,true,1);fill(src.s,1);
+  Image dst(64,37,0x11,true,1);resample(&src.s,&dst.s,1);
+  check(dst.s,40,24,0,0,1,"unscalable depth copy did not clear the destination",1.0f,0);
+  Image part(48,32,0x11,true,1);
+  transition_image(&part.s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+  VkClearDepthStencilValue value{0.75f,0x33};VkImageSubresourceRange range{part.s.aspect,0,1,0,1};
+  record::vkCmdClearDepthStencilImage(command_buffer(),part.s.image,part.s.layout,&value,1,&range);
+  resample(&src.s,&part.s,1,0.5f,0.75f,30,21);
+  check(part.s,20,18,0,0,1,"unscalable partial depth copy changed the destination",0.75f,0x33);
+ }
+ g_depthCopyOverride=DepthCopyOverride::Draw;
+ fprintf(stderr,"[renderer smoke] unscalable depth copies clear (whole) or keep (partial) the destination\n");
+ // the resize itself: a screen-shaped depth/stencil target, then a 21:9 aspect ratio and a 2x resolution
+ SurfaceDesc d;d.addr=mem::host_alloc(64*36*8,256);d.width=64;d.height=36;d.pitch=64;d.format=0x11;d.isDepth=true;d.dim=1;d.slices=1;
+ Surface* target=find_or_create_surface(d,true);
+ require(target&&target->extent.width==64&&target->extent.height==36,"depth target extent differs");
+ fill(*target,1);
+ set_frame_aspect(21.0f/9.0f);latch_res_scale();
+ require(find_or_create_surface(d,true)==target&&target->extent.width==84&&target->extent.height==36,"aspect change did not rescale the depth target");
+ check(*target,64,36,84,36,1,"depth target after an aspect-ratio change differs");
+ fill(*target,1);
+ set_res_scale(2);latch_res_scale();
+ require(find_or_create_surface(d,true)==target&&target->extent.width==168&&target->extent.height==72,"resolution change did not rescale the depth target");
+ check(*target,84,36,168,72,1,"depth target after a resolution change differs");
+ set_frame_aspect(16.0f/9.0f);set_res_scale(1);latch_res_scale();
+ require(find_or_create_surface(d,true)==target&&target->extent.width==64,"depth target did not return to its guest size");
+ g_depthCopyOverride=override;
+ fprintf(stderr,"[renderer smoke] depth/stencil target resized by aspect ratio and resolution without blits passed\n");
+}
+// The bloom chain's targets keep the console's size (issue #307) while the chain draws them, also
+// through the other passes into its levels; a target the game later puts at the same address gets
+// the internal resolution once the chain has left it. After the chain has been idle (the pause
+// menu), its helper pass drawing a level first keeps the level as it is.
+void bloom_chain_size_check() {
+ set_res_scale(2);latch_res_scale();
+ const gfx::SizeRequest chain=gfx::size_request(gfx::ProgramKind::BloomChain),
+                        helper=gfx::size_request(gfx::ProgramKind::BloomHelper);
+ SurfaceDesc d;d.addr=mem::host_alloc(60*40*4,256);d.width=60;d.height=33;d.pitch=64;d.format=0x1A;d.dim=1;d.slices=1;
+ d.sizeRequest=chain;Surface* level=find_or_create_surface(d,true);
+ require(level&&level->extent.width==60&&level->extent.height==33,"bloom chain level is not at the console's size");
+ d.sizeRequest={};
+ require(find_or_create_surface(d,true)==level&&level->extent.width==60,"a pass between the chain's levels rescaled a level");
+ R.frame+=gfx::SizeClaim::kIdleFrames+1;
+ require(find_or_create_surface(d,true)==level&&level->extent.width==120&&level->extent.height==66,
+         "a target at a level's address the chain has left kept the console's size");
+ d.sizeRequest=chain;
+ require(find_or_create_surface(d,true)==level&&level->extent.width==60,"the chain's next draw did not restore the console's size");
+ const VkImage image=level->image;
+ R.frame+=80;
+ d.sizeRequest=helper;
+ require(find_or_create_surface(d,true)==level&&level->image==image,"the chain's helper pass after an idle chain resized a level");
+ d.sizeRequest={};
+ require(find_or_create_surface(d,true)==level&&level->image==image,"the helper pass did not renew the chain's claim");
+ set_res_scale(1);latch_res_scale();
+ fprintf(stderr,"[renderer smoke] bloom chain targets keep the console's size until the chain leaves them\n");
+}
+// Full-size torchlight: the point-light buffer's depth copy gets twice the internal resolution once the
+// lights claim it, keeps it while only its own pass draws it (no light on screen, the pause menu), and
+// returns to the internal resolution once only other passes draw it. A clear of the light buffer
+// leaves its claim alone.
+void light_target_size_check() {
+ const bool fullLight=render::full_light();render::set_full_light(true);
+ set_res_scale(2);latch_res_scale();
+ const gfx::SizeRequest lights=gfx::size_request(gfx::ProgramKind::PointLight),
+                        depthCopy=gfx::size_request(gfx::ProgramKind::DepthDownsample);
+ SurfaceDesc d;d.addr=mem::host_alloc(64*36*4,256);d.width=64;d.height=36;d.pitch=64;d.format=0x1A;d.dim=1;d.slices=1;
+ d.sizeRequest=depthCopy;Surface* copy=find_or_create_surface(d,true);
+ require(copy&&copy->extent.width==128&&copy->extent.height==72,"the depth downsample claimed the light size by itself");
+ copy->sizeClaim.request(lights,R.frame);  // a point-light pass reads it
+ require(find_or_create_surface(d,true)==copy&&copy->extent.width==256&&copy->extent.height==144,
+         "the lights' claim did not double the depth copy");
+ const VkImage image=copy->image;
+ for(int i=0;i<80;++i) {
+  ++R.frame;
+  require(find_or_create_surface(d,true)==copy&&copy->image==image,"the depth copy was resized while no light was drawn");
+ }
+ R.frame+=gfx::SizeClaim::kIdleFrames+1;d.sizeRequest={};
+ require(find_or_create_surface(d,true)==copy&&copy->extent.width==128,"a target at the depth copy's address kept the light size");
+ // the light buffer: the game clears it before the lights draw it, also after the pause menu
+ SurfaceDesc b=d;b.addr=mem::host_alloc(64*36*4,256);b.sizeRequest=lights;Surface* buffer=find_or_create_surface(b,true);
+ require(buffer&&buffer->extent.width==256,"the point lights' draw did not double the light buffer");
+ const VkImage bufferImage=buffer->image;
+ R.frame+=157;b.sizeRequest={};b.sizeRequest.keeps=true;
+ require(find_or_create_surface(b,true)==buffer&&buffer->image==bufferImage,"a clear after the pause menu resized the light buffer");
+ b.sizeRequest=lights;
+ require(find_or_create_surface(b,true)==buffer&&buffer->image==bufferImage,"the lights' draw after the clear resized the light buffer");
+ render::set_full_light(fullLight);set_res_scale(1);latch_res_scale();
+ fprintf(stderr,"[renderer smoke] the point-light depth copy keeps the light size while the lights claim it\n");
+}
+// Volume render targets (issue #53, the Picto Box): the game renders 8x8x8 colour-grading volumes
+// slice by slice (GX2 colour buffers of a 3D surface, the view selecting the slice) and samples them
+// as 3D textures. The render target must be a volume whose slices are attachments, and the sampled
+// lookup must return it (a 2D render target at that address made the 3D view throw).
+void volume_target_check() {
+ if(!R.imageView2DOn3DImage){fprintf(stderr,"[renderer smoke] volume render targets skipped (no imageView2DOn3DImage)\n");return;}
+ const uint32_t w=8,h=8,depth=4,slice=2;
+ std::vector<uint32_t> regs(0x10000,0);
+ uint32_t addr=mem::host_alloc(w*h*depth*4,256);
+ regs[mmCB_COLOR0_BASE]=addr;regs[mmCB_COLOR0_INFO]=0x1Au<<2;  // RGBA8 unorm
+ regs[mmCB_COLOR0_TILE]=w|(depth<<16)|gx2::kColorTarget3D;regs[mmCB_COLOR0_FRAG]=h;regs[mmCB_COLOR0_VIEW]=slice;
+ uint32_t selected=~0u;Surface* s=color_target(regs.data(),0,&selected);
+ require(s&&s->imageType==VK_IMAGE_TYPE_3D&&s->extent.depth==depth&&s->arrayLayers==1,"volume colour target is not a 3D image");
+ require(selected==slice,"volume colour target slice differs");
+ const float blue[4]={0,0,1,1};clear_image(*s,blue);
+ transition_image(s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+ VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(s,selected);target.imageLayout=s->layout;
+ target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[1]=1;target.clearValue.color.float32[3]=1;
+ VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea.extent={w,h};ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
+ auto cmd=command_buffer();begin_pass(cmd,ri,[&] { return color_pass(s->fmt.pixel,s->layout); });pass_state().rendering=true;end_encoder();mark_gpu_written(s);
+ auto read_slice=[&](uint32_t z) {
+  Buffer b=create_readback_buffer(w*h*4);
+  transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_READ_BIT);
+  VkBufferImageCopy copy{};copy.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1};copy.imageOffset={0,0,int32_t(z)};copy.imageExtent={w,h,1};
+  auto c=command_buffer();record::vkCmdCopyImageToBuffer(c,s->image,s->layout,b.buffer,1,&copy);
+  VkBufferMemoryBarrier barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};barrier.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;barrier.dstAccessMask=VK_ACCESS_HOST_READ_BIT;barrier.srcQueueFamilyIndex=barrier.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED;barrier.buffer=b.buffer;barrier.size=VK_WHOLE_SIZE;
+  record::vkCmdPipelineBarrier(c,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_HOST_BIT,0,0,nullptr,1,&barrier,0,nullptr);
+  try {flush();std::vector<uint8_t> result(w*h*4);memcpy(result.data(),b.mapped,result.size());defer_buffer(b);return result;}
+  catch(...){defer_buffer(b);throw;}
+ };
+ const uint8_t greenBytes[4]={0,255,0,255},blueBytes[4]={0,0,255,255};
+ rgba_is(read_slice(slice),greenBytes,"volume slice render differs");
+ rgba_is(read_slice(slice-1),blueBytes,"volume render wrote outside its slice");
+ // sampled as a volume (DIM_3D), it is this render target; a 2D sampled view never gets it
+ SurfaceDesc volume;volume.addr=addr;volume.width=w;volume.height=h;volume.slices=depth;volume.pitch=w;volume.format=0x1a;volume.dim=2;
+ require(find_or_create_surface(volume,false)==s,"sampled volume is not the rendered volume");
+ uint32_t textureWords[7]={2,0,0,0,(0u<<16)|(1u<<19)|(2u<<22)|(3u<<25),0,0};
+ require(sampled_texture_view(s,textureWords)!=VK_NULL_HANDLE,"sampled volume view creation failed");
+ SurfaceDesc flat=volume;flat.slices=1;flat.dim=1;
+ Surface* other=find_or_create_surface(flat,false);
+ require(other&&other!=s&&other->imageType==VK_IMAGE_TYPE_2D,"a 2D sampled view got the rendered volume");
+ fprintf(stderr,"[renderer smoke] volume render target slice, clear isolation and 3D sampling passed\n");
+}
+float triangle(Surface& s, float eyeOffset=0, float clipW=1,
+               VkFormat rgbFormat=VK_FORMAT_UNDEFINED, bool fallback=false,
+               std::vector<uint8_t>* image=nullptr,
+               VkDescriptorSetLayout textureLayout=VK_NULL_HANDLE, VkDescriptorSet textures=VK_NULL_HANDLE) {
+ struct Resources {
+  VkShaderModule vs=VK_NULL_HANDLE,ps=VK_NULL_HANDLE;VkPipelineLayout layout=VK_NULL_HANDLE;VkPipeline pipeline=VK_NULL_HANDLE;
+  ~Resources(){if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
+ } objects;
+ auto module=[&](const char* glsl,bool vertex,VkShaderModule& result) {
+  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
+  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
+ };
+ float projection[16]={1,0,0,0, 0,1,0,0, 0,0,-1.01f,-.1f, 0,0,-1,0};
+ if (clipW==1) { projection[11]=0;projection[14]=0;projection[15]=1; }
+ stereo::project_eye(projection,eyeOffset,4);
+ std::string vertexSource="#version 450\nlayout(push_constant) uniform Camera { vec4 row; } camera; void main(){vec2 p[3]=vec2[3](vec2(-0.8,-0.8),vec2(0.8,-0.8),vec2(0,0.8));float w="+std::to_string(clipW)+";vec4 view=vec4(p[gl_VertexIndex]*w,-w,1);gl_Position=vec4(dot(camera.row,view),view.y,0,w);}";
+ UploadSlice rgb;
+ uint32_t componentBytes=rgbFormat==VK_FORMAT_R8G8B8_UINT?1:rgbFormat==VK_FORMAT_R16G16B16_UINT?2:4;
+ if(rgbFormat!=VK_FORMAT_UNDEFINED) {
+  const std::string declaration=fallback?vk::vertex_fallback_declaration("attrDataSem0",1):"in uvec4 attrDataSem0;\n";
+  vertexSource.insert(vertexSource.find('\n')+1,"layout(location=0) "+declaration+"layout(location=0) flat out uint valid;\n");
+  vertexSource.insert(vertexSource.rfind('}'),"valid=all(equal(attrDataSem0,uvec4(17,93,201,1)))?1u:0u;");
+  // Three tightly packed RGB vertices; the split never fetches beyond RGB.
+  rgb=allocate_upload(9*componentBytes,4);
+  std::memset(rgb.mapped,0,rgb.size);
+  const uint32_t values[3]={17,93,201};
+  for(uint32_t v=0;v<3;++v)for(uint32_t lane=0;lane<3;++lane)
+   std::memcpy(static_cast<uint8_t*>(rgb.mapped)+(v*3+lane)*componentBytes,&values[lane],componentBytes);
+ }
+ module(vertexSource.c_str(),true,objects.vs);
+ module(textureLayout
+     ? "#version 450\nlayout(set=0,binding=0) uniform sampler2D a;layout(set=0,binding=1) uniform sampler2D b;layout(location=0) out vec4 color;void main(){color=(textureLod(a,vec2(.5),0)+textureLod(b,vec2(.5),1))*.5;}"
+     : rgbFormat==VK_FORMAT_UNDEFINED
+     ? "#version 450\nlayout(location=0) out vec4 color;void main(){color=vec4(1,0,0,1);}"
+     : "#version 450\nlayout(location=0) flat in uint valid;layout(location=0) out vec4 color;void main(){color=valid==1u?vec4(1,0,0,1):vec4(0,1,0,1);}",false,objects.ps);
+ VkPushConstantRange stereoRange{VK_SHADER_STAGE_VERTEX_BIT,0,16};
+ VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};if(textureLayout){layout.setLayoutCount=1;layout.pSetLayouts=&textureLayout;}layout.pushConstantRangeCount=1;layout.pPushConstantRanges=&stereoRange;vk_check(vkCreatePipelineLayout(R.device,&layout,nullptr,&objects.layout),"smoke pipeline layout");
+ VkPipelineShaderStageCreateInfo stages[2]{};
+ for(auto& stage:stages){stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stage.pName="main";}
+ stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].module=objects.vs;stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].module=objects.ps;
+ VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+ VkVertexInputBindingDescription rgbBinding{0,3*componentBytes,VK_VERTEX_INPUT_RATE_VERTEX};
+ VkVertexInputAttributeDescription rgbAttributes[2]={
+  {0,0,fallback?vk::split_vertex_format(rgbFormat):rgbFormat,0},
+  {1,0,vk::vertex_tail_format(rgbFormat),vk::vertex_tail_offset(rgbFormat)}};
+ if(rgbFormat!=VK_FORMAT_UNDEFINED) {
+  vertex.vertexBindingDescriptionCount=1;vertex.vertexAttributeDescriptionCount=fallback?2:1;
+  vertex.pVertexBindingDescriptions=&rgbBinding;vertex.pVertexAttributeDescriptions=rgbAttributes;
+ }
+
+ VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+ VkViewport viewport{0,0,float(s.extent.width),float(s.extent.height),0,1};VkRect2D scissor{{0,0},{s.extent.width,s.extent.height}};
+ VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=vp.scissorCount=1;vp.pViewports=&viewport;vp.pScissors=&scissor;
+ VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};raster.polygonMode=VK_POLYGON_MODE_FILL;raster.cullMode=VK_CULL_MODE_NONE;raster.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE;raster.lineWidth=1;
+ VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+ VkPipelineColorBlendAttachmentState attachment{};attachment.colorWriteMask=0xf;
+ VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=1;blend.pAttachments=&attachment;
+ VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&s.fmt.pixel;
+ VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};pipeline_targets(info,rendering);info.stageCount=2;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&vp;info.pRasterizationState=&raster;info.pMultisampleState=&ms;info.pColorBlendState=&blend;info.layout=objects.layout;
+ vk_check(stutter::create_graphics(R.frame, "smoke_pipeline", R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
+ R.pipelineCacheDirty=true;
+ R.pipelineCacheChangedFrame=R.frame;
+ transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+ VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[3]=1;
+ VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
+ auto cmd=command_buffer();begin_pass(cmd,ri,[&] { return color_pass(s.fmt.pixel,s.layout); });pass_state().rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);record::vkCmdPushConstants(cmd,objects.layout,VK_SHADER_STAGE_VERTEX_BIT,0,16,projection);if(textures)record::vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.layout,0,1,&textures,0,nullptr);if(rgbFormat!=VK_FORMAT_UNDEFINED)record::vkCmdBindVertexBuffers(cmd,0,1,&rgb.buffer,&rgb.offset);
+ record::vkCmdDraw(cmd,3,1,0,0);end_encoder();mark_gpu_written(&s);flush();
+ auto pixels=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
+ if(image)*image=pixels;
+ size_t center=(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4;
+ require(pixels[center]==255&&pixels[center+1]==0&&pixels[center+2]==0&&pixels[center+3]==255,"triangle center pixel differs");
+ require(pixels[0]==0&&pixels[1]==0&&pixels[2]==0&&pixels[3]==255,"triangle background pixel differs");
+ size_t red=0;for(size_t i=0;i<pixels.size();i+=4)if(pixels[i]==255)++red;
+ require(red>size_t(s.extent.width)*s.extent.height/5&&red<size_t(s.extent.width)*s.extent.height/2,"triangle rasterized area differs");
+ fprintf(stderr,"[renderer smoke] generated GLSL triangle/readback passed (%zu red pixels)\n",red);
+ double sum=0;for(size_t i=0;i<pixels.size();i+=4)if(pixels[i]==255)sum+=(i/4)%s.extent.width;
+ return float(sum/red);
+}
+void stereo_geometry_check() {
+ // Exercise the real remapped-uniform path, including a stale HUD register
+ // range beside a world projection. Each eye must get an immutable snapshot.
+ std::vector<uint32_t> regs(0x10000);
+ const uint32_t base=mmSQ_ALU_CONSTANT0_0+0x400;
+ const float camera[16]={2,0,0,0, 0,3,0,0, 0,0,-1.01f,-20, 0,0,-1,0};
+ // An HD layout's projection (fovy 40, near 1, far 10000), its x row narrowed for the TV.
+ const float layout[16]={1.4f,0,0,0, 0,2.74748f,0,0, 0,0,-1.0002f,-2.0002f, 0,0,-1,0};
+ memcpy(regs.data()+base,camera,64);
+ memcpy(regs.data()+base+32,layout,64);
+ const auto oldTag=stereo::layoutProjection;
+ const auto oldStart=stereo::layoutProjectionStart;
+ stereo::tag_layout(base+32,regs.data()+base+32);
+ LatteDecompilerShader metadata(LatteConst::ShaderType::Vertex);
+ metadata.list_remappedUniformEntries_register={{0,16},{16,0},{32,48},{48,32},{128,64}};
+ vk::Shader shader;shader.vertex=true;shader.dec=&metadata;
+ shader.uniforms.offset_remapped=0;shader.uniforms.offset_endOfBlock=80;
+ std::vector<uint8_t> leftUniforms,rightUniforms;
+ stereo::EyeRows replayRows;
+ vk::pack_uniforms_into(regs.data(),shader,leftUniforms,1,1,-8,600,&replayRows);
+ vk::pack_uniforms_into(regs.data(),shader,rightUniforms,1,1,8,600);
+ auto replayed=leftUniforms;
+ stereo::apply_eye_rows(replayed.data(),replayRows,8,600);
+ require(replayed==rightUniforms,"second-eye replay differs from independent uniform packing");
+ float leftRow[4],rightRow[4];
+ memcpy(leftRow,leftUniforms.data()+16,16);memcpy(rightRow,rightUniforms.data()+16,16);
+ require(leftRow[3]==16 && rightRow[3]==-16,"stereo remapped world projection not applied");
+ require(memcmp(leftUniforms.data()+64,rightUniforms.data()+64,16)!=0,"stale layout tag flattened a world camera");
+ stereo::layout_draw(true);
+ vk::pack_uniforms_into(regs.data(),shader,leftUniforms,1,1,-8,600);
+ vk::pack_uniforms_into(regs.data(),shader,rightUniforms,1,1,8,600);
+ stereo::layout_draw(false);
+ require(leftUniforms==rightUniforms&&!memcmp(leftUniforms.data()+64,layout,16),"scoped layout has disparity");
+ // A camera in a raw block must also retain depth despite matching the HUD lens.
+ float block[16];memcpy(block,layout,64);block[0]=1.54546f;
+ stereo::project_uniform_block(reinterpret_cast<unsigned char*>(block),64,8,600);
+ require(block[0]==1.54546f&&block[3]!=0,"HUD lens match flattened a uniform-block camera");
+ require(!memcmp(regs.data()+base,camera,64),"stereo modified shared guest uniforms");
+ stereo::layoutProjection=oldTag;stereo::layoutProjectionStart=oldStart;
+ SurfaceDesc desc;desc.addr=0x3E000000;desc.width=64;desc.height=64;desc.pitch=64;desc.format=0x1a;
+ Surface* left=find_or_create_surface(desc,true);
+ const float nearLeft=triangle(*left,-.4f,2);
+ auto leftPixels=read_image(*left,VK_IMAGE_ASPECT_COLOR_BIT,4);
+ stereo_select_eye(1);
+ Surface* right=find_or_create_surface(desc,true);
+ require(right!=left && right->image!=left->image,"stereo surfaces alias between eyes");
+ const float nearRight=triangle(*right,.4f,2);
+ require(nearLeft>nearRight+4,"near geometry lacks stereo disparity");
+ require(read_image(*left,VK_IMAGE_ASPECT_COLOR_BIT,4)==leftPixels,"right eye overwrote left eye");
+ float zeroRight=triangle(*right,.4f,4),farRight=triangle(*right,.4f,8);
+ float hudRight=triangle(*right,.4f,1);
+ stereo_select_eye(0);
+ require(find_or_create_surface(desc,false)==left,"eye surface namespace not restored");
+ float zeroLeft=triangle(*left,-.4f,4),farLeft=triangle(*left,-.4f,8);
+ float hudLeft=triangle(*left,-.4f,1);
+ require(std::fabs(zeroLeft-zeroRight)<.01f,"convergence plane has disparity");
+ require(farRight>farLeft+2,"far geometry has wrong disparity sign");
+ require(std::fabs(hudLeft-hudRight)<.01f,"orthographic HUD has disparity");
+ // A captured photograph is canonical even when eye 1 already has a GPU
+ // image at the same guest address. Ordinary scene textures remain per-eye.
+ const auto photoMode=stereo::frame.mode;
+ stereo::frame.mode=stereo::HalfSBS;
+ transition_image(left,VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+ stereo_select_eye(1);
+ require(!stereo_eye0_texture(desc),"ordinary GPU scene texture shared between eyes");
+ stereo::layoutPhotograph=true;
+ require(stereo_eye0_texture(desc)==left,"photo preview used the second camera's image");
+ require(left->eyeHeld==stereoFlushGeneration,"photo preview did not retain its source image");
+ stereo::layoutPhotograph=false;
+ require(!stereo_eye0_texture(desc),"photo sampling policy leaked into scene rendering");
+ stereo_select_eye(0);
+ stereo::frame.mode=photoMode;
+ std::vector<int> order;
+ stereo_pair([&]{order.push_back(stereoEye());},true);
+ stereo_pair([&]{order.push_back(stereoEye());},true);
+ require(order==std::vector<int>({0,1,0,1}),"stereo eye scheduling changed per-eye order");
+ left->gpuWritten=right->gpuWritten=false;
+ left->dirty=right->dirty=false;
+ left->lastCheckedFrame=right->lastCheckedFrame=R.frame;
+ const bool wasRendering=pass_state().rendering;
+ stereo_invalidate(2,desc.addr,64*64*4);
+ require(left->dirty&&right->dirty,"stereo invalidation missed an eye cache");
+ require(stereoEye()==0&&pass_state().rendering==wasRendering,"CPU invalidation changed active render context");
+ SurfaceDesc atlas;atlas.addr=mem::host_alloc(6*1024*1024,256);
+ atlas.width=atlas.height=atlas.pitch=1024;atlas.slices=3;atlas.dim=5;atlas.format=5;atlas.isDepth=true;
+ auto* sun=find_or_create_surface(atlas,true);
+ transition_image(sun,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+ VkClearDepthStencilValue shadowClear{0.375f,0};
+ VkImageSubresourceRange shadowRange{VK_IMAGE_ASPECT_DEPTH_BIT,0,1,0,3};
+ record::vkCmdClearDepthStencilImage(command_buffer(),sun->image,sun->layout,&shadowClear,1,&shadowRange);
+ mark_gpu_written(sun);
+ stereo_select_eye(1);
+ require(find_or_create_surface(atlas,true)==sun,"sun atlas duplicated for the second eye");
+ require(&stereo_copy_cache(atlas.addr,1024,1024,3)==&stereo_surface_cache(atlas),"shadow copy missed shared atlas");
+ auto shadowPixels=read_image(*sun,VK_IMAGE_ASPECT_DEPTH_BIT,2,0,2);
+ uint16_t shadowValue;memcpy(&shadowValue,shadowPixels.data(),2);
+ require(std::abs(int(shadowValue)-24576)<=1,"second eye cannot read shared sun depth");
+ atlas.slices=1;
+ require(find_or_create_surface(atlas,true)!=sun,"ordinary depth unexpectedly shared");
+ stereo_select_eye(0);
+ // Turning stereo off must release the second eye while retaining eye 0.
+ const auto oldFrame=stereo::frame;
+ const int oldMode=stereo::requestedMode.load();
+ stereo::frame.mode=stereo::HalfSBS;
+ for(auto* scan : {&stereoRight.scan,&stereoRight.buildingScan}) {
+  *scan=std::make_unique<Surface>();
+  (*scan)->width=(*scan)->height=16;(*scan)->format=0x1a;
+  (*scan)->fmt=format_info(0x1a,false);create_surface_image(scan->get(),false);
+ }
+ stereoRight.buildingScanDirty=true;
+ stereo_select_eye(1);
+ stereo::set_mode(stereo::Off);stereo_latch();
+ require(stereoEye()==0 && find_or_create_surface(desc,false)==left,"stereo disable lost the primary eye");
+ require(!stereoRight.scan && !stereoRight.buildingScan && !stereoRight.buildingScanDirty,"stereo disable retained scan buffers");
+ stereo_select_eye(1);
+ require(selected_surfaces().empty() && selected_linear_targets().empty() && selected_main_depth()==0,"stereo disable retained second-eye surfaces");
+ stereo_select_eye(0);
+ // Re-enable twice: shared shadows survive, and the released namespace is recreated.
+ for(int cycle=0;cycle<2;++cycle) {
+  stereo::set_mode(stereo::HalfSBS);stereo_latch();
+  stereo_select_eye(1);
+  require(find_or_create_surface(desc,true)->image!=left->image,"re-enabled stereo aliases the primary eye");
+  atlas.slices=3;require(find_or_create_surface(atlas,true)==sun,"stereo toggle lost the shared shadow atlas");
+  stereo::set_mode(stereo::Off);stereo_latch();
+ }
+ stereo::frame=oldFrame;stereo::requestedMode=oldMode;
+ flush();
+ fprintf(stderr,"[renderer smoke] stereo geometry, convergence, HUD, eye isolation and toggle cleanup PASS\n");
+}
+void stereo_resize_upload_check() {
+ const auto oldFrame=stereo::frame;
+ const int oldMode=stereo::requestedMode.load();
+ const float oldScale=res_scale();
+ set_res_scale(1);set_frame_aspect(16.0f/9.0f);latch_res_scale();
+ SurfaceDesc color;color.addr=mem::host_alloc(65536,256);color.width=color.pitch=64;
+ color.height=36;color.format=0x1a;
+ SurfaceDesc depth=color;depth.addr=mem::host_alloc(65536,256);depth.format=0x11;depth.isDepth=true;
+ require(!R.tv.scan&&!R.tv.buildingScan,"stereo resize test requires unpublished TV scans");
+ const uint32_t cb=mem::host_alloc(0x9c,256);
+ memset(mem::ptr(cb),0,0x9c);
+ st32(cb,1);st32(cb+4,64);st32(cb+8,36);st32(cb+12,1);st32(cb+16,1);
+ st32(cb+20,0x1a);st32(cb+0x24,color.addr);st32(cb+0x3c,64);st32(cb+0x7c,1);
+ const uint8_t rgba[4]={17,93,201,255};
+ const uint32_t packedDepth=0x5a800000;
+ for(uint32_t i=0;i<65536;i+=4) {
+  memcpy(mem::ptr(color.addr)+i,rgba,4);memcpy(mem::ptr(depth.addr)+i,&packedDepth,4);
+ }
+ // Same guest addresses through real mode latching and target lookup: full ->
+ // half width -> half height -> full -> off, including uploads at smaller sizes.
+ for(int mode:{stereo::FullSBS,stereo::HalfSBS,stereo::TAB,stereo::FullSBS,stereo::Off}) {
+  stereo::set_mode(mode);stereo_latch();
+  const uint32_t width=mode==stereo::HalfSBS?32:64,height=mode==stereo::TAB?18:36;
+  for(int eye=0;eye<(mode==stereo::Off?1:2);++eye) {
+   stereo_select_eye(eye);
+   for(const auto& desc:{color,depth}) {
+    auto* surface=find_or_create_surface(desc,true);
+    require(surface->extent.width==width&&surface->extent.height==height,"stereo mode switch kept an old target extent");
+    surface->gpuWritten=false;surface->dirty=true;surface->lastCheckedFrame=~uint64_t{0};
+    upload_surface(surface);
+    if(!desc.isDepth) rgba_is(read_image(*surface,VK_IMAGE_ASPECT_COLOR_BIT,4),rgba,"resampled stereo guest color upload differs");
+    else {
+     const auto values=read_image(*surface,VK_IMAGE_ASPECT_DEPTH_BIT,4);
+     const auto stencil=read_image(*surface,VK_IMAGE_ASPECT_STENCIL_BIT,1);
+     for(size_t i=0;i<stencil.size();++i) {
+      float value;memcpy(&value,values.data()+i*4,4);
+      require(std::abs(value-0.5f)<0.00001f&&stencil[i]==0x5a,"resampled stereo depth/stencil upload differs");
+     }
+    }
+    mark_gpu_written(surface);
+   }
+   const float eyeColor[4]={eye?0.0f:1.0f,0,eye?1.0f:0.0f,1};
+   clear_image(*find_or_create_surface(color,true),eyeColor);
+   copy_to_scan(cb,1);
+   auto& screen=eye?stereoRight:R.tv;
+   require(screen.buildingScan&&screen.buildingScan->extent.width==width&&
+       screen.buildingScan->extent.height==height,"scan expanded an eye-sized target");
+   require(screen.buildingScanDisplayExtent.width==64&&screen.buildingScanDisplayExtent.height==36,
+       "scan lost the eye's display aspect");
+   screen.scan.swap(screen.buildingScan);
+   std::swap(screen.scanDisplayExtent,screen.buildingScanDisplayExtent);
+   screen.scanSrgb=screen.buildingScanSrgb;screen.buildingScanDirty=false;
+  }
+  stereo_select_eye(0);
+  const uint32_t packedWidth=mode==stereo::FullSBS?128:64;
+  stereo_flush(); // swap/copy-to-scan's ordered boundary precedes presentation
+  const auto packed=compose_offscreen(R.tv,packedWidth,36,false);
+  auto pixel=[&](uint32_t x,uint32_t y,int channel) { return packed[(y*packedWidth+x)*4+channel]; };
+  const uint32_t leftX=mode==stereo::TAB?32:packedWidth/4,leftY=mode==stereo::TAB?9:18;
+  const uint32_t rightX=mode==stereo::TAB?32:packedWidth*3/4,rightY=mode==stereo::TAB?27:18;
+  require(pixel(leftX,leftY,0)==255&&pixel(leftX,leftY,2)==0,"left eye placement/capture differs");
+  require(pixel(rightX,rightY,mode==stereo::Off?0:2)==255,"right eye placement/capture differs");
+ }
+ // A device that can neither blit nor draw a screen format (here depth, WWHD_VK_DEPTH_COPY=none):
+ // Half SBS eyes keep the full size, so the upload is copied, never scaled into a cleared target,
+ // and the scan keeps one eye's shape.
+ const auto oldDepthCopy=g_depthCopyOverride;
+ g_depthCopyOverride=DepthCopyOverride::Unsupported;
+ stereo::set_mode(stereo::HalfSBS);stereo_latch();
+ for(int eye=0;eye<2;++eye) {
+  stereo_select_eye(eye);
+  for(const auto& desc:{depth,color}) {
+   auto* surface=find_or_create_surface(desc,true);
+   require(surface->extent.width==64&&surface->extent.height==36,"unscalable format kept an eye-sized target");
+   surface->gpuWritten=false;surface->dirty=true;surface->lastCheckedFrame=~uint64_t{0};
+   upload_surface(surface);
+   if(!desc.isDepth) rgba_is(read_image(*surface,VK_IMAGE_ASPECT_COLOR_BIT,4),rgba,"full-size stereo color upload differs");
+   else {
+    const auto values=read_image(*surface,VK_IMAGE_ASPECT_DEPTH_BIT,4);
+    const auto stencil=read_image(*surface,VK_IMAGE_ASPECT_STENCIL_BIT,1);
+    for(size_t i=0;i<stencil.size();++i) {
+     float value;memcpy(&value,values.data()+i*4,4);
+     require(std::abs(value-0.5f)<0.00001f&&stencil[i]==0x5a,"full-size stereo depth/stencil upload was cleared");
+    }
+   }
+   mark_gpu_written(surface);
+  }
+  const float eyeColor[4]={eye?0.0f:1.0f,0,eye?1.0f:0.0f,1};
+  clear_image(*find_or_create_surface(color,true),eyeColor);
+  copy_to_scan(cb,1);
+  auto& screen=eye?stereoRight:R.tv;
+  require(screen.buildingScan&&screen.buildingScan->extent.width==64&&
+      screen.buildingScanDisplayExtent.width==64&&screen.buildingScanDisplayExtent.height==36,
+      "full-size eye scan lost its shape");
+  screen.scan.swap(screen.buildingScan);
+  std::swap(screen.scanDisplayExtent,screen.buildingScanDisplayExtent);
+  screen.scanSrgb=screen.buildingScanSrgb;screen.buildingScanDirty=false;
+ }
+ stereo_select_eye(0);
+ stereo_flush();
+ {
+  const auto packed=compose_offscreen(R.tv,64,36,false);
+  require(packed[(18*64+16)*4]==255&&packed[(18*64+16)*4+2]==0&&packed[(18*64+48)*4+2]==255,
+      "full-size Half SBS eyes placed wrong");
+ }
+ g_depthCopyOverride=oldDepthCopy;
+ stereo_reset_eye_sized_targets();
+ stereo::set_mode(stereo::Off);stereo_latch();
+ stereo_select_eye(1);
+ require(selected_surfaces().empty(),"mode-switch test retained eye 1 targets after switch-off");
+ stereo_select_eye(0);
+ for(uint32_t address:{color.addr,depth.addr}) {
+  auto found=selected_surfaces().find(address);
+  require(found!=selected_surfaces().end(),"mode-switch test primary target missing");
+  std::erase(selected_linear_targets(),found->second.get());
+  if(selected_main_depth()==address)selected_main_depth()=0;
+  destroy_surface_image(found->second.get());selected_surfaces().erase(found);
+ }
+ ++g_surface_epoch;
+ destroy_surface_image(R.tv.scan.get());destroy_surface_image(R.tv.buildingScan.get());
+ R.tv.scan.reset();R.tv.buildingScan.reset();R.tv.scanDisplayExtent=R.tv.buildingScanDisplayExtent={};
+ set_res_scale(oldScale);latch_res_scale();
+ stereo::set_mode(oldFrame.mode);stereo_latch();stereo::frame=oldFrame;stereo::requestedMode=oldMode;
+ flush();
+ fprintf(stderr,"[renderer smoke] 1x stereo color/depth uploads, Half SBS/TAB resizes and switch-off PASS\n");
+}
+// Issue #248: switching eyes keeps both render passes open; eye 1's held commands follow eye 0's
+// at the submission, also behind a deferred capture of the renderer's own commands.
+void stereo_stream_check() {
+ const auto oldFrame=stereo::frame;
+ const int oldMode=stereo::requestedMode.load();
+ stereo::frame.mode=stereo::HalfSBS;
+ SurfaceDesc desc;desc.addr=0x3E100000;desc.width=desc.height=desc.pitch=16;desc.format=0x1a;
+ Surface* left=find_or_create_surface(desc,true);
+ stereo_select_eye(1);
+ Surface* right=find_or_create_surface(desc,true);
+ stereo_select_eye(0);
+ auto open=[](Surface* s,float red) {
+  transition_image(s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(s,0);target.imageLayout=s->layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[0]=red;target.clearValue.color.float32[3]=1;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea={{0,0},{s->extent.width,s->extent.height}};ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
+  auto cmd=command_buffer();begin_pass(cmd,ri,[&] { return color_pass(s->fmt.pixel,s->layout); });
+  pass_state().rendering=pass_state().tracked=true;pass_state().colors={};pass_state().colors[0]=s;mark_gpu_written(s);
+ };
+ for(int captured=0;captured<2;++captured) {
+  if(captured) {
+   if(active_deferred_commands) break; // the record worker's stream: no capture to append to
+   deferred_commands().start_capture();
+  }
+  open(left,1);
+  stereo_select_eye(1);
+  require(!pass_state().rendering,"eye 1 inherited eye 0's render pass");
+  open(right,captured?.25f:.5f);
+  require(eye_deferred_commands()&&eye_deferred_commands()->command_count(),"eye 1 commands were not held");
+  stereo_select_eye(0);
+  require(pass_state().rendering&&pass_state().colors[0]==left,"eye switch ended eye 0's render pass");
+  stereo_select_eye(1);
+  require(pass_state().rendering&&pass_state().colors[0]==right,"eye switch ended eye 1's render pass");
+  if(captured) {
+   const size_t before=active_deferred_commands->command_count();
+   stereo_flush();
+   require(active_deferred_commands->command_count()>before,"held eye 1 commands bypassed the renderer's capture");
+  }
+  flush();
+  require(!pass_state().rendering&&!eye_deferred_commands()->command_count(),"submission left eye 1's pass open");
+  stereo_select_eye(0);
+  require(!pass_state().rendering,"submission left eye 0's pass open");
+  auto l=read_image(*left,VK_IMAGE_ASPECT_COLOR_BIT,4),r=read_image(*right,VK_IMAGE_ASPECT_COLOR_BIT,4);
+  require(l[0]==255&&std::abs(int(r[0])-(captured?64:128))<=1,"held eye 1 pass rendered the wrong image");
+ }
+ stereo_select_eye(0);
+ stereo::set_mode(stereo::Off);stereo_latch();
+ auto found=selected_surfaces().find(desc.addr);
+ require(found!=selected_surfaces().end()&&found->second.get()==left,"stream test primary surface missing");
+ std::erase(selected_linear_targets(),left);
+ destroy_surface_image(left);selected_surfaces().erase(found);++g_surface_epoch;
+ stereo::set_mode(oldFrame.mode);stereo_latch();
+ stereo::frame=oldFrame;stereo::requestedMode=oldMode;
+ fprintf(stderr,"[renderer smoke] stereo eye streams keep both passes open PASS\n");
+}
+// Bind a rendered base first, then a mip-chain assembled from that same base.
+// The second resolution must not invalidate the first descriptor's read layout.
+void sampled_mip_order_check(bool bindRenderedLevel = false) {
+ SurfaceDesc base;
+ base.addr=mem::host_alloc(4096,256);base.mipAddr=mem::host_alloc(4096,256);
+ base.width=base.height=base.pitch=16;base.format=0x1a;base.tileMode=1;
+ auto* target=find_or_create_surface(base,true);
+ SurfaceDesc level=base;level.addr=base.mipAddr;level.mipAddr=0;
+ level.width=level.height=level.pitch=8;
+ auto* mip=find_or_create_surface(level,true);
+ const float red[4]={1,0,0,1};clear_image(*target,red);clear_image(*mip,red);
+ std::vector<uint32_t> registers(0x10000);
+ uint32_t words[7]={1u|(1u<<3)|(1u<<8)|(15u<<19),15u|(0x1au<<26),
+     base.addr>>8,base.mipAddr>>8,(1u<<19)|(2u<<22)|(3u<<25),0,0};
+ words[5]=1;
+ std::copy(words,words+7,registers.begin()+Latte::REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS+7);
+ // unit 1's sampler filters between mips up to LOD 1: the chain is built only as far as its sampler
+ // reaches (with_mip_chain), so a sampler without mips would never assemble the rendered level 1
+ registers[Latte::REGADDR::SQ_TEX_SAMPLER_WORD0_0+3]=1u<<17;  // MIP_FILTER point
+ registers[Latte::REGADDR::SQ_TEX_SAMPLER_WORD0_0+4]=64u<<10;  // MAX_LOD 1.0
+ words[5]=0;
+ if(bindRenderedLevel){words[0]=1u|(1u<<3)|(7u<<19);words[1]=7u|(0x1au<<26);words[2]=base.mipAddr>>8;words[3]=0;}
+ std::copy(words,words+7,registers.begin()+Latte::REGADDR::SQ_TEX_RESOURCE_WORD0_N_PS);
+ struct Layout {
+   VkDescriptorSetLayout value=VK_NULL_HANDLE;
+   ~Layout(){if(value)vkDestroyDescriptorSetLayout(R.device,value,nullptr);}
+ } textureLayout;
+ VkDescriptorSetLayoutBinding bindings[2]{};
+ for(uint32_t i=0;i<2;++i){bindings[i].binding=i;bindings[i].descriptorType=VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;bindings[i].descriptorCount=1;bindings[i].stageFlags=VK_SHADER_STAGE_FRAGMENT_BIT;}
+ VkDescriptorSetLayoutCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+ info.bindingCount=2;info.pBindings=bindings;
+ vk_check(vkCreateDescriptorSetLayout(R.device,&info,nullptr,&textureLayout.value),"mip-order texture layout");
+ auto descriptors=texture_stage_smoke_bind(registers.data(),textureLayout.value,2);
+ require(target->mipChain && target->mipChain->mips==2,"mip-order fixture did not exercise generated rendered mips");
+ Image output(64,64,0x1a);
+ triangle(output.s,0,1,VK_FORMAT_UNDEFINED,false,nullptr,textureLayout.value,descriptors);
+ require(target->layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL && mip->layout==VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,"later mip resolution invalidated an earlier sampled source layout");
+ fprintf(stderr,"[renderer smoke] production multi-texture rendered-mip ordering passed\n");
+}
+void vertex_window_check(Surface& s) {
+ struct Resources {
+  VkShaderModule vs=VK_NULL_HANDLE,ps=VK_NULL_HANDLE;VkPipelineLayout layout=VK_NULL_HANDLE;VkPipeline pipeline=VK_NULL_HANDLE;
+  ~Resources(){if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
+ } objects;
+ auto module=[&](const char* glsl,bool vertex,VkShaderModule& result) {
+  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
+  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
+ };
+ module("#version 450\nlayout(location=0) in vec3 position;layout(location=1) in vec4 tint;layout(location=0) out vec4 vertexColor;void main(){gl_Position=vec4(position.xy,0,1);vertexColor=gl_VertexIndex==int(position.z)?tint:vec4(0,0,1,1);}",true,objects.vs);
+ module("#version 450\nlayout(location=0) in vec4 vertexColor;layout(location=0) out vec4 color;void main(){color=vertexColor;}",false,objects.ps);
+ VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};vk_check(vkCreatePipelineLayout(R.device,&layout,nullptr,&objects.layout),"smoke pipeline layout");
+ VkPipelineShaderStageCreateInfo stages[2]{};
+ for(auto& stage:stages){stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stage.pName="main";}
+ stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].module=objects.vs;stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].module=objects.ps;
+ struct Vertex {float x,y,id,r,g,b,a;};
+ VkVertexInputBindingDescription binding{0,sizeof(Vertex),VK_VERTEX_INPUT_RATE_VERTEX};
+ VkVertexInputAttributeDescription attributes[2]={{0,0,VK_FORMAT_R32G32B32_SFLOAT,0},{1,0,VK_FORMAT_R32G32B32A32_SFLOAT,12}};
+ VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};vertex.vertexBindingDescriptionCount=1;vertex.pVertexBindingDescriptions=&binding;vertex.vertexAttributeDescriptionCount=2;vertex.pVertexAttributeDescriptions=attributes;
+ VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP;assembly.primitiveRestartEnable=VK_TRUE;
+ VkViewport viewport{0,0,float(s.extent.width),float(s.extent.height),0,1};VkRect2D scissor{{0,0},{s.extent.width,s.extent.height}};
+ VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=vp.scissorCount=1;vp.pViewports=&viewport;vp.pScissors=&scissor;
+ VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};raster.polygonMode=VK_POLYGON_MODE_FILL;raster.cullMode=VK_CULL_MODE_NONE;raster.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE;raster.lineWidth=1;
+ VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+ VkPipelineColorBlendAttachmentState attachment{};attachment.colorWriteMask=0xf;
+ VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=1;blend.pAttachments=&attachment;
+ VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&s.fmt.pixel;
+ VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};pipeline_targets(info,rendering);info.stageCount=2;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&vp;info.pRasterizationState=&raster;info.pMultisampleState=&ms;info.pColorBlendState=&blend;info.layout=objects.layout;
+ vk_check(stutter::create_graphics(R.frame, "smoke_pipeline", R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
+ R.pipelineCacheDirty=true;
+ R.pipelineCacheChangedFrame=R.frame;
+ std::array<Vertex,128> data{};
+ for(uint32_t i=100;i<108;++i) {const float xy[3][2]={{-0.8f,-0.8f},{0.8f,-0.8f},{0,0.8f}};data[i]={xy[(i-100)%3][0],xy[(i-100)%3][1],float(i),1,0,0,1};}
+ const uint32_t address=0x73510000; // Fixture cache identity; data is supplied directly.
+ auto sameSlice=[](const UploadSlice& a,const UploadSlice& b){return a.buffer==b.buffer && a.offset==b.offset;};
+ const char* reuseEnv=std::getenv("WWHD_VK_REUSE_VERTEX_SNAPSHOTS");
+ const bool reuse=reuseEnv && !std::strcmp(reuseEnv,"1");
+ const uint32_t reserved=106*sizeof(Vertex),offset=100*sizeof(Vertex);
+ auto original=vertex_window_smoke_snapshot(0,address,reserved,offset,reserved-offset,data.data(),true);
+ for(uint32_t i=0;i<offset;++i)require(static_cast<uint8_t*>(original.mapped)[i]==0xCD,"vertex window leading poison missing");
+ auto repeated=vertex_window_smoke_snapshot(0,address,reserved,offset,reserved-offset,data.data(),true);
+ require(sameSlice(original,repeated)==reuse,"vertex window exact reuse mismatch");
+ data[1].r=0.25f;
+ auto outside=vertex_window_smoke_snapshot(0,address,reserved,offset,reserved-offset,data.data(),true);
+ require(sameSlice(repeated,outside)==reuse,"vertex window outside mutation reuse mismatch");
+ data[101].g=0.25f;
+ auto changed=vertex_window_smoke_snapshot(0,address,reserved,offset,reserved-offset,data.data(),true);
+ require(!sameSlice(outside,changed),"vertex window fetched mutation reused stale slice");
+ auto shifted=vertex_window_smoke_snapshot(0,address,reserved,offset+sizeof(Vertex),reserved-offset-sizeof(Vertex),data.data(),true);
+ require(!sameSlice(changed,shifted),"vertex window shifted key reused stale slice");
+ data[101].g=0;
+ auto render=[&](bool window,uint32_t first,int32_t base,bool narrow,bool restart,bool converted) {
+  const uint32_t end=restart?first+6:first+3;
+  const uint32_t reservation=end*sizeof(Vertex),begin=window?first*sizeof(Vertex):0;
+  auto vertices=vertex_window_smoke_snapshot(0,address,reservation,begin,reservation-begin,data.data(),true);
+  // A freshly copied slice must preserve every fetched byte, including IDs.
+  require(!memcmp(static_cast<uint8_t*>(vertices.mapped)+begin,reinterpret_cast<uint8_t*>(data.data())+begin,reservation-begin),"vertex window snapshot bytes differ");
+  std::vector<uint32_t> wide={uint32_t(int64_t(first)-base),uint32_t(int64_t(first+1)-base),uint32_t(int64_t(first+2)-base)};
+  if(restart){wide.push_back(UINT32_MAX);for(uint32_t i=3;i<6;++i)wide.push_back(uint32_t(int64_t(first+i)-base));}
+  // Custom guest marker and endian conversion are normalized before Vulkan.
+  if(converted){
+   auto swap=[](uint32_t v){return (v<<24)|((v&0xFF00)<<8)|((v>>8)&0xFF00)|(v>>24);};
+   if(restart)wide[3]=0x12345678;
+   for(auto& value:wide){const uint32_t guestEndian=swap(value);value=swap(guestEndian);if(restart && value==0x12345678)value=UINT32_MAX;}
+  }
+  auto indices=allocate_upload(wide.size()*(narrow?2:4),4);
+  for(size_t i=0;i<wide.size();++i) {if(narrow){uint16_t value=wide[i]==UINT32_MAX?UINT16_MAX:uint16_t(wide[i]);memcpy(static_cast<uint8_t*>(indices.mapped)+i*2,&value,2);}else memcpy(static_cast<uint8_t*>(indices.mapped)+i*4,&wide[i],4);}
+  transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;target.clearValue.color.float32[3]=1;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
+  auto cmd=command_buffer();begin_pass(cmd,ri,[&] { return color_pass(s.fmt.pixel,s.layout); });pass_state().rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);
+  record::vkCmdBindVertexBuffers(cmd,0,1,&vertices.buffer,&vertices.offset);record::vkCmdBindIndexBuffer(cmd,indices.buffer,indices.offset,narrow?VK_INDEX_TYPE_UINT16:VK_INDEX_TYPE_UINT32);
+  record::vkCmdDrawIndexed(cmd,wide.size(),1,0,base,0);end_encoder();mark_gpu_written(&s);flush_async();
+ };
+ for(int test=0;test<12;++test) {
+  const uint32_t first=test>=8?101:100;const int32_t base=test%3==0?-5:test%3==1?5:0;
+  const bool narrow=test%2==0,restart=test%4>=2,converted=test%4==3;
+  if(test==6)data[101].g=0.5f; // Same key, freshly changed fetched bytes.
+  if(test==7)data[1].r=0.3f;   // Never fetched; must not affect pixels.
+  render(false,first,base,narrow,restart,converted);auto full=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
+  render(true,first,base,narrow,restart,converted);auto window=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
+  require(full==window,"vertex window/full GPU pixels differ");
+  const size_t center=(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4;
+  require(window[center]>200 && window[center+2]==0,"vertex window position/VertexIndex invariant failed");
+ }
+ // More than four queued submissions exercise slot retirement and epoch reset.
+ for(int i=0;i<10;++i)render(true,100,i%2?-5:5,i%2,false,false);
+ auto final=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
+ require(final[(size_t(s.extent.height/2)*s.extent.width+s.extent.width/2)*4]>200,"vertex window ring retirement failed");
+ fprintf(stderr,"[renderer smoke] vertex copy windows/full pixels, poison, signed base, restart, mutation and ring retirement passed\n");
+}
+void dynamic_uniform_check(Surface& s) {
+ if(R.properties.limits.maxDescriptorSetUniformBuffersDynamic<3) {
+  fprintf(stderr,"[renderer smoke] dynamic UBO ordering fixture skipped (device limit <3)\n");return;
+ }
+ struct Resources {
+  VkShaderModule vs=VK_NULL_HANDLE,ps=VK_NULL_HANDLE;VkPipelineLayout layout=VK_NULL_HANDLE;VkPipeline pipeline=VK_NULL_HANDLE;
+  VkDescriptorSetLayout sets[2]{};
+  ~Resources(){for(auto set:sets)if(set)vkDestroyDescriptorSetLayout(R.device,set,nullptr);if(pipeline)vkDestroyPipeline(R.device,pipeline,nullptr);if(layout)vkDestroyPipelineLayout(R.device,layout,nullptr);if(vs)vkDestroyShaderModule(R.device,vs,nullptr);if(ps)vkDestroyShaderModule(R.device,ps,nullptr);}
+ } objects;
+ auto module=[&](const char* glsl,bool vertex,VkShaderModule& result) {
+  std::string error;auto words=vk::compile_glsl(glsl,vertex,&error);if(words.empty())exception_report::raise("smoke GLSL compilation: "+error);
+  VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};ci.codeSize=words.size()*4;ci.pCode=words.data();vk_check(vkCreateShaderModule(R.device,&ci,nullptr,&result),"smoke shader module");
+ };
+ module("#version 450\nlayout(set=0,binding=7,std140) uniform Transform{vec4 transform;} ;layout(set=0,binding=1,std140) uniform Tint{vec4 tint;};layout(location=0) out vec4 vcolor;void main(){vec2 p[3]=vec2[3](vec2(-1,-1),vec2(3,-1),vec2(-1,3));gl_Position=vec4(p[gl_VertexIndex]*transform.xy+transform.zw,0,1);vcolor=tint;}",true,objects.vs);
+ module("#version 450\nlayout(set=1,binding=3,std140) uniform Factor{vec4 factor;};layout(location=0) in vec4 vcolor;layout(location=0) out vec4 color;void main(){color=vcolor*factor;}",false,objects.ps);
+ VkDescriptorSetLayoutBinding vsBindings[2]={{7,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr},{1,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,1,VK_SHADER_STAGE_VERTEX_BIT,nullptr}};
+ VkDescriptorSetLayoutBinding psBinding{3,VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC,1,VK_SHADER_STAGE_FRAGMENT_BIT,nullptr};
+ VkDescriptorSetLayoutCreateInfo setInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};setInfo.bindingCount=2;setInfo.pBindings=vsBindings;
+ vk_check(vkCreateDescriptorSetLayout(R.device,&setInfo,nullptr,&objects.sets[0]),"smoke dynamic VS layout");
+ setInfo.bindingCount=1;setInfo.pBindings=&psBinding;vk_check(vkCreateDescriptorSetLayout(R.device,&setInfo,nullptr,&objects.sets[1]),"smoke dynamic PS layout");
+ VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};layout.setLayoutCount=2;layout.pSetLayouts=objects.sets;
+ vk_check(vkCreatePipelineLayout(R.device,&layout,nullptr,&objects.layout),"smoke dynamic pipeline layout");
+ VkPipelineShaderStageCreateInfo stages[2]{};
+ for(auto& stage:stages){stage.sType=VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;stage.pName="main";}
+ stages[0].stage=VK_SHADER_STAGE_VERTEX_BIT;stages[0].module=objects.vs;stages[1].stage=VK_SHADER_STAGE_FRAGMENT_BIT;stages[1].module=objects.ps;
+ VkPipelineVertexInputStateCreateInfo vertex{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+ VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};assembly.topology=VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+ VkViewport viewport{0,0,float(s.extent.width),float(s.extent.height),0,1};VkRect2D scissor{{0,0},{s.extent.width,s.extent.height}};
+ VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};vp.viewportCount=vp.scissorCount=1;vp.pViewports=&viewport;vp.pScissors=&scissor;
+ VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};raster.polygonMode=VK_POLYGON_MODE_FILL;raster.cullMode=VK_CULL_MODE_NONE;raster.frontFace=VK_FRONT_FACE_COUNTER_CLOCKWISE;raster.lineWidth=1;
+ VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};ms.rasterizationSamples=VK_SAMPLE_COUNT_1_BIT;
+ VkPipelineColorBlendAttachmentState attachment{};attachment.colorWriteMask=0xf;
+ VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};blend.attachmentCount=1;blend.pAttachments=&attachment;
+ VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};rendering.colorAttachmentCount=1;rendering.pColorAttachmentFormats=&s.fmt.pixel;
+ VkDynamicState dynamicState=VK_DYNAMIC_STATE_SCISSOR;
+ VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};dynamic.dynamicStateCount=1;dynamic.pDynamicStates=&dynamicState;
+ VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};pipeline_targets(info,rendering);info.stageCount=2;info.pStages=stages;info.pVertexInputState=&vertex;info.pInputAssemblyState=&assembly;info.pViewportState=&vp;info.pRasterizationState=&raster;info.pMultisampleState=&ms;info.pColorBlendState=&blend;info.layout=objects.layout;info.pDynamicState=&dynamic;
+ vk_check(stutter::create_graphics(R.frame, "smoke_pipeline", R.device,R.pipelineCache,1,&info,nullptr,&objects.pipeline),"smoke triangle pipeline");
+ R.pipelineCacheDirty=true;
+ R.pipelineCacheChangedFrame=R.frame;
+ // Two rounds force a pool reset between freshly allocated descriptor sets.
+ for(uint32_t round=0;round<2;++round) {
+  uint64_t generation=R.submissionGeneration;
+  const float transform[4]={1,1,0,0},factor[4]={1,1,1,1};
+  const float tints[2][2][4]={{{1,0,0,1},{0,1,0,1}},{{0,0,1,1},{1,1,0,1}}};
+  std::array<UploadSlice,2> transforms{},tintSlices{},factors{};
+  for(uint32_t draw=0;draw<2;++draw) {
+   // Prepare binding7 before binding1, matching support uniforms prepared last.
+   transforms[draw]=allocate_upload(16,R.properties.limits.minUniformBufferOffsetAlignment);
+   factors[draw]=allocate_upload(16,R.properties.limits.minUniformBufferOffsetAlignment);
+   tintSlices[draw]=allocate_upload(16,R.properties.limits.minUniformBufferOffsetAlignment);
+   memcpy(transforms[draw].mapped,transform,16);memcpy(factors[draw].mapped,factor,16);memcpy(tintSlices[draw].mapped,tints[round][draw],16);
+  }
+  require(transforms[0].buffer==tintSlices[1].buffer&&transforms[0].buffer==factors[1].buffer,"dynamic UBO fixture requires pooled slices");
+  VkDescriptorSet sets[2]{};VkDescriptorSetAllocateInfo allocation{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};allocation.descriptorPool=R.descriptorPool;allocation.descriptorSetCount=2;allocation.pSetLayouts=objects.sets;
+  vk_check(vkAllocateDescriptorSets(R.device,&allocation,sets),"smoke dynamic descriptor sets");
+  VkDescriptorBufferInfo buffers[3]={{transforms[0].buffer,0,16},{tintSlices[0].buffer,0,16},{factors[0].buffer,0,16}};
+  VkWriteDescriptorSet writes[3]{};
+  for(uint32_t i=0;i<3;++i){writes[i].sType=VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;writes[i].dstSet=sets[i==2?1:0];writes[i].dstBinding=i==0?7:i==1?1:3;writes[i].descriptorCount=1;writes[i].descriptorType=VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;writes[i].pBufferInfo=&buffers[i];}
+  vkUpdateDescriptorSets(R.device,3,writes,0,nullptr);
+  transition_image(&s,VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+  VkRenderingAttachmentInfo target{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};target.imageView=layer_view(&s,0);target.imageLayout=s.layout;target.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;target.storeOp=VK_ATTACHMENT_STORE_OP_STORE;
+  VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};ri.renderArea=scissor;ri.layerCount=1;ri.colorAttachmentCount=1;ri.pColorAttachments=&target;
+  auto cmd=command_buffer();begin_pass(cmd,ri,[&] { return color_pass(s.fmt.pixel,s.layout); });pass_state().rendering=true;record::vkCmdBindPipeline(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.pipeline);
+  for(uint32_t draw=0;draw<2;++draw) {
+   // Dynamic offsets are ordered by binding within VS set0, then PS set1.
+   uint32_t offsets[3]={uint32_t(tintSlices[draw].offset),uint32_t(transforms[draw].offset),uint32_t(factors[draw].offset)};
+   record::vkCmdBindDescriptorSets(cmd,VK_PIPELINE_BIND_POINT_GRAPHICS,objects.layout,0,2,sets,3,offsets);
+   VkRect2D half{{int32_t(draw*s.extent.width/2),0},{s.extent.width/2,s.extent.height}};record::vkCmdSetScissor(cmd,0,1,&half);record::vkCmdDraw(cmd,3,1,0,0);
+  }
+  end_encoder();mark_gpu_written(&s);flush();
+  require(R.submissionGeneration!=generation,"dynamic descriptor pool reset did not change generation");
+  auto pixels=read_image(s,VK_IMAGE_ASPECT_COLOR_BIT,4);
+  for(uint32_t y=0;y<s.extent.height;++y)for(uint32_t x=0;x<s.extent.width;++x)for(uint32_t channel=0;channel<4;++channel)
+   require(pixels[(size_t(y)*s.extent.width+x)*4+channel]==uint8_t(tints[round][x<s.extent.width/2?0:1][channel]*255),"dynamic UBO reused-set colors or offset order differ");
+ }
+ fprintf(stderr,"[renderer smoke] dynamic UBO immutable draws, VS/PS binding order and fresh sets after pool reset passed\n");
+}
+}
+#ifdef __ANDROID__
+bool android_display_touch_event(const SDL_Event&);
+int android_display_smoke_test() {
+ try {
+  mem::init();
+  for (Screen* screen : {&R.tv, &R.drc}) {
+   screen->scan = std::make_unique<Surface>();
+   Surface& image = *screen->scan;
+   image.width = 64; image.height = 36; image.format = 0x1a;
+   image.fmt = format_info(image.format, false);
+   create_surface_image(&image, false);
+  }
+  auto start = std::chrono::steady_clock::now();
+  auto report = start;
+  uint64_t touchEventsSeen = 0, touchEventsHandled = 0;
+  SDL_SetHint("WWHD_DISPLAY_SMOKE_INPUT_TRACE", "1");
+  std::chrono::steady_clock::time_point lastPrimary;
+  uint64_t lastPrimaryCount=R.tv.presented.load(),timingEpoch=0;
+  auto timingStarted=start;
+  std::vector<double> primaryIntervals,swapCosts;
+  auto summary=[](std::vector<double> values) {
+    std::array<double,4> result{};
+    if(values.empty())return result;
+    std::sort(values.begin(),values.end());
+    for(size_t i=0;i<3;++i) {
+      const double quantiles[]={.50,.95,.99};
+      result[i]=values[size_t(std::ceil(quantiles[i]*values.size()))-1];
+    }
+    result[3]=values.back();return result;
+  };
+  const char* internal = SDL_GetAndroidInternalStoragePath();
+  require(internal != nullptr, "internal app storage is unavailable");
+  std::filesystem::path metrics = std::filesystem::path(internal) / "display-smoke.json";
+  const std::string temporary = metrics.string() + ".tmp";
+  // Full lifecycle/fold probes can exceed two minutes on a freshly booted
+  // emulator. The runner still enforces per-transition and frame-time gates.
+  while (std::chrono::steady_clock::now() - start < std::chrono::seconds(240)) {
+   SDL_Event event;
+   while (SDL_PollEvent(&event)) {
+    if (event.type == SDL_EVENT_QUIT) return 0;
+    const bool touchHandled = android_display_touch_event(event);
+    if (event.type == SDL_EVENT_FINGER_DOWN || event.type == SDL_EVENT_FINGER_MOTION ||
+        event.type == SDL_EVENT_FINGER_UP || event.type == SDL_EVENT_FINGER_CANCELED) {
+     ++touchEventsSeen;
+     if (touchHandled) ++touchEventsHandled;
+     LOG("[display smoke input] type=%u finger=%lld window=%u primary=%u x=%f y=%f handled=%d dual=%d swapped=%d",
+         unsigned(event.type), (long long)event.tfinger.fingerID, event.tfinger.windowID,
+         SDL_GetWindowID(R.tv.window), event.tfinger.x, event.tfinger.y, int(touchHandled),
+         int(gfx::g_has_drc_window), int(dual_display::active_swap.load()));
+    }
+    if (!touchHandled) input::handle_event(event);
+    if (event.type == SDL_EVENT_WINDOW_FOCUS_GAINED || event.type == SDL_EVENT_WINDOW_FOCUS_LOST)
+     LOG("[display smoke input] focus type=%u window=%u", unsigned(event.type), event.window.windowID);
+    if (event.type == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED &&
+        event.window.windowID == SDL_GetWindowID(R.tv.window)) {
+     R.tv.width = event.window.data1; R.tv.height = event.window.data2;
+     R.tv.resize = true;
+    }
+    if (event.type == SDL_EVENT_WINDOW_RESTORED || event.type == SDL_EVENT_WINDOW_SHOWN)
+     R.tv.visible = true;
+    if (event.type == SDL_EVENT_WINDOW_MINIMIZED) R.tv.visible = false;
+   }
+   hostui::run_posted();
+   input::update();
+   const auto commandPath = std::filesystem::path(internal) / "display-smoke-command";
+   if (std::ifstream command{commandPath}; command) {
+    std::string value;
+    command >> value;
+    if (value == "overlay1") overlay::set_open(true);
+    if (value == "overlay0") overlay::set_open(false);
+    if (value == "faceauto" || value == "faceposition") {
+      auto mapping=input_map::current();
+      if(value=="faceauto") input_map::set_face_auto(mapping,true);
+      else input_map::apply_face_layout(mapping,input_map::FaceLayout::kPosition);
+      input_map::set_current(mapping,false);
+    }
+    if (value == "touchauto") { gfx::g_touch_buttons = 0; hostui::set("touchButtons", "0"); }
+    if (value == "touchshow") { gfx::g_touch_buttons = 1; hostui::set("touchButtons", "1"); }
+    if (value == "touchhide") { gfx::g_touch_buttons = 2; hostui::set("touchButtons", "2"); }
+    if (value == "show_drc") hostui::show_drc(true);
+    if (value == "hide_drc") hostui::show_drc(false);
+    if (value == "swap1") hostui::set_displays_swapped(true);
+    if (value == "swap0") hostui::set_displays_swapped(false);
+    if (value == "filter0") hostui::set_scale_filter(0);
+    if (value == "filter1") hostui::set_scale_filter(1);
+    if (value == "filter2") hostui::set_scale_filter(2);
+    if (value == "retirement1") R.secondaryRetirementHeld=true;
+    if (value == "retirement0") R.secondaryRetirementHeld=false;
+    if (value == "worker1") R.secondaryPresentHeld=true;
+    if (value == "worker0") R.secondaryPresentHeld=false;
+    if (value == "lose_acquire") R.secondaryInjectAcquireLoss=true;
+    if (value == "lose_present") R.secondaryInjectPresentLoss=true;
+    if (value == "external_memory_capabilities") {
+      try { android_external_memory_capabilities(); LOG("[vulkan] external memory capability probe passed"); }
+      catch(const std::exception& error) { LOG("[vulkan] external memory capability probe failed: %s",error.what()); }
+    }
+    if (value == "shared_image_general_probe") {
+      try { android_shared_image_smoke(true); LOG("[vulkan] two-device shared image general shader probe passed"); }
+      catch(const std::exception& error) { LOG("[vulkan] two-device shared image general shader probe failed: %s",error.what()); }
+    }
+    if (value == "shared_image_probe") {
+      try { android_shared_image_smoke(); LOG("[vulkan] two-device shared image shader probe passed"); }
+      catch(const std::exception& error) { LOG("[vulkan] two-device shared image shader probe failed: %s",error.what()); }
+    }
+    if (value == "lose_query") { R.secondaryInjectQueryLoss=true;R.drc.resize=true; }
+    if (value == "lose_primary_query") { R.primaryInjectQueryLoss=true; R.tv.resize=true; }
+    if (value == "acquire1") R.secondaryAcquireHeld=true;
+    if (value == "acquire0") R.secondaryAcquireHeld=false;
+    if (value == "timestamps0") R.gpuTimestampsEnabled=false;
+    if (value == "resize_primary") R.tv.resize=true;
+    if (value.size()==5 && value.starts_with("mode") && value[4]>='0' && value[4]<'0'+gfx::kDrcModeCount) {
+      // a layout under test, not the player switching the second screen off (#222)
+      const bool secondOff=gfx::g_second_screen_off;
+      hostui::set_drc_mode(value[4]-'0');
+      gfx::g_second_screen_off=secondOff;
+      hostui::save_pip_position();  // saves the display options again, with the player's choice
+    }
+    // the player choosing a mode in Settings: Off releases a connected second screen (#222)
+    if (value.size()==12 && value.starts_with("choose_mode") && value[11]>='0' && value[11]<'0'+gfx::kDrcModeCount)
+      hostui::set_drc_mode(value[11]-'0');
+    if (value == "secondary_profile1") R.secondaryProfile=true;
+    if (value == "secondary_profile0") R.secondaryProfile=false;
+    if (value == "timing_reset") {
+      primaryIntervals.clear();swapCosts.clear();lastPrimary={};
+      lastPrimaryCount=R.tv.presented.load();++timingEpoch;timingStarted=std::chrono::steady_clock::now();
+    }
+    std::filesystem::remove(commandPath);
+    if(value=="exit_smoke")break;
+   }
+   // Authored moving color patterns: red TV, blue GamePad. No guest assets.
+   float pulse = .5f + float(R.frame % 60) / 120.0f;
+   const float tv[4] = {pulse, 0, 0, 1}, drc[4] = {0, 0, pulse, 1};
+   clear_image(*R.tv.scan, tv); clear_image(*R.drc.scan, drc);
+   const auto swapStarted=std::chrono::steady_clock::now();
+   swap();
+   auto now = std::chrono::steady_clock::now();
+   if(R.tv.presented.load()!=lastPrimaryCount) {
+    if(lastPrimary!=std::chrono::steady_clock::time_point{})
+      primaryIntervals.push_back(std::chrono::duration<double,std::milli>(now-lastPrimary).count());
+    swapCosts.push_back(std::chrono::duration<double,std::milli>(now-swapStarted).count());
+    lastPrimary=now;lastPrimaryCount=R.tv.presented.load();
+   }
+   if (now - report >= std::chrono::milliseconds(100)) {
+    input::PadState pad = input::read();
+    const auto intervals=summary(primaryIntervals),costs=summary(swapCosts);
+    const SDL_DisplayMode* mode=SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(R.tv.window));
+    std::ofstream out(temporary, std::ios::trunc);
+    out << "{\"secondary_stage_cpu\":[";
+    for(size_t i=0;i<R.secondaryStageNs.size();++i) {
+      if(i)out << ',';
+      out << "{\"stage\":\"" << secondaryStageNames[i] << "\",\"ns\":" << R.secondaryStageNs[i].load() << ",\"calls\":" << R.secondaryStageCalls[i].load() << '}';
+    }
+    out << "]";
+    out << ",\"pad_family\":" << int(input_map::pad_family())
+        << ",\"settings_open\":" << (overlay::is_open() ? "true" : "false")
+        << ",\"touch_buttons\":" << (gfx::touch_buttons_visible() ? "true" : "false")
+        << ",\"pad_buttons\":" << pad.buttons
+        << ",\"primary_presented\":" << R.tv.presented.load()
+        << ",\"primary_surface_losses\":" << R.primarySurfaceLosses.load()
+        << ",\"primary_swapchains\":" << R.tv.swapchainGeneration
+        << ",\"secondary_presented\":" << R.drc.presented.load()
+        << ",\"timing_epoch\":" << timingEpoch
+        << ",\"timing_duration_ms\":" << std::chrono::duration<double,std::milli>(now-timingStarted).count()
+        << ",\"primary_interval_samples\":" << primaryIntervals.size()
+        << ",\"primary_intervals_ms\":{\"p50\":" << intervals[0] << ",\"p95\":" << intervals[1]
+        << ",\"p99\":" << intervals[2] << ",\"max\":" << intervals[3] << "}"
+        << ",\"swap_cpu_ms\":{\"p50\":" << costs[0] << ",\"p95\":" << costs[1]
+        << ",\"p99\":" << costs[2] << ",\"max\":" << costs[3] << "}"
+        << ",\"gpu_timestamps_enabled\":" << (R.gpuTimestampsEnabled ? "true" : "false")
+        << ",\"gpu_submission_intervals_ns\":" << R.gpuTimestampLifetimeStats.intervalNs
+        << ",\"gpu_submission_samples\":" << R.gpuTimestampLifetimeStats.submissions
+        << ",\"drc_mode\":" << gfx::g_mode
+        << ",\"primary_present_mode\":" << R.tv.presentMode
+        << ",\"secondary_present_mode\":" << R.drc.presentMode
+        << ",\"primary_refresh_hz\":" << (mode ? mode->refresh_rate : 0)
+        << ",\"secondary_width\":" << R.drc.width.load() << ",\"secondary_height\":" << R.drc.height.load()
+        << ",\"secondary_fence_retirement\":" << (R.secondaryPresentFences ? "true" : "false")
+        << ",\"primary_requested_queues\":" << R.primaryRequestedQueues
+        << ",\"secondary_device_swapchains\":" << R.secondaryDeviceSwapchains.load()
+        << ",\"secondary_shared_snapshots\":" << R.secondarySharedSnapshots.load()
+        << ",\"secondary_local_queue_waits\":" << R.secondaryLocalQueueWaits.load()
+        << ",\"secondary_shared_general\":" << (R.secondaryIsolated && getenv("WWHD_VK_SHARED_GENERAL") && !strcmp(getenv("WWHD_VK_SHARED_GENERAL"),"1") ? "true" : "false")
+        << ",\"secondary_isolated_device\":" << (R.secondaryIsolated ? "true" : "false")
+        << ",\"secondary_present_worker\":" << (R.secondaryQueue ? "true" : "false")
+        << ",\"primary_queue_family\":" << R.queueFamily
+        << ",\"secondary_queue_family\":" << R.secondaryQueueFamily
+        << ",\"secondary_present_held\":" << (R.secondaryPresentHeld.load() ? "true" : "false")
+        << ",\"secondary_present_pending\":" << (R.secondaryPresentPending ? "true" : "false")
+        << ",\"secondary_acquire_waiting\":" << (R.secondaryAcquireWaiting.load() ? "true" : "false")
+        << ",\"secondary_acquire_held\":" << (R.secondaryAcquireHeld.load() ? "true" : "false")
+        << ",\"secondary_acquire_pending\":" << (R.secondaryAcquirePending ? "true" : "false")
+        << ",\"secondary_surface_losses\":" << R.secondarySurfaceLosses.load()
+        << ",\"secondary_present_skipped\":" << R.secondaryPresentSkipped.load()
+        << ",\"secondary_retirement_held\":" << (R.secondaryRetirementHeld ? "true" : "false")
+        << ",\"secondary_idle_waits\":" << R.secondaryIdleWaits.load()
+        << ",\"secondary_retired\":" << R.secondaryRetired.load()
+        << ",\"secondary_retirement_pending\":" << R.secondaryRetirementPending.load()
+        << ",\"second_available\":" << (gfx::g_second_display_available ? "true" : "false")
+        << ",\"second_off\":" << (gfx::drc_screen_off() ? "true" : "false")
+        << ",\"dual\":" << (gfx::g_has_drc_window ? "true" : "false")
+        << ",\"swap_requested\":" << (dual_display::requested_swap ? "true" : "false")
+        << ",\"swap_active\":" << (dual_display::active_swap ? "true" : "false")
+        << ",\"scale_filter\":" << hostui::scale_filter()
+        << ",\"primary_width\":" << R.tv.width.load() << ",\"primary_height\":" << R.tv.height.load()
+        << ",\"touch_events_seen\":" << touchEventsSeen
+        << ",\"touch_events_handled\":" << touchEventsHandled
+        << ",\"touch\":" << (pad.touch ? "true" : "false")
+        << ",\"tx\":" << pad.tx << ",\"ty\":" << pad.ty << "}\n";
+    out.close();
+    require(bool(out), "cannot write display smoke metrics");
+    std::filesystem::rename(temporary, metrics);
+    report = now;
+   }
+   SDL_Delay(16);
+  }
+  wait_idle();
+  LOG("[display smoke] completed synthetic display session");
+  return 0;
+ } catch (const std::exception& error) {
+  LOG("[display smoke] FAIL: %s", error.what());
+  return 1;
+ }
+}
+#endif
+
+int renderer_smoke_test() {
+ try {
+  // Test-only calibration: CI requires the layer to report this intentional WAW.
+  if(std::getenv("WWHD_VK_SYNC_NEGATIVE_CONTROL")) {
+   Buffer b=create_buffer(16,VK_BUFFER_USAGE_TRANSFER_DST_BIT,VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+   auto cmd=command_buffer();
+   auto fill=reinterpret_cast<PFN_vkCmdFillBuffer>(vkGetDeviceProcAddr(R.device,"vkCmdFillBuffer"));
+   require(fill!=nullptr,"sync negative control needs vkCmdFillBuffer");
+   fill(cmd,b.buffer,0,16,0);
+   fill(cmd,b.buffer,0,16,1);
+   flush();defer_buffer(b);
+   LOG("[renderer smoke] sync negative control submitted two unordered writes");
+   command_buffer();flush();return 0;
+  }
+  mem::init();
+  if(std::getenv("WWHD_VK_MIP_ORDER_SMOKE")) {
+   set_res_scale(1);latch_res_scale();sampled_mip_order_check();sampled_mip_order_check(true);
+   LOG("[renderer smoke] PASS: production rendered-mip texture ordering");return 0;
+  }
+  {
+   Image target(32,32,0x1a);
+   for(auto format:{VK_FORMAT_R8G8B8_UINT,VK_FORMAT_R16G16B16_UINT,VK_FORMAT_R32G32B32_UINT}) {
+    require((format_properties(vk::split_vertex_format(format)).bufferFeatures&VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) &&
+        (format_properties(vk::vertex_tail_format(format)).bufferFeatures&VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT),
+        "RGB fallback format unsupported");
+    std::vector<uint8_t> native,fallback;
+    triangle(target.s,0,1,format,true,&fallback);
+    if(format_properties(format).bufferFeatures&VK_FORMAT_FEATURE_VERTEX_BUFFER_BIT) {
+     triangle(target.s,0,1,format,false,&native);
+     require(native==fallback,"native and fallback RGB images differ");
+     fprintf(stderr,"[renderer smoke] %s native/fallback exact image parity passed\n",vk::vertex_format_name(format));
+    } else fprintf(stderr,"[renderer smoke] %s fallback readback passed; native unsupported\n",vk::vertex_format_name(format));
+   }
+  }
+  bc_decode_smoke();bc_surface_check();texture_path_check();upload_arena_check();asynchronous_submission_check();renderpass_retirement_check();buffer_cache_check();set_res_scale(1);latch_res_scale();
+  {
+   Image upload(16,16,0x1a,false,2,2);
+   upload.s.addr=mem::host_alloc(65536,256);upload.s.mipAddr=mem::host_alloc(65536,256);
+   const uint8_t rgba[4]={17,34,51,255};
+   for(uint32_t i=0;i<65536;++i){mem::ptr(upload.s.addr)[i]=rgba[i%4];mem::ptr(upload.s.mipAddr)[i]=rgba[i%4];}
+   upload_surface(&upload.s);
+   uint32_t textureWords[7]={5,0,0,0,(2u<<16)|(1u<<19)|(0u<<22)|(5u<<25),0,0};
+   auto swizzled=sampled_texture_view(&upload.s,textureWords);require(swizzled!=VK_NULL_HANDLE&&swizzled==sampled_texture_view(&upload.s,textureWords),"sampled array/swizzle view cache differs");
+   for(uint32_t mip=0;mip<2;++mip)for(uint32_t layer=0;layer<2;++layer)rgba_is(read_image(upload.s,VK_IMAGE_ASPECT_COLOR_BIT,4,mip,layer),rgba,"guest mip/layer upload differs");
+   fprintf(stderr,"[renderer smoke] guest upload, two mips and two layers passed\n");
+   // Use the public surface cache so the public invalidation path sees this fixture.
+   SurfaceDesc cacheDesc;
+   cacheDesc.addr=upload.s.addr;cacheDesc.mipAddr=upload.s.mipAddr;
+   cacheDesc.width=16;cacheDesc.height=16;cacheDesc.pitch=16;cacheDesc.slices=2;
+   cacheDesc.mips=2;cacheDesc.format=0x1a;cacheDesc.dim=5;
+   auto* cached=find_or_create_surface(cacheDesc,false);
+   upload_surface(cached);
+   uint64_t checks=g_stat_full_checks,uploads=g_stat_uploads;
+   upload_surface(cached);
+   require(g_stat_full_checks==checks&&g_stat_uploads==uploads,"same-frame upload bypassed texture cache");
+   ++R.frame;
+   if(((R.frame+(cached->addr>>12))&63)==0)++R.frame;
+   upload_surface(cached);
+   require(g_stat_full_checks==checks&&g_stat_uploads==uploads,"unchanged next-frame texture performed a full check");
+   const uint8_t changedMip[4]={85,102,119,255};
+   for(uint32_t i=0;i<65536;++i)mem::ptr(cached->mipAddr)[i]=changedMip[i%4];
+   // The invalidated range starts inside the mip, rather than crossing its base.
+   invalidate(2,cached->mipAddr+16,4);
+   require(cached->dirty&&cached->lastCheckedFrame!=R.frame,"interior mip invalidation did not reset the upload gate");
+   upload_surface(cached);
+   require(g_stat_full_checks==checks+1&&g_stat_uploads==uploads+1,"same-frame invalidated mip was not uploaded");
+   for(uint32_t layer=0;layer<2;++layer) {
+    rgba_is(read_image(*cached,VK_IMAGE_ASPECT_COLOR_BIT,4,0,layer),rgba,"mip invalidation changed the base image");
+    rgba_is(read_image(*cached,VK_IMAGE_ASPECT_COLOR_BIT,4,1,layer),changedMip,"invalidated mip guest upload differs");
+   }
+   fprintf(stderr,"[renderer smoke] upload cache and interior mip invalidation/readback passed\n");
+   {
+    // A buffer sampled (with a two-level descriptor) before anything rendered it, then rendered:
+    // the render target must be its own one-level surface, not the sampled texture, and later
+    // sampling must find the target (issue #47).
+    SurfaceDesc t;t.addr=mem::host_alloc(16*16*4,256);t.mipAddr=mem::host_alloc(8*8*4,256);
+    t.width=16;t.height=16;t.pitch=16;t.slices=1;t.mips=2;t.format=0x1a;t.dim=1;
+    auto* tex=find_or_create_surface(t,false);
+    upload_surface(tex);
+    SurfaceDesc rt=t;rt.mipAddr=0;rt.mips=1;
+    auto* target=find_or_create_surface(rt,true);
+    require(target&&target!=tex&&target->mips==1,"render target adopted a sampled mipmapped texture");
+    mark_gpu_written(target);
+    require(find_or_create_surface(t,false)==target,"sampling after the render did not find the render target");
+    fprintf(stderr,"[renderer smoke] render target after a mipmapped sampled texture passed\n");
+    // Bloom renders level 1 separately, then binds the base descriptor with LOD clamped to 1.
+    // Distinct GPU colours prove that this reads the rendered mip rather than the base image.
+    SurfaceDesc mip=rt;mip.addr=t.mipAddr;mip.width=8;mip.height=8;mip.pitch=8;
+    auto* mipTarget=find_or_create_surface(mip,true);
+    const float baseColor[4]={0,0,1,1},mipColor[4]={0,1,0,1};
+    clear_image(*target,baseColor);clear_image(*mipTarget,mipColor);
+    uint32_t words[7]={1u|(1u<<3)|(1u<<8)|(15u<<19),15u|(0x1au<<26),
+        t.addr>>8,t.mipAddr>>8,(1u<<19)|(2u<<22)|(3u<<25),1,0};
+    auto* sampledMip=sampled_texture(words,false);
+    require(sampledMip!=target && sampledMip->mips==2,"GPU-rendered mip chain was not assembled");
+    const uint8_t mipBytes[4]={0,255,0,255};
+    rgba_is(read_image(*sampledMip,VK_IMAGE_ASPECT_COLOR_BIT,4,1),mipBytes,
+        "fixed-LOD rendered mip readback differs");
+    const uint8_t baseBytes[4]={0,0,255,255};
+    rgba_is(read_image(*sampledMip,VK_IMAGE_ASPECT_COLOR_BIT,4),baseBytes,"mip chain changed the base image");
+    const float changedColor[4]={1,0,0,1};const uint8_t changedBytes[4]={255,0,0,255};
+    clear_image(*mipTarget,changedColor);
+    auto* rebuilt=sampled_texture(words,false);
+    rgba_is(read_image(*rebuilt,VK_IMAGE_ASPECT_COLOR_BIT,4,1),changedBytes,"mip-only write did not rebuild the sampled chain");
+    fprintf(stderr,"[renderer smoke] GPU-rendered mip chain/base preservation/mip-only refresh passed\n");
+   }
+   {
+    // A texel changed in place, unannounced, between the 256 words the former sampled check read
+    // (step 1 KiB here): page write tracking must still upload it on the next frame.
+    SurfaceDesc bigDesc;bigDesc.addr=mem::host_alloc(256*256*4,256);
+    bigDesc.width=256;bigDesc.height=256;bigDesc.pitch=256;bigDesc.slices=1;bigDesc.mips=1;bigDesc.format=0x1a;bigDesc.dim=1;
+    for(uint32_t i=0;i<256*256*4;++i)mem::ptr(bigDesc.addr)[i]=rgba[i%4];
+    auto* big=find_or_create_surface(bigDesc,false);
+    upload_surface(big);
+    ++R.frame;
+    if(((R.frame+(big->addr>>12))&63)==0)++R.frame;
+    upload_surface(big);
+    uint64_t bigUploads=g_stat_uploads;
+    const uint8_t texel[4]={200,10,20,255};
+    memcpy(mem::ptr(bigDesc.addr)+(256+5)*4,texel,4);  // texel (5,1): bytes 1044..1047, not sampled
+    ++R.frame;
+    if(((R.frame+(big->addr>>12))&63)==0)++R.frame;
+    upload_surface(big);
+    require(g_stat_uploads==bigUploads+1,"unannounced in-place texel change was not uploaded");
+    auto px=read_image(*big,VK_IMAGE_ASPECT_COLOR_BIT,4);
+    require(!memcmp(px.data()+(256+5)*4,texel,4)&&!memcmp(px.data(),rgba,4),"unannounced texel change readback differs");
+    fprintf(stderr,"[renderer smoke] unannounced in-place texel change between sampled words uploaded next frame\n");
+   }
+   Image color(16,16,0x1a);const float green[4]={0,1,0,1};const uint8_t greenBytes[4]={0,255,0,255};clear_image(color.s,green);rgba_is(read_image(color.s,VK_IMAGE_ASPECT_COLOR_BIT,4),greenBytes,"color clear differs");
+   Image scaled(32,32,0x1a);resample(&color.s,&scaled.s,1);rgba_is(read_image(scaled.s,VK_IMAGE_ASPECT_COLOR_BIT,4),greenBytes,"scaled blit differs");
+   // Retire an image while its commands are pending; replacement must not destroy it early.
+   clear_image(color.s,green);destroy_surface_image(&color.s);create_surface_image(&color.s,true);const float blue[4]={0,0,1,1};const uint8_t blueBytes[4]={0,0,255,255};clear_image(color.s,blue);rgba_is(read_image(color.s,VK_IMAGE_ASPECT_COLOR_BIT,4),blueBytes,"deferred image replacement differs");
+   fprintf(stderr,"[renderer smoke] clear, scaled blit and deferred image replacement passed\n");
+   Image depth(16,16,0x11,true);depth.s.addr=mem::host_alloc(65536,256);
+   const uint32_t packedDepth=0x5a800000;for(uint32_t i=0;i<65536;i+=4)memcpy(mem::ptr(depth.s.addr)+i,&packedDepth,4);
+   upload_surface(&depth.s);
+   textureWords[0]=1;require(sampled_texture_view(&depth.s,textureWords)!=VK_NULL_HANDLE,"sampled depth-only view creation failed");
+   auto depths=read_image(depth.s,VK_IMAGE_ASPECT_DEPTH_BIT,4);auto stencils=read_image(depth.s,VK_IMAGE_ASPECT_STENCIL_BIT,1);
+   for(size_t i=0;i<stencils.size();++i){float value;memcpy(&value,depths.data()+i*4,4);require(std::abs(value-0.5f)<0.00001f&&stencils[i]==0x5a,"depth/stencil guest upload differs");}
+   transition_image(&depth.s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+   VkClearDepthStencilValue dv{0.25f,0xa5};VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT|VK_IMAGE_ASPECT_STENCIL_BIT,0,1,0,1};record::vkCmdClearDepthStencilImage(command_buffer(),depth.s.image,depth.s.layout,&dv,1,&range);
+   depths=read_image(depth.s,VK_IMAGE_ASPECT_DEPTH_BIT,4);stencils=read_image(depth.s,VK_IMAGE_ASPECT_STENCIL_BIT,1);
+   for(size_t i=0;i<stencils.size();++i){float value;memcpy(&value,depths.data()+i*4,4);require(value==0.25f&&stencils[i]==0xa5,"depth/stencil clear differs");}
+   fprintf(stderr,"[renderer smoke] depth/stencil upload and clear passed\n");
+   depth_copy_check();
+   colour_comparison_check();
+   texture_pack_check(false);
+   texture_pack_check(true);
+   {
+    // the peek checks read the answers as soon as each frame's fence retires (mode 0); the default
+    // (answers two game steps later, written at the game's swap) has no swaps here
+    ::gfx::depth_peek::force_mode_for_test(0);
+    struct RestorePeekMode { ~RestorePeekMode() { ::gfx::depth_peek::force_mode_for_test(-1); } } restorePeekMode;
+    auto peek=std::make_unique<Surface>();
+    peek->width=1280;peek->height=720;peek->pitch=1280;peek->format=0x11;peek->isDepth=true;peek->fmt=format_info(0x11,true);
+    peek->addr=mem::host_alloc(256,256);create_surface_image(peek.get(),true,VkExtent3D{16,16,1});
+    auto* surface=peek.get();auto entry=selected_surfaces().emplace(peek->addr,std::move(peek));++g_surface_set_gen;
+    uint32_t previousDepth=selected_main_depth();selected_main_depth()=surface->addr;
+    uint32_t result=mem::host_alloc(256,256);uint32_t cells[]={320,240,result,0,0,result+4};
+    for(float z:{0.25f,1.0f}) {
+     transition_image(surface,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+     VkClearDepthStencilValue value{z,0};record::vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
+     peek_z(cells,6);flush();uint32_t expected=z==1.0f?0xFFFFFFu:0x3FFFFFu;
+     require(ld32(result)==expected&&ld32(result+4)==expected,"GPU depth peek differs");
+    }
+    // A drain retires the newest fence first; an older answer must not replace it.
+    for(float z:{0.25f,1.0f}) {
+     transition_image(surface,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
+     VkClearDepthStencilValue value{z,0};record::vkCmdClearDepthStencilImage(command_buffer(),surface->image,surface->layout,&value,1,&range);
+     peek_z(cells,6);flush_async();
+    }
+    flush();require(ld32(result)==0xFFFFFFu&&ld32(result+4)==0xFFFFFFu,"older GPU depth answer replaced newer answer");
+    selected_main_depth()=previousDepth;destroy_surface_image(surface);selected_surfaces().erase(entry);++g_surface_set_gen;
+    fprintf(stderr,"[renderer smoke] asynchronous GPU depth peeks passed\n");
+   }
+   stereo_stream_check();
+   stereo_resize_upload_check();
+   stereo_geometry_check();
+   Image rendered(64,64,0x1a);dynamic_uniform_check(rendered.s);vertex_window_check(rendered.s);triangle(rendered.s);
+   if(R.tv.scan)destroy_surface_image(R.tv.scan.get());R.tv.scan=std::make_unique<Surface>();auto& scan=*R.tv.scan;scan.width=64;scan.height=64;scan.format=0x1a;scan.fmt=format_info(scan.format,false);create_surface_image(&scan,false);resample(&rendered.s,&scan,1);mark_gpu_written(&scan);
+   auto capturePath=std::filesystem::temp_directory_path()/("wwhd-vulkan-smoke-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".png");
+   request_tv_dump(capturePath.string(),0);swap();
+   std::ifstream capture(capturePath,std::ios::binary);std::vector<uint8_t> png((std::istreambuf_iterator<char>(capture)),std::istreambuf_iterator<char>());
+   const uint8_t signature[8]={137,80,78,71,13,10,26,10};require(png.size()>8&&memcmp(png.data(),signature,8)==0,"PNG capture signature differs");
+   auto get32=[&](size_t offset){return (uint32_t(png[offset])<<24)|(uint32_t(png[offset+1])<<16)|(uint32_t(png[offset+2])<<8)|png[offset+3];};
+   std::vector<uint8_t> compressed;bool header=false;
+   for(size_t offset=8;offset+12<=png.size();) {
+    uint32_t size=get32(offset);require(size<=png.size()-offset-12,"PNG capture chunk length differs");
+    const uint8_t* type=png.data()+offset+4;const uint8_t* data=type+4;
+    require(uint32_t(crc32(0,type,size+4))==get32(offset+8+size),"PNG capture chunk CRC differs");
+    if(memcmp(type,"IHDR",4)==0){require(size==13&&get32(offset+8)==64&&get32(offset+12)==64,"PNG capture dimensions differ");header=true;}
+    if(memcmp(type,"IDAT",4)==0)compressed.insert(compressed.end(),data,data+size);
+    offset+=size+12;
+   }
+   std::vector<uint8_t> decoded((64*4+1)*64);uLongf decodedSize=decoded.size();require(header&&uncompress(decoded.data(),&decodedSize,compressed.data(),compressed.size())==Z_OK&&decodedSize==decoded.size(),"PNG capture decompression differs");
+   size_t pngCenter=32*(64*4+1)+1+32*4;require(decoded[pngCenter]==255&&decoded[pngCenter+1]==0&&decoded[pngCenter+2]==0,"PNG capture triangle center differs");
+   fprintf(stderr,"[renderer smoke] queued GPU PNG capture passed: %s\n",capturePath.string().c_str());
+   require(R.tv.swapchain!=VK_NULL_HANDLE,"smoke presentation did not create a swapchain");LOG("[renderer smoke] scan-buffer swapchain presentation and PNG readback passed");
+   volume_target_check();
+   bloom_chain_size_check();
+   light_target_size_check();
+   completed_scan_retention_check();
+  }
+  // Ensure deferred objects left by readback and stack-owned images are actually reclaimed.
+  command_buffer();flush();require(R.garbageBuffers.empty()&&R.garbageImages.empty()&&R.garbageCacheRegions.empty(),"deferred Vulkan resources were not reclaimed");
+  // Exercise the actual timestamp command sites, not just the demand predicate.
+  if (!getenv("WWHD_VK_GPU_TIMESTAMPS") && !getenv("WWHD_VK_GPU_PASS_TIMESTAMPS")) {
+    perf::set_demand(false, false);
+    auto before = perf::counters();
+    command_buffer(); flush();
+    require(perf::counters().timestamp_writes == before.timestamp_writes, "hidden overlay wrote timestamps");
+    // Queue families with zero timestamp bits must silently keep the GPU reading unavailable.
+    auto validBits = R.gpuTimestampValidBits;
+    R.gpuTimestampValidBits = 0;
+    perf::set_demand(true, false);
+    command_buffer(); flush();
+    require(perf::counters().timestamp_writes == before.timestamp_writes, "unsupported queue wrote timestamps");
+    perf::set_demand(false, false);
+    R.gpuTimestampValidBits = validBits;
+    perf::set_demand(true, false);
+    command_buffer(); flush();
+    auto measured = perf::counters();
+    if (R.gpuTimestampValidBits && R.properties.limits.timestampPeriod > 0)
+      require(measured.timestamp_writes == before.timestamp_writes + 2, "visible overlay did not write timestamp pair");
+    require(measured.query_reads == before.query_reads, "overlay read timestamps in the recorded frame");
+    ++R.frame; command_buffer(); flush();
+    measured = perf::counters();
+    if (measured.query_reads > before.query_reads)
+      require(measured.minimum_query_age >= 1, "overlay read timestamps without a frame of delay");
+    perf::set_demand(false, false);
+    command_buffer(); flush();
+    require(perf::counters().timestamp_writes == measured.timestamp_writes, "hiding overlay kept writing timestamps");
+    require(perf::counters().query_reads == measured.query_reads, "hidden overlay polled query results");
+    LOG("[renderer smoke] overlay timestamp writes: hidden 0, on %llu, hidden again 0",
+        (unsigned long long)(measured.timestamp_writes - before.timestamp_writes));
+  }
+  test_hdr_presentation();
+  vr_upscale::self_test();
+  if (std::getenv("WWHD_TEST_CACHE_BACKGROUND")) {
+    // Synthetic durability test: let the caller kill this process after the
+    // background checkpoint reaches disk, bypassing orderly shutdown entirely.
+    gx2::request_background_vulkan_cache_checkpoint();
+    LOG("[renderer smoke] waiting for kill after background cache request");
+    for (;;) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  if (vrvk::smoke(270)) throw std::runtime_error("VR frame loop");  // WWHD_VR=1: about 3 s on the headset
+  save_pipeline_cache();
+  wait_idle();
+  stop_record_worker();
+  reset_pass_caches();
+  LOG("[renderer smoke] PASS: actual device upload/clear/blit/depth/triangle/present");return 0;
+ }catch(const std::exception& e){LOG("[renderer smoke] FAIL: %s",e.what());try {command_buffer();flush();}catch(...){}try {stop_record_worker();}catch(...){}return 1;}
+}
+} // namespace gfxvk
