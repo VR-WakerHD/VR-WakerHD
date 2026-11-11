@@ -12,7 +12,7 @@ and HUD displays on Link's wrists. It is a derivative of the original project (s
 **License.** Two licenses (see [LICENSE-VR.md](LICENSE-VR.md)): the VR mode written for this project (the files in
 `LICENSES/VR-FILES.txt`) is under the **GPL-3.0-or-later, with a credit term**: anyone who
 distributes it, changed or not, must share their program's source under the GPL and keep the credit "VR mode by
-Mehrab Kooner (VR-WakerHD, https://github.com/VR-WakerHD)" in the source and where users see it. The original port's code,
+from VR-WakerHD (VR-WakerHD, https://github.com/VR-WakerHD)" in the source and where users see it. The original port's code,
 including the changes made to its files, stays under the **MPL-2.0** ([LICENSE](LICENSE)).
 
 **No game is included.** This repository contains no game code, no game-disc images, no keys and no game assets. To
