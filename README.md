@@ -292,31 +292,104 @@ files (--game)**. The launcher passes it to a source build as `--game <folder>`.
 
 The controllers become the Wii U GamePad's buttons and sticks, so every action works as the game decides. The
 **sword hand** is the right controller and the **shield hand** the left; **Left-handed** (`vr.leftHanded=1`) swaps
-them. Button defaults are from `runtime/src/vr/vr_bindings.h`; change them in the launcher's **Controllers** tab or
-with `vr.bind.<action>=<button>`. The physical buttons can also be moved in the runtime's binding editor.
+them. These are the defaults (`runtime/src/vr/vr_bindings.h`); change them in the launcher's **Controllers** tab or
+with `vr.bind.<action>=<button>`. Buttons are named as on Quest / Rift Touch controllers; on PS VR2 Sense, Cross is A,
+Circle B, Square X and Triangle Y. The controls change with the view: **first person**, **third person** and **on the
+boat**.
 
-| Controller input | Default | In the game |
-|---|---|---|
-| Left stick | movement | forward is where you look (`vr.moveDirection=hand`: where the left controller points) |
-| Right stick left / right | turning | smooth (the default) or snap (30° by default; `vr.turn`); aims while aiming the bow, hookshot or boomerang |
-| Right stick down (held) | ZR | shield / crouch |
-| Right stick click | | first / third person; cancels the item wheel |
-| Both stick clicks held 0.6 s | | recentre |
-| Sword-hand trigger | A | talk, open, pick up, climb |
-| Sword-hand primary (A / Cross) | A | the same |
-| Sword-hand secondary (B / Circle) | B | sword (also without a swing) |
-| Sword-hand grip | R | the item on R; over the sword hand's shoulder: draw the sword |
-| Sword-hand stick click | Minus | Minus |
-| Shield-hand trigger | ZL | target lock |
-| Shield-hand grip | (none) | closes Link's hand; over the shield hand's shoulder: opens the item wheel |
-| Shield-hand primary (X / Square) | X | the item on X |
-| Shield-hand secondary (Y / Triangle) | Y | the item on Y |
-| Shield-hand stick click | LeftStickClick | |
-| Menu button (left controller) | Plus | pause menu (on the GamePad panel) |
-| Head | | the view: rotation and position |
+### Everywhere
 
-The Valve Index has no menu button: bind "Menu" in SteamVR's binding editor. Full reference:
-[docs/VR_CONTROL_MAPPING.md](docs/VR_CONTROL_MAPPING.md), [docs/VR_CONTROLS.md](docs/VR_CONTROLS.md).
+| Input | Does |
+|---|---|
+| Left stick | move (forward is where you look; `vr.moveDirection=hand`: where the left controller points) |
+| Right stick left / right | turn: smooth (default) or snap (30°, `vr.turn`) |
+| Right stick click | switch the view: first / third person (on the boat: four views, below) |
+| Left stick click | the VR settings menu in the headset (the game pauses) |
+| Both stick clicks held 0.6 s | recentre |
+| A / B | A (talk, open, pick up, climb) / B (sword) |
+| X / Y | the item on X / on Y |
+| Left trigger | lock on (ZL) |
+| Menu button (left controller) | pause menu (+), on the GamePad panel in front of you |
+| Head | the view: rotation and position |
+
+The Valve Index has no menu button: bind "Menu" in SteamVR's binding editor.
+
+### First person
+
+![First-person controls](docs/images/controls-first-person.svg)
+
+Your hands are Link's hands: the arms follow the controllers, and the sword and shield are held in them.
+
+| Input | Does |
+|---|---|
+| Swing the right controller | sword attack: down, left to right or right to left; the blade hits along its path |
+| Right grip over the right shoulder | draw the sword (B also draws it) |
+| Right grip | the item on R |
+| Right trigger | with empty hands: the item wheel (hold, right stick to choose, let go to take it out); with an aimed item: fire |
+| Left grip held over the left shoulder | the item wheel (right stick to choose, push the hand forward to take it out) |
+| Raise the shield (left hand up) | lock onto the nearest enemy; locked on, Link guards by himself |
+| Raised shield + left grip | block (ZR), when nothing is locked on |
+| Right stick down (hold) | crouch / shield (ZR) |
+| A when the parry prompt shows | parry: the game rolls you around the enemy, your swing makes the finishing cut |
+| A at a wall when "Sidle" shows | sidle along the wall |
+| Point the hand holding it | aim the bow, hookshot or boomerang; the bow is drawn with your other hand, a trigger shoots |
+| Hold your hands up / down / left / right | conduct the Wind Waker (the sticks work too) |
+
+### Third person
+
+![Third-person controls](docs/images/controls-third-person.svg)
+
+The game's own camera, turned by your head. There are no motion controls: buttons and sticks work as on the GamePad,
+and the sword attacks with B.
+
+| Input | Does |
+|---|---|
+| Left stick | move Link, relative to the camera |
+| Right stick left / right | turn the camera |
+| Right stick down (hold) | crouch / block (ZR) |
+| Left grip (hold) | block (ZR) |
+| Right grip (hold) + left stick | the **D-pad** (see below); Link stands still meanwhile |
+| Right trigger | the item on R |
+| Either trigger, bow out | hold to draw, let go to shoot |
+| B | sword |
+
+### On the boat (the King of Red Lions)
+
+![Boat controls](docs/images/controls-boat.svg)
+
+While Link sails, in every view:
+
+| Input | Does |
+|---|---|
+| Left stick | steer |
+| A | hop (while sailing); also talk, get off, hold to stop |
+| Right stick click | cycle the views: first person → third person → **figurehead** (on the King of Red Lions' head) → **Free Roam camera** → first person |
+| Right stick | look around (it never crouches on the boat) |
+| Right grip (hold) + left stick | the **D-pad**; the boat is not steered meanwhile |
+| Left grip (hold) + right stick | the **D-pad** too; the camera stays still meanwhile |
+| Right trigger | third person: the item on R; first person / figurehead with empty hands: the item wheel |
+| X / Y / R | the items on them: cannon, grappling hook (salvage), bow, boomerang |
+| Free Roam camera | left trigger zooms in, right trigger zooms out, right stick slides the camera |
+
+Taking out the bow, hookshot or boomerang in the figurehead or Free Roam view switches to first person, so you can aim
+with your hands; click back to a boat view afterwards. Leaving the boat returns to third person.
+
+### The D-pad
+
+The Wii U GamePad's D-pad has no button of its own on VR controllers, so a grip turns a stick into it: **hold the
+grip, then push the stick** up, down, left or right (past half way; its strongest direction counts). Let go of the
+grip and the stick moves (or steers) again. **D-pad up plays the Wind Waker**; the other directions do what the game
+gives them.
+
+| Where | D-pad |
+|---|---|
+| Third person, on foot | right grip + left stick |
+| On the boat (any view) | right grip + left stick, or left grip + right stick |
+| Third person, in events and menus | the right grip alone presses D-pad up |
+| First person, on foot | not on a grip (the grips close Link's hands); switch to third person, or bind a button to `Up` / `Down` / `Left` / `Right` in the launcher |
+
+Full reference: [docs/VR_CONTROLS.md](docs/VR_CONTROLS.md), [docs/VR_CONTROL_MAPPING.md](docs/VR_CONTROL_MAPPING.md),
+[docs/VR_SAILING_VIEWS.md](docs/VR_SAILING_VIEWS.md). The diagrams are drawn by `tools/docs/controller_diagrams.py`.
 
 ## Motion controls and physical interactions
 

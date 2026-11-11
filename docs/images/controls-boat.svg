@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 700" width="1200" height="700" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+<rect width="1200" height="700" rx="18" fill="#ffffff"/>
+<text x="600.0" y="44" font-size="28" font-weight="700" fill="#1f2933" text-anchor="middle">Sailing the King of Red Lions</text>
+<text x="600.0" y="74" font-size="16" fill="#52606d" text-anchor="middle">In every view on the boat; the stick click cycles the views</text>
+<text x="410" y="520" font-size="17" font-weight="700" fill="#1f2933" text-anchor="middle">Left: shield hand</text>
+<text x="790" y="520" font-size="17" font-weight="700" fill="#1f2933" text-anchor="middle">Right: sword hand</text>
+<g transform="translate(410,360)"><path d="M -70 -70 Q -80 40 -30 120 L 30 120 Q 78 40 70 -70 Q 0 -112 -70 -70 Z" fill="#e4e7eb" stroke="#9aa5b1" stroke-width="3"/><path d="M -92 -96 A 110 70 0 0 1 92 -96" fill="none" stroke="#9aa5b1" stroke-width="10" stroke-linecap="round"/><circle cx="-28" cy="-40" r="24" fill="#3e4c59"/><circle cx="-28" cy="-40" r="15" fill="#616e7c"/><circle cx="34" cy="-64" r="15" fill="#3e4c59"/><text x="34" y="-58" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">Y</text><circle cx="40" cy="-24" r="15" fill="#3e4c59"/><text x="40" y="-18" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">X</text><rect x="-12" y="16" width="16" height="10" rx="5" fill="#3e4c59"/><rect x="-10" y="-116" width="20" height="14" rx="5" fill="#0b6e99"/><rect x="-66" y="-34" width="12" height="40" rx="5" fill="#0b6e99"/></g>
+<g transform="translate(790,360)"><path d="M 70 -70 Q 80 40 30 120 L -30 120 Q -78 40 -70 -70 Q 0 -112 70 -70 Z" fill="#e4e7eb" stroke="#9aa5b1" stroke-width="3"/><path d="M 92 -96 A 110 70 0 0 1 -92 -96" fill="none" stroke="#9aa5b1" stroke-width="10" stroke-linecap="round"/><circle cx="28" cy="-40" r="24" fill="#3e4c59"/><circle cx="28" cy="-40" r="15" fill="#616e7c"/><circle cx="-34" cy="-64" r="15" fill="#3e4c59"/><text x="-34" y="-58" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">B</text><circle cx="-40" cy="-24" r="15" fill="#3e4c59"/><text x="-40" y="-18" font-size="16" font-weight="700" fill="#fff" text-anchor="middle">A</text><rect x="-10" y="-116" width="20" height="14" rx="5" fill="#0b6e99"/><rect x="54" y="-34" width="12" height="40" rx="5" fill="#0b6e99"/></g>
+<polyline points="410,250 262,110.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="410" cy="250" r="4" fill="#0b6e99"/>
+<text x="28" y="104.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">Trigger</text>
+<text x="28" y="124.0" font-size="15" fill="#1f2933" text-anchor="start">Lock on (ZL). Free Roam camera: zoom</text>
+<text x="28" y="142.0" font-size="15" fill="#1f2933" text-anchor="start">in</text>
+<polyline points="429,296 262,179.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="429" cy="296" r="4" fill="#0b6e99"/>
+<text x="28" y="173.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">Y</text>
+<text x="28" y="193.0" font-size="15" fill="#1f2933" text-anchor="start">Item on Y (cannon, grappling</text>
+<text x="28" y="211.0" font-size="15" fill="#1f2933" text-anchor="start">hook...)</text>
+<polyline points="364,306 262,248.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="364" cy="306" r="4" fill="#0b6e99"/>
+<text x="28" y="242.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">Stick</text>
+<text x="28" y="262.0" font-size="15" fill="#1f2933" text-anchor="start">Steer. With the right grip held: the</text>
+<text x="28" y="280.0" font-size="15" fill="#1f2933" text-anchor="start">D-pad</text>
+<polyline points="368,320 262,317.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="368" cy="320" r="4" fill="#0b6e99"/>
+<text x="28" y="311.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">Stick click</text>
+<text x="28" y="331.0" font-size="15" fill="#1f2933" text-anchor="start">VR settings menu</text>
+<polyline points="435,336 262,386.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="435" cy="336" r="4" fill="#0b6e99"/>
+<text x="28" y="380.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">X</text>
+<text x="28" y="400.0" font-size="15" fill="#1f2933" text-anchor="start">Item on X</text>
+<polyline points="350,346 262,455.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="350" cy="346" r="4" fill="#0b6e99"/>
+<text x="28" y="449.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">Grip (hold)</text>
+<text x="28" y="469.0" font-size="15" fill="#1f2933" text-anchor="start">Turns the right stick into the D-pad</text>
+<polyline points="397,381 262,524.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="397" cy="381" r="4" fill="#0b6e99"/>
+<text x="28" y="518.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="start">Menu</text>
+<text x="28" y="538.0" font-size="15" fill="#1f2933" text-anchor="start">Pause menu (+)</text>
+<polyline points="790,250 938,110.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="790" cy="250" r="4" fill="#0b6e99"/>
+<text x="1172" y="104.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">Trigger</text>
+<text x="1172" y="124.0" font-size="15" fill="#1f2933" text-anchor="end">Third person: item on R. Free Roam:</text>
+<text x="1172" y="142.0" font-size="15" fill="#1f2933" text-anchor="end">zoom out</text>
+<polyline points="771,296 938,179.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="771" cy="296" r="4" fill="#0b6e99"/>
+<text x="1172" y="173.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">B</text>
+<text x="1172" y="193.0" font-size="15" fill="#1f2933" text-anchor="end">Sword</text>
+<polyline points="836,306 938,248.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="836" cy="306" r="4" fill="#0b6e99"/>
+<text x="1172" y="242.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">Stick</text>
+<text x="1172" y="262.0" font-size="15" fill="#1f2933" text-anchor="end">Look around. Free Roam: slide the</text>
+<text x="1172" y="280.0" font-size="15" fill="#1f2933" text-anchor="end">camera</text>
+<polyline points="832,320 938,317.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="832" cy="320" r="4" fill="#0b6e99"/>
+<text x="1172" y="311.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">Stick click</text>
+<text x="1172" y="331.0" font-size="15" fill="#1f2933" text-anchor="end">View: first, third, figurehead, Free</text>
+<text x="1172" y="349.0" font-size="15" fill="#1f2933" text-anchor="end">Roam</text>
+<polyline points="765,336 938,386.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="765" cy="336" r="4" fill="#0b6e99"/>
+<text x="1172" y="380.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">A</text>
+<text x="1172" y="400.0" font-size="15" fill="#1f2933" text-anchor="end">Hop while sailing; talk, get off</text>
+<polyline points="828,340 938,455.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="828" cy="340" r="4" fill="#0b6e99"/>
+<text x="1172" y="449.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">Stick down</text>
+<text x="1172" y="469.0" font-size="15" fill="#1f2933" text-anchor="end">Camera only (no crouch on the boat)</text>
+<polyline points="850,346 938,524.0" fill="none" stroke="#9aa5b1" stroke-width="1.5"/>
+<circle cx="850" cy="346" r="4" fill="#0b6e99"/>
+<text x="1172" y="518.0" font-size="15" font-weight="700" fill="#0b6e99" text-anchor="end">Grip (hold)</text>
+<text x="1172" y="538.0" font-size="15" fill="#1f2933" text-anchor="end">Turns the left stick into the D-pad</text>
+<text x="600.0" y="638" font-size="15" fill="#52606d" text-anchor="middle">Hold both stick clicks 0.6 s to recentre. Left-handed (vr.leftHanded=1) swaps the hands.</text>
+<text x="600.0" y="660" font-size="15" fill="#52606d" text-anchor="middle">Defaults; rebind in the VR launcher's Controllers tab.</text>
+</svg>
