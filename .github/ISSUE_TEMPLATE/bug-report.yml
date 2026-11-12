@@ -1,0 +1,118 @@
+name: Bug report
+description: "Something goes wrong in setup, the VR launcher or the game (graphics, gameplay, sound, controls, crashes)."
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Your **log file is required** (where to find it is just below); a zip of your **save folder** is optional.
+
+        If a maintainer closed your issue and the problem comes back, comment `/reopen` on it (as the person who opened it) and it reopens automatically.
+  - type: markdown
+    attributes:
+      value: |
+        ## 📄 Your log file is required
+        **Bug reports without a log file can't be looked at.** The game writes it every time it runs. Find yours below,
+        then drag it into the **Log file** box. If you started the game again after the problem, also attach
+        **`wwhd-previous.log`** from the same folder (each start replaces `wwhd.log`).
+
+        | Where you play | Your log file |
+        |---|---|
+        | **Quest 3 / 3S** (APK) | `/sdcard/Android/data/org.wwhdrecomp.wwhd/files/captures/wwhd.log` |
+        | Quest, from a Windows PC over USB | `This PC\Quest 3\Internal shared storage\Android\data\org.wwhdrecomp.wwhd\files\captures\wwhd.log` |
+        | **Linux / SteamOS / Steam Frame** (AppImage) | `/home/<your user name>/.local/share/wwhd/captures/wwhd.log` |
+        | **Windows** (release zip) | `data\captures\wwhd.log` inside the folder you unzipped, e.g. `C:\Games\VR-WakerHD\data\captures\wwhd.log` |
+        | Windows, an older install | `C:\Users\<your user name>\AppData\Local\WWHD\captures\wwhd.log` |
+        | Built from source | `captures/wwhd.log` in the folder you start the game from |
+        | **Setup failed** | `data\setup.log` (Windows) or `/home/<your user name>/.local/share/wwhd/setup.log` (AppImage) |
+
+        **Quest tips:** the easiest way is **Share log** on the app's setup screen (sends both logs, e.g. to email or Drive).
+        Over USB, put the headset on and choose **Allow** when it asks to allow access to data (the PC may name it
+        differently than "Quest 3"). With SideQuest or adb: `adb pull /sdcard/Android/data/org.wwhdrecomp.wwhd/files/captures/wwhd.log`
+
+        **Linux tip:** `.local` is a hidden folder: press **Ctrl+H** in the file manager, or type the path into its address bar.
+        **Windows tip:** for an older install, paste `%LOCALAPPDATA%\WWHD\captures` into File Explorer's address bar.
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log file (required)
+      description: "Drag your wwhd.log here (and wwhd-previous.log if you restarted; the crash-<date>-<time>.log too if the game crashed). The table above says where it is. Your user folder names are removed from the logs."
+      placeholder: "Drag wwhd.log here"
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        ## 💾 Your save folder (optional)
+        Not required, but it helps us reproduce the problem much faster: **zip your save folder** and drag the zip into
+        the **Save folder** box. It holds your save files (`cking.sav`, a few KB).
+
+        | Where you play | Your save folder |
+        |---|---|
+        | **Quest 3 / 3S** (APK) | `/sdcard/Android/data/org.wwhdrecomp.wwhd/files/save/` |
+        | Quest, from a Windows PC over USB | `This PC\Quest 3\Internal shared storage\Android\data\org.wwhdrecomp.wwhd\files\save` |
+        | **Linux / SteamOS / Steam Frame** (AppImage) | `/home/<your user name>/.local/share/wwhd/save/` |
+        | **Windows** (release zip) | `data\save` inside the folder you unzipped, e.g. `C:\Games\VR-WakerHD\data\save` |
+        | Built from source | `save` in the folder you start the game from |
+
+        **How to zip it:** Windows: right-click the `save` folder → **Send to → Compressed (zipped) folder**. Linux /
+        SteamOS: right-click → **Compress**. Quest: copy the folder to a PC over USB first, then zip it there.
+  - type: textarea
+    id: savefile
+    attributes:
+      label: Save folder (optional)
+      description: "Drag your zipped save folder here. Also say where you were (island or dungeon, room, which file slot)."
+      placeholder: "save.zip attached, file 1, standing at ..."
+    validations:
+      required: false
+  - type: textarea
+    id: what
+    attributes:
+      label: What happens
+      description: What you see, and what you expected instead. Screenshots or a short video help a lot.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Where it happened (setup, the VR launcher, or where in the game), and what you did right before.
+      placeholder: |
+        1. Go to ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release (e.g. v0.2.1), or the commit if you built it yourself (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Windows
+        - macOS
+        - Linux (x86-64)
+        - Linux (arm64)
+        - Android
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: CPU, GPU and RAM (e.g. "Ryzen 5 5600, RTX 3060, 16 GB" or "M1, 8 GB").
+    validations:
+      required: true
+  - type: dropdown
+    id: renderer
+    attributes:
+      label: Renderer
+      options:
+        - Metal
+        - Vulkan
+        - Don't know
