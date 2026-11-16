@@ -24,7 +24,7 @@ them (the sword is then in the left hand; sticks keep their roles).
 
 | Action | Controller | GamePad button / effect |
 |---|---|---|
-| Move | left stick | left stick (radial dead zone `vr.stickDeadZone`); forward is where you look (`vr.moveDirection=hand`: where the left controller points) |
+| Move | left stick | left stick (radial dead zone `vr.stickDeadZone`); forward is where the left controller points (default; "Move where you look" on, `vr.moveDirection=head`: where you look) |
 | Walking backwards | left stick back (more than 100 degrees from forward; it ends forward of 80 or let go) | Link keeps standing, his model facing the way you face every step (so he and you never disagree), and VR moves him the stick's way, up to 6 game units a step (`vr.moveSpeed` scales it), as far as walls let him; the game gets no stick meanwhile, so it never turns him round. No leg animation (not seen in first person). ZL and lock-on are the game's as always; locked on, on a ladder or swimming, the game's own movement |
 | Turn | right stick left/right | smooth turn (the default) or snap turn (`vr.turn=snap`, `vr.snapDegrees`, default 30) |
 | Sword | swing the sword-hand controller | B (the game picks the cut: combos, finishers as usual) |
@@ -54,14 +54,18 @@ controller side). Holding the button does not repeat: the game reacts to the pre
 Interaction profiles suggested to the runtime: Khronos simple controller, Oculus Touch (Quest, Rift and
 most emulations), Valve Index, HTC Vive, Windows Mixed Reality. Runtimes map other controllers to one of
 these; their binding editors (e.g. SteamVR > Controllers > Manage controller bindings) can change any
-physical binding. The **Valve Index** has no menu button: bind "Menu" in SteamVR's binding editor.
+physical binding. The **Valve Index** has no menu button; its System button (under the trackpad) is kept by SteamVR for its dashboard. The menu is a press of either trackpad, and the System button is bound to it too for a runtime that passes it on (2026-11-15).
 
 **PS VR2 Sense controllers (SteamVR).** SteamVR's OpenXR runtime has no interaction profile for them (2.18: none
 from Sony), so it maps the game's Oculus Touch bindings onto them in compatibility mode: the controllers pose as Touch
 controllers, with Touch models and Touch-shaped poses, and a saved copy of that mapping bound the left "menu" to an
 input the Sense controller does not have and a *touch* of Create to the menu.
-`runtime/assets/steamvr/wwhd_playstation_vr2_sense.json` is a native binding instead (no compatibility mode; the game
-still sees the Touch profile):
+**The VR launcher sets the binding (2026-11-15):** General > "Use the game's PS VR2 controller binding", with SteamVR
+closed. It writes `steamvr/wwhd_psvr2_sense_binding.json` next to the game and points SteamVR's setting for the game
+(`steamvr.vrsettings`, section `system.generated.openxr.the wind waker hd.<exe>`,
+`playstation_vr2_sense_250820_CurrentURL_openxr`) at it, keeping the binding before as `..._PreviousURL_openxr` and the
+settings file before as `steamvr.vrsettings.wwhd-backup`. The binding is the one that works in the headset (the
+developer's PS VR2, SteamVR 2.18.4, Workshop binding 3825041755): Touch compatibility mode, with
 
 | Game action | Left | Right |
 |---|---|---|
@@ -70,16 +74,13 @@ still sees the Touch profile):
 | Stick, stick click | left stick | right stick |
 | Primary (X / A) | Square | Cross |
 | Secondary (Y / B) | Triangle | Circle |
-| Menu | Create (press) | Options (press) |
+| Menu | Create (press or touch) | Create (press or touch) |
 | Poses | the Sense controller's `handgrip` and `openxr_aim` | |
 | Vibration | both | |
 
-SteamVR uses it when the game's binding setting points at it: with SteamVR closed, in
-`~/.local/share/Steam/config/steamvr.vrsettings`, section `system.generated.openxr.the wind waker hd.wwhd`,
-`"playstation_vr2_sense_250820_CurrentURL_openxr" : "file:///<repository>/runtime/assets/steamvr/wwhd_playstation_vr2_sense.json"`.
-Back to another binding: SteamVR > Controllers > Manage controller bindings > The Wind Waker HD, or the value the
-`..._PreviousURL_openxr` key keeps. Players without the repository can take it from there once it is published to
-the Workshop from SteamVR's binding editor. Not yet tried in the headset.
+(`tools/vr_launcher/steamvr_binding.h`; `runtime/assets/steamvr/wwhd_playstation_vr2_sense.json`, an earlier native
+binding never tried in the headset, is not used: its app key is the Linux one.) Back to another binding: SteamVR >
+Controllers > Manage controller bindings > The Wind Waker HD.
 
 Change which GamePad button an action presses with `vr.bind.<action>=<button>`; actions: `mainTrigger`,
 `mainGrip`, `mainPrimary`, `mainSecondary`, `mainStickClick`, `offTrigger`, `offGrip`, `offPrimary`,
@@ -102,7 +103,7 @@ numbers are clamped to the ranges below.
 | `vr.turn` | smooth | snap, smooth | right stick turning |
 | `vr.snapDegrees` | 30 | 10 .. 90 | snap turn angle |
 | `vr.smoothDegreesPerSecond` | 120 | 20 .. 360 | smooth turn speed at full stick |
-| `vr.moveDirection` | head | head, hand | what "forward" on the left stick means |
+| `vr.moveDirection` | hand ("Move where you look" off) | head, hand | what "forward" on the left stick means |
 | `vr.moveSpeed` | 1 | 0.2 .. 1 | left stick scale (the game walks below about half) |
 | `vr.renderScale` | 1 | 0.5 .. 2 | headset image size relative to the runtime's recommendation |
 | `vr.maxHeadOffset` | 1.0 | 0.05 .. 2 m | how far you may lean/walk from Link's body before the view stops (walls stop it sooner) |
@@ -759,3 +760,22 @@ as before. The guard is let go while he attacks: a swing's or a parry's press (A
 after either, so the cut is made standing. Logged: `[vr] shield: raised and locked on: the guard (ZR held)`, `an
 attack: the guard let go for it`, `the locked-on guard ends`. To check in the headset: the parry's prompt still comes
 while he guards locked on. Not yet tried in the headset.
+
+## Controller profiles per headset model (2026-11-13)
+
+Each headset model has its own controller calibration, so a correction for one never moves another's hands
+(`openxr_session.cpp`, `controller_profile` and `apply_controller_calibration`). The model comes from the runtime's
+system name: "Meta Quest 3S" (checked first: its name contains the 3's), "Meta Quest 3", everything else. Its
+calibration turns both controller poses (aim and grip) in their own frame before anything reads them (hands, sword,
+shield, pointers): pitch, yaw and roll in degrees, the right hand's, the left hand mirrored (yaw and roll negated). Held
+poses through a tracking gap are turned the same way.
+
+| Setting | Model | Default |
+|---|---|---|
+| `vr.calibration.quest3.pitch` / `.yaw` / `.roll` | Meta Quest 3 | 0 |
+| `vr.calibration.quest3s.pitch` / `.yaw` / `.roll` | Meta Quest 3S | 0 |
+| `vr.calibration.other.pitch` / `.yaw` / `.roll` | every other headset | 0 |
+
+-90 to 90 degrees each. The log names the model and its values at the start: `[vr] controller profile: Quest 3S
+(vr.calibration.quest3s); calibration pitch 0, yaw 0, roll 0 degrees`. The `[vr] hand pose (left/right)` lines (every
+5 s) give the controller's and the drawn hand's angles a correction is read from.

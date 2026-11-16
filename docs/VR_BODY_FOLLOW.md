@@ -12,7 +12,7 @@ In first-person play, while Link stands, he turns to face where you look once yo
 
 **When the game keeps control:** while it turns him itself, nothing here touches his facing, and following resumes
 when that ends. That covers:
-- walking and running (towards the stick's direction, which is where you look);
+- walking and running (towards the stick's direction: where the left controller points, or where you look with "Move where you look");
 - lock-on;
 - attacks and items;
 - swimming, climbing and hanging;

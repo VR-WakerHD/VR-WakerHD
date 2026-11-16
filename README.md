@@ -491,6 +491,12 @@ history; the VR work is a series of commits on top of its `main` (v0.4.0).
 
 ## Credits
 
+### VR-WakerHD
+
+VR mode by VR-WakerHD (https://github.com/VR-WakerHD/).
+
+- **Game Tester:** [legaiaflame](https://www.youtube.com/@legaiaflame)
+
 ### Original project credits
 
 *(From the original project's README.)*

@@ -1,7 +1,11 @@
+#include <cstdio>
 #include "pod_commands.h"
+#include "crash_track.h"
 #include "handoff_trace.h"
 #include "render_prof.h"
 #include "transfer_wait.h"
+#include <atomic>
+#include <vector>
 #include <algorithm>
 #include <array>
 #include <cstring>
@@ -14,6 +18,159 @@ namespace gfxvk {
 std::mutex& graphics_queue_mutex() {
   static std::mutex m;
   return m;
+}
+// (standalone draw guard, 2026-11-12: a Quest 3S crashed in the Adreno driver's vkCmdDrawIndexed, address 0xf8, as
+// the record worker replayed a draw) a draw replayed into a command buffer that has no graphics pipeline, or for an
+// indexed draw no index buffer, bound since it began is left out and counted, not handed to the driver. Judged only
+// for command buffers whose begin this thread replayed, with nothing recorded into them another way since (a call
+// command, or a drain before direct recording: note_direct_recording); anything else is drawn as before, so a valid
+// draw is never left out. Standalone headsets only; x64 PC builds unchanged
+#if defined(__ANDROID__) || defined(__aarch64__)
+constexpr bool kDrawGuard = true;
+#else
+constexpr bool kDrawGuard = false;
+#endif
+namespace {
+std::atomic<uint64_t> g_directRecording{0};
+std::atomic<uint64_t> g_leftOutNoPipeline{0}, g_leftOutNoIndex{0}, g_leftOutNoPass{0};
+// (2026-11-13) the guard also follows the render pass: a draw with none open in its command buffer (begun and not yet
+// ended, dynamic rendering or a render pass object) is left out too; and what each command buffer has bound, for the
+// crash log's last replayed draw (replay_crash_note)
+struct GuardedCommand {
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  uint64_t epoch = 0;
+  bool known = false, pipeline = false, index = false;
+  bool pass = false, vertex = false, rateMap = false;
+  uint32_t viewMask = 0, colors = 0, depth = 0;
+  uint64_t pipelineHandle = 0, indexHandle = 0, vertexHandle = 0, setHandle = 0;
+};
+// the last draw the replay handed to the driver (or left out), for the crash log: plain atomics, written before each
+// draw, read by the crash handler without locks
+struct LastDraw {
+  std::atomic<uint64_t> cmd{0}, pipeline{0}, index{0}, vertex{0}, set{0}, draws{0};
+  std::atomic<uint32_t> flags{0}, viewMask{0}, colors{0}, count{0};
+};
+LastDraw g_lastDraw;
+enum : uint32_t { kLdKnown = 1, kLdPass = 2, kLdPipeline = 4, kLdIndex = 8, kLdVertex = 16, kLdRateMap = 32,
+                  kLdIndexed = 64, kLdDepth = 128, kLdLeftOut = 256 };
+thread_local std::vector<GuardedCommand> t_guarded;
+GuardedCommand* guarded(VkCommandBuffer cmd) {
+  for (auto& g : t_guarded)
+    if (g.cmd == cmd) return &g;
+  return nullptr;
+}
+void guard_begin(VkCommandBuffer cmd) {
+  GuardedCommand* g = guarded(cmd);
+  if (!g) {
+    if (t_guarded.size() >= 64) t_guarded.erase(t_guarded.begin());
+    t_guarded.push_back({});
+    g = &t_guarded.back();
+  }
+  *g = {};
+  g->cmd = cmd;
+  g->epoch = g_directRecording.load(std::memory_order_acquire);
+  g->known = true;
+}
+void guard_forget(VkCommandBuffer cmd) {
+  if (GuardedCommand* g = guarded(cmd)) g->known = false;
+}
+// true: the draw may go to the driver
+bool guard_draw(VkCommandBuffer cmd, bool indexed, uint32_t count) {
+  const GuardedCommand* g = guarded(cmd);
+  const bool judged = g && g->known && g->epoch == g_directRecording.load(std::memory_order_acquire);
+  uint32_t f = indexed ? kLdIndexed : 0;
+  if (judged)
+    f |= kLdKnown | (g->pass ? kLdPass : 0) | (g->pipeline ? kLdPipeline : 0) | (g->index ? kLdIndex : 0) |
+         (g->vertex ? kLdVertex : 0) | (g->rateMap ? kLdRateMap : 0) | (g->depth ? kLdDepth : 0);
+  const bool ok = !judged || (g->pass && g->pipeline && (!indexed || g->index));
+  if (!ok) {
+    f |= kLdLeftOut;
+    (!g->pass ? g_leftOutNoPass : !g->pipeline ? g_leftOutNoPipeline : g_leftOutNoIndex).fetch_add(1, std::memory_order_relaxed);
+  }
+  g_lastDraw.cmd.store(uint64_t(reinterpret_cast<uintptr_t>(cmd)), std::memory_order_relaxed);
+  g_lastDraw.pipeline.store(judged ? g->pipelineHandle : 0, std::memory_order_relaxed);
+  g_lastDraw.index.store(judged ? g->indexHandle : 0, std::memory_order_relaxed);
+  g_lastDraw.vertex.store(judged ? g->vertexHandle : 0, std::memory_order_relaxed);
+  g_lastDraw.set.store(judged ? g->setHandle : 0, std::memory_order_relaxed);
+  crash_track::note_command(indexed ? 4 : 3, uint64_t(reinterpret_cast<uintptr_t>(cmd)), count, judged ? g->pipelineHandle : 0);
+  g_lastDraw.viewMask.store(judged ? g->viewMask : 0, std::memory_order_relaxed);
+  g_lastDraw.colors.store(judged ? g->colors : 0, std::memory_order_relaxed);
+  g_lastDraw.count.store(count, std::memory_order_relaxed);
+  g_lastDraw.flags.store(f, std::memory_order_relaxed);
+  g_lastDraw.draws.fetch_add(1, std::memory_order_relaxed);
+  return ok;
+}
+}  // namespace
+// (logged by the renderer, draw.cpp: this file is also built into tools without the game's log)
+uint64_t draw_guard_left_out(uint64_t* noPipeline, uint64_t* noPass) {
+  if (noPipeline) *noPipeline = g_leftOutNoPipeline.load(std::memory_order_relaxed);
+  if (noPass) *noPass = g_leftOutNoPass.load(std::memory_order_relaxed);
+  return g_leftOutNoPipeline.load(std::memory_order_relaxed) + g_leftOutNoIndex.load(std::memory_order_relaxed) +
+         g_leftOutNoPass.load(std::memory_order_relaxed);
+}
+// (crash handler, main.cpp) the last draw the record worker replayed: what its command buffer had bound and open.
+// snprintf into a static buffer only (no locks, no allocation)
+void replay_crash_note(int fd, void (*out)(int, const char*, size_t)) {
+  if constexpr (!kDrawGuard) return;
+  static char buf[512];
+  const uint32_t f = g_lastDraw.flags.load(std::memory_order_relaxed);
+  const int n = std::snprintf(
+      buf, sizeof buf,
+      "\n--- the record worker's last replayed draw ---\n%s draw of %u, command buffer %llx (%s): render pass %s "
+      "(view mask %u, %u colour attachments, depth %s, shading rate map %s), graphics pipeline %s %llx, index buffer "
+      "%s %llx, vertex buffers %s%s; %llu draws replayed; left out so far: no pass %llu, no pipeline %llu, no index "
+      "buffer %llu\n",
+      (f & kLdIndexed) ? "indexed" : "plain", g_lastDraw.count.load(std::memory_order_relaxed),
+      (unsigned long long)g_lastDraw.cmd.load(std::memory_order_relaxed), (f & kLdKnown) ? "followed" : "not followed",
+      (f & kLdPass) ? "open" : "NOT open", g_lastDraw.viewMask.load(std::memory_order_relaxed),
+      g_lastDraw.colors.load(std::memory_order_relaxed), (f & kLdDepth) ? "yes" : "no", (f & kLdRateMap) ? "yes" : "no",
+      (f & kLdPipeline) ? "bound" : "NOT bound", (unsigned long long)g_lastDraw.pipeline.load(std::memory_order_relaxed),
+      (f & kLdIndex) ? "bound" : "NOT bound", (unsigned long long)g_lastDraw.index.load(std::memory_order_relaxed),
+      (f & kLdVertex) ? "bound" : "none", (f & kLdLeftOut) ? " (this draw left out)" : "",
+      (unsigned long long)g_lastDraw.draws.load(std::memory_order_relaxed),
+      (unsigned long long)g_leftOutNoPass.load(std::memory_order_relaxed),
+      (unsigned long long)g_leftOutNoPipeline.load(std::memory_order_relaxed),
+      (unsigned long long)g_leftOutNoIndex.load(std::memory_order_relaxed));
+  if (n > 0) out(fd, buf, size_t(n < int(sizeof buf) ? n : int(sizeof buf) - 1));
+  // (crash_track.h, WWHD_VK_CRASH_TRACK=1) the use-after-free check, the pipeline's kind, the commands before
+  if (!crash_track::enabled()) return;
+  auto line = [&](const char* fmt, auto... args) {
+    const int k = std::snprintf(buf, sizeof buf, fmt, args...);
+    if (k > 0) out(fd, buf, size_t(k < int(sizeof buf) ? k : int(sizeof buf) - 1));
+  };
+  const uint64_t frame = crash_track::g_frame.load(std::memory_order_relaxed);
+  auto alive = [&](const char* what, uint64_t h) {
+    if (!h) return;
+    uint32_t kind = 0;
+    const uint64_t at = crash_track::destroyed_frame(h, &kind);
+    if (at == ~uint64_t{0}) line("  %s %llx: not among the last %u destroys\n", what, (unsigned long long)h, crash_track::kDestroyed);
+    else line("  %s %llx: DESTROYED at frame %llu (now %llu, %llu frames ago; kind %u)\n", what, (unsigned long long)h,
+              (unsigned long long)at, (unsigned long long)frame, (unsigned long long)(frame - at), kind);
+  };
+  line("crash tracking (frame %llu):\n", (unsigned long long)frame);
+  const uint64_t p = g_lastDraw.pipeline.load(std::memory_order_relaxed);
+  const uint32_t pf = crash_track::pipeline_flags(p);
+  line("  the pipeline's kind: %s%s (the pass's view mask %u)\n",
+       !(pf & crash_track::kRegistered) ? "not a registered two-eye pipeline (single view)" : "two-eye (multiview)",
+       (pf & crash_track::kShadingRate) ? ", with the shading rate flag" : "", g_lastDraw.viewMask.load(std::memory_order_relaxed));
+  alive("pipeline", p);
+  alive("index buffer", g_lastDraw.index.load(std::memory_order_relaxed));
+  alive("vertex buffer (first)", g_lastDraw.vertex.load(std::memory_order_relaxed));
+  line("  descriptor set (first) %llx\n", (unsigned long long)g_lastDraw.set.load(std::memory_order_relaxed));
+  line("  the last %u commands replayed (oldest first; 1 pipeline, 2 index buffer, 3 draw, 4 indexed draw, 6 end "
+       "rendering, 18 vertex buffers, 19 descriptor sets, 24 begin rendering, 26/27 render pass, 28 begin):\n",
+       crash_track::kCommands);
+  const uint32_t end = crash_track::g_commandAt.load(std::memory_order_relaxed);
+  for (uint32_t i = 0; i < crash_track::kCommands; ++i) {
+    const crash_track::Command& c = crash_track::g_commands[(end + i) % crash_track::kCommands];
+    const uint32_t op = c.opcode.load(std::memory_order_acquire);
+    if (!op) continue;
+    line("    op %u cmd %llx a %llx b %llx\n", op, (unsigned long long)c.cmd.load(std::memory_order_relaxed),
+         (unsigned long long)c.a.load(std::memory_order_relaxed), (unsigned long long)c.b.load(std::memory_order_relaxed));
+  }
+}
+void note_direct_recording() {
+  if constexpr (kDrawGuard) g_directRecording.fetch_add(1, std::memory_order_acq_rel);
 }
 namespace {
 struct Header {
@@ -569,7 +726,12 @@ bool PodCommands::vkCmdBeginRendering(VkCommandBuffer cmd,
   if (!consume(1, sizeof(cmd) + sizeof(VkRenderingInfo) + sizeof(uint32_t)))
     return reject(PodFailureReason::ByteBudgetOrOverflow);
   if (!info) return reject(PodFailureReason::InvalidInput);
-  if (info->pNext) return reject(PodFailureReason::UnsupportedPNext);
+  // (foveation.cpp) the one pNext a pass may carry: its fragment shading rate map, alone
+  const auto* rateMap = static_cast<const VkRenderingFragmentShadingRateAttachmentInfoKHR*>(info->pNext);
+  if (rateMap && (rateMap->sType != VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR || rateMap->pNext))
+    return reject(PodFailureReason::UnsupportedPNext);
+  if (!consume(rateMap ? 1 : 0, sizeof(VkRenderingFragmentShadingRateAttachmentInfoKHR)))
+    return reject(PodFailureReason::ByteBudgetOrOverflow);
   if (!consume(info->colorAttachmentCount, sizeof(VkRenderingAttachmentInfo)) ||
       !consume(info->pDepthAttachment ? 1 : 0,
                sizeof(VkRenderingAttachmentInfo)) ||
@@ -585,6 +747,7 @@ bool PodCommands::vkCmdBeginRendering(VkCommandBuffer cmd,
     Writer w(limits_.maxPayloadBytes);
     w.put(cmd);
     auto copy = *info;
+    copy.pNext = nullptr;
     copy.pColorAttachments = nullptr;
     copy.pDepthAttachment = nullptr;
     copy.pStencilAttachment = nullptr;
@@ -594,13 +757,16 @@ bool PodCommands::vkCmdBeginRendering(VkCommandBuffer cmd,
                     ((info->pDepthAttachment &&
                       info->pDepthAttachment == info->pStencilAttachment)
                          ? 4u
-                         : 0u);
+                         : 0u) |
+                    (rateMap ? 8u : 0u);
     w.put(mask);
     w.array(info->colorAttachmentCount, info->pColorAttachments);
     if (mask & 1)
       w.put(*info->pDepthAttachment);
     if (mask & 2)
       w.put(*info->pStencilAttachment);
+    if (mask & 8)
+      w.put(*rateMap);
     if (!w.valid) return reject(w.failure);
     return append(24, w.view());
   } catch (const std::bad_alloc &) {
@@ -737,8 +903,16 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto pipeline = r.get<VkPipeline>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+              if (GuardedCommand* g = guarded(cmd)) {
+                g->pipeline = pipeline != VK_NULL_HANDLE;
+                g->pipelineHandle = uint64_t(reinterpret_cast<uintptr_t>(pipeline));
+              }
+          crash_track::note_command(1, uint64_t(reinterpret_cast<uintptr_t>(cmd)), uint64_t(reinterpret_cast<uintptr_t>(pipeline)), point);
           gfxvk::vkCmdBindPipeline(cmd, point, pipeline);
+        }
         break;
       }
       case 2: {
@@ -748,8 +922,15 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto type = r.get<VkIndexType>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd)) {
+              g->index = buffer != VK_NULL_HANDLE;
+              g->indexHandle = uint64_t(reinterpret_cast<uintptr_t>(buffer));
+            }
+          crash_track::note_command(2, uint64_t(reinterpret_cast<uintptr_t>(cmd)), uint64_t(reinterpret_cast<uintptr_t>(buffer)), offset);
           gfxvk::vkCmdBindIndexBuffer(cmd, buffer, offset, type);
+        }
         break;
       }
       case 3: {
@@ -760,7 +941,7 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto firstInstance = r.get<uint32_t>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute && (!kDrawGuard || guard_draw(cmd, false, vertices)))
           gfxvk::vkCmdDraw(cmd, vertices, instances, firstVertex,
                            firstInstance);
         break;
@@ -774,7 +955,7 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto firstInstance = r.get<uint32_t>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute && (!kDrawGuard || guard_draw(cmd, true, indices)))
           gfxvk::vkCmdDrawIndexed(cmd, indices, instances, firstIndex,
                                   vertexOffset, firstInstance);
         break;
@@ -794,8 +975,12 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto cmd = r.get<VkCommandBuffer>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd)) g->pass = false, g->rateMap = false;
+          crash_track::note_command(6, uint64_t(reinterpret_cast<uintptr_t>(cmd)), 0, 0);
           gfxvk::vkCmdEndRendering(cmd);
+        }
         break;
       }
       case 7: {
@@ -943,9 +1128,17 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto offsets = r.array<VkDeviceSize>(count);
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd)) {
+              g->vertex = count > 0;
+              if (count) g->vertexHandle = uint64_t(reinterpret_cast<uintptr_t>(data(buffers)[0]));
+            }
+          crash_track::note_command(18, uint64_t(reinterpret_cast<uintptr_t>(cmd)),
+                                    count ? uint64_t(reinterpret_cast<uintptr_t>(data(buffers)[0])) : 0, count);
           gfxvk::vkCmdBindVertexBuffers(cmd, first, count, data(buffers),
                                         data(offsets));
+        }
         break;
       }
       case 19: {
@@ -959,10 +1152,16 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto offsets = r.array<uint32_t>(offsetCount);
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd); g && count && point == VK_PIPELINE_BIND_POINT_GRAPHICS && first == 0)
+              g->setHandle = uint64_t(reinterpret_cast<uintptr_t>(data(sets)[0]));
+          crash_track::note_command(19, uint64_t(reinterpret_cast<uintptr_t>(cmd)),
+                                    count ? uint64_t(reinterpret_cast<uintptr_t>(data(sets)[0])) : 0, first);
           gfxvk::vkCmdBindDescriptorSets(cmd, point, layout, first, count,
                                          data(sets), offsetCount,
                                          data(offsets));
+        }
         break;
       }
       case 20: {
@@ -1021,7 +1220,7 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto info = r.get<VkRenderingInfo>();
         auto mask = r.get<uint32_t>();
         if (info.pNext || info.pColorAttachments || info.pDepthAttachment ||
-            info.pStencilAttachment || mask > 7 ||
+            info.pStencilAttachment || mask > 15 ||
             ((mask & 4) && ((mask & 3) != 3)))
           throw std::runtime_error("invalid rendering payload");
         auto colors =
@@ -1031,6 +1230,13 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
           depth = r.get<VkRenderingAttachmentInfo>();
         if (mask & 2)
           stencil = r.get<VkRenderingAttachmentInfo>();
+        VkRenderingFragmentShadingRateAttachmentInfoKHR rateMap{};
+        if (mask & 8) {
+          rateMap = r.get<VkRenderingFragmentShadingRateAttachmentInfoKHR>();
+          if (rateMap.sType != VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR || rateMap.pNext)
+            throw std::runtime_error("invalid shading rate map payload");
+          info.pNext = &rateMap;
+        }
         if ((execute && !chains(info.colorAttachmentCount, data(colors))) ||
             ((mask & 1) && depth.pNext) || ((mask & 2) && stencil.pNext))
           throw std::runtime_error("invalid attachment chain");
@@ -1040,8 +1246,19 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
             (mask & 4) ? &depth : ((mask & 2) ? &stencil : nullptr);
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd)) {
+              g->pass = true;
+              g->viewMask = info.viewMask;
+              g->colors = info.colorAttachmentCount;
+              g->depth = (mask & 1) ? 1u : 0u;
+              g->rateMap = (mask & 8) != 0;
+            }
+          crash_track::note_command(24, uint64_t(reinterpret_cast<uintptr_t>(cmd)), info.viewMask,
+                                    info.colorAttachmentCount | ((mask & 8) ? 0x100u : 0u) | ((mask & 1) ? 0x200u : 0u));
           gfxvk::vkCmdBeginRendering(cmd, &info);
+        }
         break;
       }
       case 25: {
@@ -1079,16 +1296,24 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto contents = r.get<VkSubpassContents>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd)) g->pass = true, g->viewMask = 0, g->rateMap = false;
+          crash_track::note_command(26, uint64_t(reinterpret_cast<uintptr_t>(cmd)), 0, 0);
           gfxvk::vkCmdBeginRenderPass(cmd, &info, contents);
+        }
         break;
       }
       case 27: {
         auto cmd = r.get<VkCommandBuffer>();
         if (r.remaining)
           throw std::runtime_error("trailing POD payload");
-        if (execute)
+        if (execute) {
+          if constexpr (kDrawGuard)
+            if (GuardedCommand* g = guarded(cmd)) g->pass = false;
+          crash_track::note_command(27, uint64_t(reinterpret_cast<uintptr_t>(cmd)), 0, 0);
           gfxvk::vkCmdEndRenderPass(cmd);
+        }
         break;
       }
       case 28: {
@@ -1101,6 +1326,7 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
               VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
           info.flags = flags;
           checked(gfxvk::vkBeginCommandBuffer(cmd, &info));
+          if constexpr (kDrawGuard) guard_begin(cmd);
         }
         break;
       }
@@ -1116,6 +1342,7 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         if (r.remaining)
           throw std::runtime_error("trailing submit payload");
         if (execute) {
+          if constexpr (kDrawGuard) guard_forget(cmd);
           checked(gfxvk::vkEndCommandBuffer(cmd));
           checked(gfxvk::vkResetFences(device, 1, &fence));
           std::array<VkSemaphore, 3> waits{}, signals{};
@@ -1160,7 +1387,10 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
         auto bytes = r.array<std::byte>(size);
         if (r.remaining)
           throw std::runtime_error("trailing call payload");
-        if (execute) fn(cmd, bytes.data());
+        if (execute) {
+          if constexpr (kDrawGuard) guard_forget(cmd);  // (a call may bind anything)
+          fn(cmd, bytes.data());
+        }
         break;
       }
       default:
@@ -1181,3 +1411,6 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
       if (opcodeCounts[opcode]) handoff_trace::emit_worker(handoff_trace::Kind::OpcodeInventory, opcode, opcodeCounts[opcode]);
 }
 } // namespace gfxvk
+
+// (main.cpp's crash handler, through a weak symbol: the game is also built without this renderer)
+extern "C" void wwhd_replay_crash_note(int fd, void (*out)(int, const char*, size_t)) { gfxvk::replay_crash_note(fd, out); }

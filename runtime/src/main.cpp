@@ -68,6 +68,7 @@
 #include "mods/player_models.h"
 #ifdef __ANDROID__
 #include "platform/android_code_mods.h"
+#include <jni.h>
 #endif
 #include "mods/save_backup.h"
 #include "mods/save_folder.h"
@@ -123,6 +124,8 @@ extern "C" void __llvm_profile_set_filename(const char*);
 static void crash_out(int fd, const char* s, size_t n) { crash_context::redact(fd, {s,n}, crash_raw); }
 static void crash_log_only(int fd, const char* s, size_t n) { crash_context::redact(fd, {s,n}, crash_log_raw); }
 extern "C" void wwhd_compile_journal_on_crash() __attribute__((weak));  // gfx/vulkan/compile_journal.cpp
+// gfx/vulkan/pod_commands.cpp: the record worker's last replayed draw, what its command buffer had bound and open
+extern "C" void wwhd_replay_crash_note(int fd, void (*out)(int, const char*, size_t)) __attribute__((weak));
 
 static void crash_handler(int sig, siginfo_t* si, void* uctx) {
     // a crash while compiling a shader or pipeline: noted so the next start leaves it out (compile_journal.h)
@@ -186,6 +189,7 @@ static void crash_handler(int sig, siginfo_t* si, void* uctx) {
     }
     crash_addr::host_backtrace(fd, crash_out, uctx);
     crash_context::note(fd, crash_out);
+    if (wwhd_replay_crash_note) wwhd_replay_crash_note(fd, crash_out);  // (the record worker's last draw: pod_commands.cpp)
     crashrec::crash_note(fd, crash_out);
     exception_report::note(fd, crash_out);
     if (fd >= 0) {
@@ -479,7 +483,7 @@ static void enter_data_folder(int argc, char** argv) {
 extern "C" void synthetic_game_frame(Cpu*, PpcFunc);
 
 #ifdef WWHD_VR
-namespace vr { int refresh_probe_main(); }
+namespace vr { int refresh_probe_main(const char* out); }
 #endif
 namespace gfxvk::ngx_vk { int probe_main(); }
 int main(int argc, char** argv) {
@@ -490,8 +494,16 @@ int main(int argc, char** argv) {
 #ifdef WWHD_VR
     // --vr-refresh-probe: the headset's refresh rate for the VR launcher's Detect Headset, then exit, with nothing else
     // started and no log file written (vr/vr_probe.cpp)
+    // (Android: --vr-refresh-probe-out <file>, where the launcher reads the answer; vr_probe.cpp)
     for (int i = 1; i < argc; ++i)
-        if (!strcmp(argv[i], "--vr-refresh-probe")) return vr::refresh_probe_main();
+        if (!strcmp(argv[i], "--vr-refresh-probe")) {
+            const char* out = nullptr;
+#ifdef __ANDROID__
+            for (int j = 1; j + 1 < argc; ++j)
+                if (!strcmp(argv[j], "--vr-refresh-probe-out")) out = argv[j + 1];
+#endif
+            return vr::refresh_probe_main(out);
+        }
 #endif
     // --dlss-probe: which NVIDIA DLSS features this PC offers, for the VR launcher's Detect PC (writes
     // dlss-status.ini), then exit (gfx/vulkan/ngx_vk.h)
@@ -903,6 +915,30 @@ int main(int argc, char** argv) {
 
     LoadedModule m{};
     std::string rpx = randomizer::game_rpx(config::game_dir);
+#ifdef __ANDROID__
+    // (2026-11-12, a Quest 3S with no game extracted yet: "FATAL: cannot load game/code/cking.rpx", a crash at boot)
+    // no game files: the app's "game files missing" screen (WwhdActivity.gameFilesMissing), which asks the player to
+    // extract the game disc and opens the extract screen; this process ends quietly, with no crash report
+    if (std::error_code missing; !std::filesystem::is_regular_file(rpx, missing)) {
+        LOG("[boot] no game files: %s not found; asking the player to extract the game disc", rpx.c_str());
+        log_flush();
+        if (auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv())) {
+            if (auto activity = static_cast<jobject>(SDL_GetAndroidActivity())) {
+                jclass cls = env->GetObjectClass(activity);
+                jmethodID method = env->GetMethodID(cls, "gameFilesMissing", "(Ljava/lang/String;)V");
+                if (method) {
+                    jstring where = env->NewStringUTF(rpx.c_str());
+                    env->CallVoidMethod(activity, method, where);
+                    env->DeleteLocalRef(where);
+                }
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                env->DeleteLocalRef(cls);
+                env->DeleteLocalRef(activity);
+                if (method) _exit(0);
+            }
+        }
+    }
+#endif
     if (!load_rpx(rpx, m)) fatal("cannot load %s", rpx.c_str());
     if (m.entry != g_recomp_entry_point) fatal("%s does not match the recompiled code", rpx.c_str());
     LOG("[boot] loaded %s (%s build, title %s): entry %08X sda %08X sda2 %08X data end %08X", rpx.c_str(),

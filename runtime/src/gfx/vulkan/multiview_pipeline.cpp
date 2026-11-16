@@ -2,6 +2,7 @@
 // Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
 // A guest pipeline's multiview twin: multiview_pipeline.h.
+#include "crash_track.h"
 #include "multiview_pipeline.h"
 #include "stereo_switches.h"
 
@@ -121,8 +122,22 @@ bool make(Job& job, std::string& error) {
     for (int st = 0; st < 2; ++st) state.set_stage_module(st, modules[st]);
     VkGraphicsPipelineCreateInfo info = *state.get();
     info.layout = out.layout;
+    // (foveation.cpp) usable in a pass with a shading rate map (VUID-vkCmdDraw-imageView-06183; and without one), and
+    // taking its rate from the map: the pipeline's own 1x1, the map's replacing it (without this state the map is ignored)
+    VkPipelineFragmentShadingRateStateCreateInfoKHR shadingRate{VK_STRUCTURE_TYPE_PIPELINE_FRAGMENT_SHADING_RATE_STATE_CREATE_INFO_KHR};
+    if (R.fsr) {
+        info.flags |= VK_PIPELINE_CREATE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR;
+        shadingRate.fragmentSize = {1, 1};
+        shadingRate.combinerOps[0] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_KEEP_KHR;
+        shadingRate.combinerOps[1] = VK_FRAGMENT_SHADING_RATE_COMBINER_OP_REPLACE_KHR;
+        shadingRate.pNext = info.pNext;
+        info.pNext = &shadingRate;
+    }
     // (no pipeline cache: the renderer's is not synchronized for another thread)
     const VkResult result = vkCreateGraphicsPipelines(R.device, VK_NULL_HANDLE, 1, &info, nullptr, &out.pipeline);
+    if (result == VK_SUCCESS)  // (crash_track.h: what kind of pipeline a crashed draw had bound)
+        crash_track::note_pipeline(uint64_t(reinterpret_cast<uintptr_t>(out.pipeline)),
+                                   crash_track::kMultiview | (R.fsr ? crash_track::kShadingRate : 0u));
     if (result != VK_SUCCESS) {
         error = "vkCreateGraphicsPipelines " + std::to_string(int(result));
         out.pipeline = VK_NULL_HANDLE;

@@ -38,6 +38,11 @@ int step_frames();      // 40 fps: frames the next logic step has before the one
 void lock_vsync_to_display(int64_t period);
 void delay_vsync_grid(int64_t ns);
 int64_t vsync_period_ns();  // 16'683'333 (59.94 Hz), or the headset's
+// swaps the render thread has finished executing (OP_SWAP): during a swap's own execution (render::swap, VR's
+// frame_begin among it) that swap is this + 1. VR pairs its display time with that number (vr.h set_real_frame_display)
+uint64_t swaps_executed();
+// swaps the game has issued (GX2SwapScanBuffers); the game thread's own count
+uint64_t swaps_issued();
 #ifdef __ANDROID__
 // The XR session first gates new presents, then waits for existing surface writes.
 void quiesce_quest_presentation();

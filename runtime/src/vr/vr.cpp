@@ -56,7 +56,99 @@ Config config() {
 }
 
 namespace {
+std::atomic<int> g_desktopView{0};  // vr.desktopView, and bit 8 vr.desktopViewFill (publish_desktop_view)
+void publish_desktop_view(const Config& c) {
+    const int view = c.desktopView >= 0 && c.desktopView <= 5 ? c.desktopView : 0;
+    g_desktopView.store(view | (c.desktopViewFill ? 8 : 0), std::memory_order_relaxed);
+}
+}  // namespace
+int desktop_view(bool& fill) {
+    const int v = g_desktopView.load(std::memory_order_relaxed);
+    fill = (v & 8) != 0;
+    return v & 7;
+}
+
+namespace {
 std::atomic<float> g_linkArm{kLinkArmUnits};  // shoulder to wrist in game units, as measured in the HD model
+}
+namespace {
+std::atomic<float> g_viewTurnRate{0.0f};
+}
+std::atomic<int64_t> g_viewTurnRateFor{0};
+std::mutex g_viewTurnRateMutex;
+void set_view_turn_rate(float radiansPerSecond, int64_t forDisplayTime) {
+    std::lock_guard<std::mutex> l(g_viewTurnRateMutex);
+    g_viewTurnRate.store(radiansPerSecond, std::memory_order_relaxed);
+    g_viewTurnRateFor.store(forDisplayTime, std::memory_order_relaxed);
+}
+float view_turn_rate() { return g_viewTurnRate.load(std::memory_order_relaxed); }
+float view_turn_rate_for(int64_t displayTime) {
+    std::lock_guard<std::mutex> l(g_viewTurnRateMutex);
+    return displayTime && g_viewTurnRateFor.load(std::memory_order_relaxed) == displayTime ? g_viewTurnRate.load(std::memory_order_relaxed) : 0.0f;
+}
+namespace {
+std::mutex g_viewVelocityMutex;
+Vec3 g_viewVelocity;
+}
+namespace {
+// the last real frame's display time and its swap, written together by the render thread and read together by the
+// game thread: a sequence count, odd while a write is under way (a reader that sees it change reads again; no lock,
+// nobody waits)
+std::atomic<uint64_t> g_realFrameSeq{0};
+std::atomic<int64_t> g_realFrameDisplay{0};
+std::atomic<uint64_t> g_realFrameSwap{0};
+}
+void set_real_frame_display(int64_t t, uint64_t swap) {
+    const uint64_t s = g_realFrameSeq.load(std::memory_order_relaxed);
+    g_realFrameSeq.store(s + 1, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+    g_realFrameDisplay.store(t, std::memory_order_relaxed);
+    g_realFrameSwap.store(swap, std::memory_order_relaxed);
+    g_realFrameSeq.store(s + 2, std::memory_order_release);
+}
+static std::atomic<bool> g_handsLayerOn{false};
+void set_hands_layer_on(bool on) { g_handsLayerOn.store(on, std::memory_order_relaxed); }
+bool hands_layer_on() { return g_handsLayerOn.load(std::memory_order_relaxed); }
+static std::atomic<int> g_handsAbMode{-1};
+void set_hands_ab_mode(int mode) { g_handsAbMode.store(mode, std::memory_order_relaxed); }
+int hands_ab_mode() { return g_handsAbMode.load(std::memory_order_relaxed); }
+int64_t real_frame_display(uint64_t* swap) {
+    // (a write is two stores; read again only a few times: the game thread never waits on the render thread here. Past
+    // that, no swap is given and display_time counts as it did before the pairing)
+    for (int tries = 0; tries < 16; ++tries) {
+        const uint64_t s1 = g_realFrameSeq.load(std::memory_order_acquire);
+        const int64_t t = g_realFrameDisplay.load(std::memory_order_relaxed);
+        const uint64_t w = g_realFrameSwap.load(std::memory_order_relaxed);
+        std::atomic_thread_fence(std::memory_order_acquire);
+        if (!(s1 & 1) && g_realFrameSeq.load(std::memory_order_relaxed) == s1) {
+            if (swap) *swap = w;
+            return t;
+        }
+    }
+    if (swap) *swap = 0;
+    return g_realFrameDisplay.load(std::memory_order_relaxed);
+}
+void set_view_velocity(Vec3 v) {
+    std::lock_guard<std::mutex> l(g_viewVelocityMutex);
+    g_viewVelocity = v;
+}
+namespace {
+Vec3 g_turnPivot;
+float g_turnPivotLimit = 0;
+bool g_haveTurnPivot = false;
+}
+void set_turn_pivot(Vec3 origin, float limit) {
+    std::lock_guard<std::mutex> l(g_viewVelocityMutex);
+    g_turnPivot = origin, g_turnPivotLimit = limit, g_haveTurnPivot = true;
+}
+bool turn_pivot(Vec3& origin, float& limit) {
+    std::lock_guard<std::mutex> l(g_viewVelocityMutex);
+    origin = g_turnPivot, limit = g_turnPivotLimit;
+    return g_haveTurnPivot;
+}
+Vec3 view_velocity() {
+    std::lock_guard<std::mutex> l(g_viewVelocityMutex);
+    return g_viewVelocity;
 }
 float world_scale() {
     const Config c = config();
@@ -74,6 +166,7 @@ void set_config(const Config& c) {
         std::lock_guard<std::mutex> lock(g_mutex);
         g_config = v;
     }
+    publish_desktop_view(v);
     for (const auto& [k, value] : to_kv(v)) hostui::set(k.c_str(), value);
 }
 
@@ -99,6 +192,7 @@ void load_settings() {
         if (mainTrigger != b.button[int(Action::MainTrigger)])
             LOG("[vr] settings format %d: the sword hand's trigger no longer presses A (it opens the item wheel)", format);
     }
+    publish_desktop_view(c);
     std::lock_guard<std::mutex> lock(g_mutex);
     g_config = c;
     g_bindings = b;
@@ -249,10 +343,51 @@ bool views(uint32_t id, xr::Views& out, double* gameTime) {
     if (gameTime) *gameTime = slot.gameTime;
     return true;
 }
-void set_frame_views(uint32_t id) { g_frameViews = id; }
-uint32_t take_frame_views() { return g_frameViews.exchange(0); }
+// (diagnostics, 2026-11-12, "[vr] views per swap (10 s)") how many camera updates stored views between two swaps: one is
+// the frame's own; none sends the frame without views (the render thread locates a pose the picture was not drawn with);
+// two or more sends the last one's, while the frame's pictures were drawn with an earlier camera (a headset sequence
+// capture: a real frame's picture 4 degrees, one game frame of stick turn, short of the heading sent with it)
+namespace {
+std::atomic<uint64_t> g_viewsSet{0};
+}
+void set_frame_views(uint32_t id) {
+    g_frameViews = id;
+    g_viewsSet.fetch_add(1, std::memory_order_relaxed);
+}
+uint32_t take_frame_views() {
+    static uint64_t lastSet = 0, swaps = 0, none = 0, one = 0, more = 0, most = 0;
+    static auto since = std::chrono::steady_clock::now();
+    const uint64_t set = g_viewsSet.load(std::memory_order_relaxed), n = set - lastSet;
+    lastSet = set;
+    ++swaps;
+    if (n == 0) ++none;
+    else if (n == 1) ++one;
+    else ++more, most = std::max(most, n);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(10)) {
+        LOG("[vr] views per swap (10 s): %llu swaps; %llu with their own camera's views, %llu with none (a pose located "
+            "afterwards), %llu with two or more camera updates since the last swap (%llu at most: the last one's views "
+            "sent)", (unsigned long long)swaps, (unsigned long long)one, (unsigned long long)none, (unsigned long long)more,
+            (unsigned long long)most);
+        swaps = none = one = more = most = 0;
+        since = now;
+    }
+    return g_frameViews.exchange(0);
+}
 void set_render_views(uint32_t id) { g_renderViews = id; }
 uint32_t render_views() { return g_renderViews.load(); }
+
+namespace {
+std::atomic<float> g_fovScale{1.0f};
+}
+float fov_scale() { return g_fovScale.load(std::memory_order_relaxed); }
+void latch_fov_scale() {
+    float s = 1.0f;
+    if (!kPcVrBuild) s = std::clamp(std::round(config().fieldOfView * 20.0f) / 20.0f, 0.75f, 1.0f);
+    g_fovScale.store(s, std::memory_order_relaxed);
+    LOG("[vr] field of view: %.0f%% of the headset's%s", double(s * 100.0f),
+        kPcVrBuild ? " (always the whole field in PC VR)" : s < 1.0f ? " (vr.fieldOfView: fewer pixels, the edges black)" : "");
+}
 
 float fov_margin() {
     static const float m = [] {

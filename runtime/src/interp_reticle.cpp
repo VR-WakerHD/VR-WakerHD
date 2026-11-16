@@ -54,7 +54,9 @@ extern "C" void hook_020CBB70(Cpu* c) {
     if (!interp::enabled() && !tracing()) return f_020CBB70_orig(c);
     scoped(c, int(c->r[5]), f_020CBB70_orig);
 }
+bool interp_vr_star_project(Cpu* c, void (*orig)(Cpu*));  // interp.cpp: dKyr_drawStar's projections in VR
 extern "C" void hook_025F1018(Cpu* c) {
+    if (interp_vr_star_project(c, f_025F1018_orig)) return;
     if (!packet) {
         f_025F1018_orig(c);
         return;

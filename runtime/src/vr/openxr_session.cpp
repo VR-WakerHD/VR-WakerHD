@@ -27,6 +27,8 @@
 #include "vr_platform.h"
 #include "vr.h"
 #include "vr_framesynth.h"
+#include "vr_laser.h"       // (kLaserWidth: made with the eyes' swapchains)
+#include "vr_wrist_hud.h"   // (kWristHudWidth: made with the eyes' swapchains)
 
 namespace vr::xr {
 namespace {
@@ -188,9 +190,13 @@ bool Session::init(const std::string& appName) {
     layerSettingsExt_ = std::any_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
         return !std::strcmp(e.extensionName, XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
     });
+    layerResolutionExt_ = std::any_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
+        return !std::strcmp(e.extensionName, XR_META_RECOMMENDED_LAYER_RESOLUTION_EXTENSION_NAME);
+    });
 #endif
     std::vector<const char*> enabled = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
     if (layerSettingsExt_) enabled.push_back(XR_FB_COMPOSITION_LAYER_SETTINGS_EXTENSION_NAME);
+    if (layerResolutionExt_) enabled.push_back(XR_META_RECOMMENDED_LAYER_RESOLUTION_EXTENSION_NAME);
     LOG("[vr] Quest Super Resolution (XR_FB_composition_layer_settings): %s", layerSettingsExt_ ? "offered" : "not offered");
     {
         // frame synthesis and depth (docs/VR_FRAME_SYNTHESIS.md, vr_framesynth.h): what the runtime offers, chosen by
@@ -206,7 +212,13 @@ bool Session::init(const std::string& appName) {
 #if defined(__ANDROID__) || defined(__aarch64__)
         caps.standalone = true;
 #endif
-        const framesynth::Choice choice = framesynth::choose(config().frameSynthesis, caps);
+        framesynth::Choice choice = framesynth::choose(config().frameSynthesis, caps);
+        // (movement smoothing, vr.movementSmoothing) depth for the runtime's reprojection where nothing else sends it and
+        // the runtime takes it: without it a runtime moves a frame shown again as if everything were far away
+        if (choice.backend == framesynth::Backend::None && !choice.depth && caps.depth && config().movementSmoothing) {
+            choice.depth = true;
+            choice.why = "depth alone (XR_KHR_composition_layer_depth), for movement smoothing (vr.movementSmoothing)";
+        }
         synthBackend_ = int(choice.backend);
         synthExt_ = choice.backend == framesynth::Backend::ExtFrameSynthesis;
         spaceWarpExt_ = choice.backend == framesynth::Backend::FbSpaceWarp;
@@ -236,6 +248,13 @@ bool Session::init(const std::string& appName) {
         return !std::strcmp(e.extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
     });
     if (perfSettingsExt_) enabled.push_back(XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
+    // (poll_perf_metrics) the runtime's own GPU and CPU counters, wherever offered (a Quest, SteamVR on PC)
+    // (WWHD_VR_PERF_METRICS=0: not enabled at all, for A/B runs against a build without them)
+    static const bool perfMetricsOff = [] { const char* e = std::getenv("WWHD_VR_PERF_METRICS"); return e && *e == '0'; }();
+    perfMetricsExt_ = !perfMetricsOff && std::any_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
+        return !std::strcmp(e.extensionName, XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
+    });
+    if (perfMetricsExt_) enabled.push_back(XR_META_PERFORMANCE_METRICS_EXTENSION_NAME);
     XrInstanceCreateInfo ci{XR_TYPE_INSTANCE_CREATE_INFO};
 #ifdef __ANDROID__
     const bool androidCreate = std::any_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
@@ -323,6 +342,14 @@ bool Session::init(const std::string& appName) {
     }
     LOG("[vr] refresh rate selection (XR_FB_display_refresh_rate): %s; curved menus (XR_KHR_composition_layer_cylinder): %s",
         refreshRateExt_ ? "available" : "not offered by the runtime", cylinderExt_ ? "available" : "not offered");
+    if (layerResolutionExt_) {
+        gipa_(instance_, "xrGetRecommendedLayerResolutionMETA",
+              reinterpret_cast<PFN_xrVoidFunction*>(&xrGetRecommendedLayerResolutionMETA_));
+        layerResolutionExt_ = xrGetRecommendedLayerResolutionMETA_ != nullptr;
+    }
+    LOG("[vr] dynamic resolution query (XR_META_recommended_layer_resolution): %s",
+        layerResolutionExt_ ? "on: asked each frame, not followed (unlocks the GPU's faster levels on a Quest 3)"
+                            : "not offered");
     if (perfSettingsExt_) {
         gipa_(instance_, "xrPerfSettingsSetPerformanceLevelEXT",
               reinterpret_cast<PFN_xrVoidFunction*>(&xrPerfSettingsSetPerformanceLevelEXT_));
@@ -331,6 +358,17 @@ bool Session::init(const std::string& appName) {
             perfSettingsExt_ ? "available: Boost while the game is stalled (loads, shaders), else Sustained High"
                              : "not loadable");
     }
+    if (perfMetricsExt_) {
+        gipa_(instance_, "xrEnumeratePerformanceMetricsCounterPathsMETA",
+              reinterpret_cast<PFN_xrVoidFunction*>(&xrEnumeratePerformanceMetricsCounterPathsMETA_));
+        gipa_(instance_, "xrSetPerformanceMetricsStateMETA", reinterpret_cast<PFN_xrVoidFunction*>(&xrSetPerformanceMetricsStateMETA_));
+        gipa_(instance_, "xrQueryPerformanceMetricsCounterMETA",
+              reinterpret_cast<PFN_xrVoidFunction*>(&xrQueryPerformanceMetricsCounterMETA_));
+        perfMetricsExt_ = xrEnumeratePerformanceMetricsCounterPathsMETA_ && xrSetPerformanceMetricsStateMETA_ &&
+                          xrQueryPerformanceMetricsCounterMETA_;
+    }
+    LOG("[vr] the runtime's GPU and CPU counters (XR_META_performance_metrics): %s",
+        perfMetricsExt_ ? "available: read each second, logged every 10 s" : "not offered");
 #ifdef __ANDROID__
     if (threadSettingsExt_) {
         gipa_(instance_, "xrSetAndroidApplicationThreadKHR",
@@ -376,6 +414,25 @@ bool Session::init(const std::string& appName) {
         quest_ = name.find("quest") != std::string::npos ||
                  (name.find("steamvr") != std::string::npos && name.find("oculus") != std::string::npos);
         if (const char* e = std::getenv("WWHD_VR_QUEST_FIXES")) quest_ = std::atoi(e) != 0;
+        // (2026-11-13) the controller profile: each Quest model its own calibration, so a correction for one never moves
+        // another's hands. "Meta Quest 3S" checked before "Meta Quest 3" (the 3S's name contains the 3's)
+        controllerModel_ = name.find("quest 3s") != std::string::npos ? ControllerModel::Quest3S
+                           : name.find("quest 3") != std::string::npos ? ControllerModel::Quest3
+                                                                         : ControllerModel::Other;
+        {
+            const Config& cfg = config();
+            const char* model = controllerModel_ == ControllerModel::Quest3S ? "Quest 3S (vr.calibration.quest3s)"
+                                : controllerModel_ == ControllerModel::Quest3 ? "Quest 3 (vr.calibration.quest3)"
+                                                                              : "other (vr.calibration.other)";
+            const float p = controllerModel_ == ControllerModel::Quest3S ? cfg.calibQuest3SPitch
+                            : controllerModel_ == ControllerModel::Quest3 ? cfg.calibQuest3Pitch : cfg.calibOtherPitch;
+            const float y = controllerModel_ == ControllerModel::Quest3S ? cfg.calibQuest3SYaw
+                            : controllerModel_ == ControllerModel::Quest3 ? cfg.calibQuest3Yaw : cfg.calibOtherYaw;
+            const float r = controllerModel_ == ControllerModel::Quest3S ? cfg.calibQuest3SRoll
+                            : controllerModel_ == ControllerModel::Quest3 ? cfg.calibQuest3Roll : cfg.calibOtherRoll;
+            LOG("[vr] controller profile: %s; calibration pitch %.0f, yaw %.0f, roll %.0f degrees", model, double(p),
+                double(y), double(r));
+        }
         LOG("[vr] Quest fixes (head and hand tracking gaps, recentre events, one input sync a frame, Quest 3 "
             "controllers on PC): %s", quest_ ? "on" : "off (not a Quest headset)");
         // a streamed headset (streamed()): on a PC, Virtual Desktop's VDXR, ALVR, or a Quest or Pico on any runtime;
@@ -634,7 +691,10 @@ bool Session::create_actions() {
             {aimPose_, "/user/hand/left/input/aim/pose"}, {aimPose_, "/user/hand/right/input/aim/pose"},
             {trigger_, "/user/hand/left/input/pinch_ext/value"}, {trigger_, "/user/hand/right/input/pinch_ext/value"},
             {squeeze_, "/user/hand/left/input/grasp_ext/value"}, {squeeze_, "/user/hand/right/input/grasp_ext/value"}});
-    // Valve Index (no menu button: bind one in the runtime's binding editor, docs/VR_CONTROLS.md)
+    // Valve Index. Its menu-like button is the System button under the trackpad (/input/system/click), which SteamVR
+    // keeps for its dashboard: bound to the menu too, for a runtime that passes it on, but the menu that works is a press
+    // of either trackpad (its force, a value the runtime turns into a click for the boolean action; the trackpads have no
+    // other use here)
     suggest("/interaction_profiles/valve/index_controller", {
         {gripPose_, "/user/hand/left/input/grip/pose"}, {gripPose_, "/user/hand/right/input/grip/pose"},
         {aimPose_, "/user/hand/left/input/aim/pose"}, {aimPose_, "/user/hand/right/input/aim/pose"},
@@ -644,6 +704,8 @@ bool Session::create_actions() {
         {stickClick_, "/user/hand/left/input/thumbstick/click"}, {stickClick_, "/user/hand/right/input/thumbstick/click"},
         {primary_, "/user/hand/left/input/a/click"}, {primary_, "/user/hand/right/input/a/click"},
         {secondary_, "/user/hand/left/input/b/click"}, {secondary_, "/user/hand/right/input/b/click"},
+        {menu_, "/user/hand/left/input/trackpad/force"}, {menu_, "/user/hand/right/input/trackpad/force"},
+        {menu_, "/user/hand/left/input/system/click"}, {menu_, "/user/hand/right/input/system/click"},
         {haptic_, "/user/hand/left/output/haptic"}, {haptic_, "/user/hand/right/output/haptic"}});
     // HTC Vive wands: the trackpad as the stick
     suggest("/interaction_profiles/htc/vive_controller", {
@@ -703,6 +765,11 @@ bool Session::create_swapchains(float renderScale) {
                             eye ? "right eye" : "left eye"))
             return false;
     }
+    // (2026-11-12, a PC log: a 31 ms frame as the wrist HUD first showed, its swapchain made then) the small panels of
+    // one fixed size made now with the eyes', not at their first use mid-game (ensure_wrist / ensure_laser then find
+    // them); a failure here leaves them to be made at first use as before
+    ensure_wrist(kWristHudWidth, kWristHudHeight);
+    ensure_laser(kLaserWidth, kLaserHeight);
     // frame synthesis and depth (docs/VR_FRAME_SYNTHESIS.md): per eye a motion vector image (RGBA16F) and a depth
     // image, at the runtime's recommended size (else a quarter of the eye's for motion, half for depth alone). A
     // runtime without these formats, or a failure here, turns the feature off; the eyes are unaffected
@@ -764,6 +831,30 @@ bool Session::ensure_ui(uint32_t width, uint32_t height) {
     }
     if (++uiWaitFrames_ < 30) return false;
     return make_swapchain(sc, width, height, "game UI layer");
+}
+// One hands image twice the eyes' width, each eye's hands in its half (2026-11-14: with one image per eye, SteamVR's
+// frame hand-off took ~3.7 ms instead of ~0.75, even with nothing written into them; with the shared image ~0.85,
+// headset-confirmed to look right). WWHD_VR_HANDS_SHARED=0: one image per eye, as before
+bool hands_shared() {
+    static const bool on = [] {
+        const char* e = std::getenv("WWHD_VR_HANDS_SHARED");
+        const bool v = !(e && *e == '0');
+        if (!v) LOG("[vr hands] WWHD_VR_HANDS_SHARED=0: one hands image per eye");
+        return v;
+    }();
+    return on;
+}
+bool Session::ensure_hands(uint32_t width, uint32_t height) {
+    auto& a = swapchains_[kHands];
+    auto& b = swapchains_[kHands + 1];
+    if (hands_shared()) {
+        if (a.handle) return true;
+        if (!session_ || !format_ || !width || !height) return false;
+        return make_swapchain(a, width * 2, height, "hands layer (both eyes)");
+    }
+    if (a.handle && b.handle) return true;
+    if (!session_ || !format_ || !width || !height || a.handle || b.handle) return false;  // one size, made once
+    return make_swapchain(a, width, height, "left hands layer") && make_swapchain(b, width, height, "right hands layer");
 }
 bool Session::ensure_wheel(uint32_t width, uint32_t height) {
     auto& sc = swapchains_[kWheel];
@@ -835,9 +926,13 @@ std::vector<float> Session::refresh_rates() {
 }
 
 float Session::refresh_rate() {
+    // (2026-11-14) read once a frame at xrWaitFrame (begin_frame): the render thread asked the runtime four to six times
+    // a frame. Before the first frame of a session, asked here
+    if (const float cached = refreshHz_.load(); cached > 0 && running()) return cached;
     float hz = 0;
     if (refreshRateExt_ && session_ && XR_SUCCEEDED(xrGetDisplayRefreshRateFB_(session_, &hz)) && hz > 0) return hz;
-    const XrDuration period = predictedPeriod_.load();
+    // (a refresh, not the runtime's frame period: that is two refreshes while VDXR's frame smoothing runs)
+    const XrDuration period = refreshPeriod_.load();
     return period > 0 ? float(1e9 / double(period)) : 0.0f;
 }
 
@@ -950,6 +1045,22 @@ bool Session::begin_frame(bool& shouldRender) {
     if (!check(xrWaitFrame_(session_, &wi, &fs), "xrWaitFrame")) return false;
     predictedTime_ = fs.predictedDisplayTime;
     if (fs.predictedDisplayPeriod > 0) predictedPeriod_ = fs.predictedDisplayPeriod;
+    {
+        // one display refresh (refresh_period; docs/VR_STREAMING_AUDIT.md, finding 12). VDXR reports two refreshes as its
+        // frame period while Virtual Desktop's frame smoothing (SSW) runs, and the game's timing in refreshes (Turn
+        // smoothing's steps, the streamed display-time checks) doubled with it. The headset's rate where the runtime
+        // offers it (read once here: refresh_rate() returns it); else the runtime's period, unless it jumped to 1.8
+        // times the last refresh or more (a smoothing runtime's doubled period, kept out)
+        float hz = 0;
+        if (refreshRateExt_ && XR_SUCCEEDED(xrGetDisplayRefreshRateFB_(session_, &hz)) && hz > 0) {
+            refreshHz_.store(hz);
+            refreshPeriod_.store(XrDuration(1e9 / double(hz)));
+        } else if (fs.predictedDisplayPeriod > 0) {
+            refreshHz_.store(0);
+            if (double(fs.predictedDisplayPeriod) < 1.8 * double(refreshPeriod_.load()))
+                refreshPeriod_.store(fs.predictedDisplayPeriod);
+        }
+    }
     if (!streamDetect_.done) {
         // a headset neither known streamed nor wired (streamed()): its display times in windows of kDetectFrames steps.
         // A streamed runtime's move with the network (a Quest through VDXR on Wi-Fi: 24 to 155 ms apart); a wired one's
@@ -959,7 +1070,7 @@ bool Session::begin_frame(bool& shouldRender) {
         constexpr double kDetectShare = 0.05;
         constexpr int kDetectWindows = 4;
         auto& d = streamDetect_;
-        const double period = double(predictedPeriod_.load());
+        const double period = double(refreshPeriod_.load());
         if (d.last > 0 && fs.predictedDisplayTime > d.last && period > 0) {
             const double step = double(fs.predictedDisplayTime - d.last);
             ++d.frames;
@@ -987,7 +1098,7 @@ bool Session::begin_frame(bool& shouldRender) {
         // display-time steadiness (docs/VR_STREAMING.md): each step from the last display time against whole periods; a
         // streamed headset's times move with the network (a Quest through VDXR on Wi-Fi: up to 155 ms apart)
         auto& d = streamDiag_;
-        const double period = double(predictedPeriod_.load());
+        const double period = double(refreshPeriod_.load());
         if (d.last > 0 && fs.predictedDisplayTime > d.last && period > 0) {
             const double step = double(fs.predictedDisplayTime - d.last);
             const double off = std::fabs(step - std::max(1.0, std::round(step / period)) * period);
@@ -1045,18 +1156,32 @@ void Session::release(int eye) {
 }
 
 void Session::end_frame(const Views& views, bool draw, const Quad* panel, const Quad* wheel, const SubQuad* wrist,
-                        int wristCount, const SubQuad* laser, int laserCount, const Quad* ui) {
+                        int wristCount, const SubQuad* laser, int laserCount, const Quad* ui, const Views* hands) {
     if (!frameBegun_) return;
     frameBegun_ = false;
     XrCompositionLayerProjectionView pv[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
                                            {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
     XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+    // (docs/VR_HANDS_LAYER_PLAN.md step 3) the hands layer: the eyes' views and parts, its own images, its alpha over them
+    XrCompositionLayerProjectionView handsViews[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                   {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    XrCompositionLayerProjection handsLayer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
     // frame synthesis and depth (docs/VR_FRAME_SYNTHESIS.md): this frame's, taken once (a frame shown again has none)
     SynthFrame synth;
     bool synthNow = false;
     {
         std::lock_guard<std::mutex> l(synthMutex_);
-        if (synthPending_) { synth = synthFrame_; synthNow = true; synthPending_ = false; }
+        const bool reuse = reuseDepth_.exchange(false, std::memory_order_relaxed);
+        if (synthPending_) {
+            synth = synthFrame_;
+            synthNow = true;
+            synthPending_ = false;
+            synthLast_ = synth;
+            synthLastValid_ = true;
+        } else if (reuse && depthOnly_ && synthLastValid_) {
+            synth = synthLast_;  // (a frame shown again: its depth, the depth swapchains' last released images)
+            synthNow = true;
+        }
     }
     XrFrameSynthesisInfoEXT synthInfo[2] = {{XR_TYPE_FRAME_SYNTHESIS_INFO_EXT}, {XR_TYPE_FRAME_SYNTHESIS_INFO_EXT}};
     XrCompositionLayerSpaceWarpInfoFB warpInfo[2] = {{XR_TYPE_COMPOSITION_LAYER_SPACE_WARP_INFO_FB},
@@ -1071,7 +1196,7 @@ void Session::end_frame(const Views& views, bool draw, const Quad* panel, const 
                                              {XR_TYPE_COMPOSITION_LAYER_QUAD}};
     XrCompositionLayerQuad laserQuads[2] = {{XR_TYPE_COMPOSITION_LAYER_QUAD}, {XR_TYPE_COMPOSITION_LAYER_QUAD}};
     XrCompositionLayerQuad uiQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
-    const XrCompositionLayerBaseHeader* layers[12] = {};
+    const XrCompositionLayerBaseHeader* layers[14] = {};
     XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};
     ei.displayTime = predictedTime_.load();
     ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -1207,7 +1332,62 @@ void Session::end_frame(const Views& views, bool draw, const Quad* panel, const 
             layer.next = &settings;
         }
         layers[ei.layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer);
+        // the hands layer right over the eyes' (under the UI and the panels): each eye's view and part as the eye's
+        // (its images the eyes' size), its pose `hands`' (the same as the eyes' on a game frame; Turn smoothing's frames
+        // keep it where it was drawn while the eyes' turn)
+        // (diagnostics, 2026-11-14: the frame's hand-off took ~3.8 ms with this layer, ~0.8 without, on SteamVR)
+        // WWHD_VR_HANDS_SUBMIT=premult: sent as premultiplied alpha (its edge fill premultiplied too, vr_genframe);
+        // =none: drawn and recorded as always but not sent
+        static const int submitMode = [] {
+            const char* e = std::getenv("WWHD_VR_HANDS_SUBMIT");
+            const int m = e && !std::strcmp(e, "premult") ? 1 : e && !std::strcmp(e, "none") ? 2 : 0;
+            if (m) LOG("[vr hands] WWHD_VR_HANDS_SUBMIT=%s: the hands layer %s", e, m == 1 ? "sent premultiplied" : "not sent");
+            return m;
+        }();
+        const bool shared = hands_shared();
+        if (submitMode != 2 && hands && hands->valid && swapchains_[kHands].handle && (shared || swapchains_[kHands + 1].handle)) {
+            for (int eye = 0; eye < 2; ++eye) {
+                handsViews[eye] = pv[eye];
+                handsViews[eye].next = nullptr;
+                handsViews[eye].subImage.swapchain = swapchains_[kHands + (shared ? 0 : eye)].handle;
+                if (shared) handsViews[eye].subImage.imageRect.offset.x += int32_t(eye) * int32_t(swapchains_[0].width);
+                const auto& hp = hands->eye[eye].pose;
+                handsViews[eye].pose.orientation = {hp.orientation.x, hp.orientation.y, hp.orientation.z, hp.orientation.w};
+                handsViews[eye].pose.position = {hp.position.x, hp.position.y, hp.position.z};
+            }
+            handsLayer.space = space_;
+            // (not premultiplied: its edge pixels carry the hands' colour at alpha 0, vr_genframe dilate, so filtering
+            // the edge blends that colour in, not black)
+            handsLayer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+                                    (submitMode == 1 || hands_premultiplied_ ? 0 : XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT);
+            handsLayer.viewCount = 2;
+            handsLayer.views = handsViews;
+            layers[ei.layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&handsLayer);
+        }
+        // (docs/VR_PERFORMANCE.md, "GPU clock") the system's recommended size for this layer, asked and logged, not
+        // followed: asking is Meta's dynamic resolution, which a Quest 3 needs to let the GPU run at levels 5 and 6
+        if (layerResolutionExt_) {
+            XrRecommendedLayerResolutionGetInfoMETA gi{XR_TYPE_RECOMMENDED_LAYER_RESOLUTION_GET_INFO_META};
+            gi.layer = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer);
+            gi.predictedDisplayTime = ei.displayTime;
+            XrRecommendedLayerResolutionMETA rr{XR_TYPE_RECOMMENDED_LAYER_RESOLUTION_META};
+            const XrResult r = xrGetRecommendedLayerResolutionMETA_(session_, &gi, &rr);
+            ++layerResolutionAsks_;
+            if (XR_FAILED(r)) {
+                if (layerResolutionAsks_ <= 3) LOG("[vr] dynamic resolution query: refused (%d)", int(r));
+            } else if (rr.isValid && (rr.recommendedImageDimensions.width != lastRecommendedW_ ||
+                                      rr.recommendedImageDimensions.height != lastRecommendedH_)) {
+                lastRecommendedW_ = rr.recommendedImageDimensions.width;
+                lastRecommendedH_ = rr.recommendedImageDimensions.height;
+                static int logs = 0;
+                if (++logs <= 30)
+                    LOG("[vr] dynamic resolution query: the system recommends %dx%d for the eyes (drawn at %dx%d: kept)",
+                        lastRecommendedW_, lastRecommendedH_, int(pv[0].subImage.imageRect.extent.width),
+                        int(pv[0].subImage.imageRect.extent.height));
+            }
+        }
     }
+    poll_perf_metrics();
     // (docs/VR_EYE_PROJECTION.md) the game's UI layer: head-locked in the view space, its premultiplied alpha over the eyes
     const auto& us = swapchains_[kUi];
     if (ui && ui->visible && us.handle && view_ && ei.layerCount) {
@@ -1220,6 +1400,11 @@ void Session::end_frame(const Views& views, bool draw, const Quad* panel, const 
         uiQuad.pose.orientation = {q.orientation.x, q.orientation.y, q.orientation.z, q.orientation.w};
         uiQuad.pose.position = {q.position.x, q.position.y, q.position.z};
         uiQuad.size = {ui->width, ui->height};
+        // (2026-11-12, a Quest 3S player: "the UI is blurry") the compositor's quality filtering for the UI's text and
+        // menus too, as the eye images have (Quest Super Resolution's sharpening; only where the runtime offers it)
+        static XrCompositionLayerSettingsFB uiSettings{XR_TYPE_COMPOSITION_LAYER_SETTINGS_FB};
+        uiSettings.layerFlags = XR_COMPOSITION_LAYER_SETTINGS_QUALITY_SHARPENING_BIT_FB;
+        uiQuad.next = layerSettingsExt_ ? &uiSettings : nullptr;
         layers[ei.layerCount++] = reinterpret_cast<XrCompositionLayerBaseHeader*>(&uiQuad);
     }
     const auto& ps = swapchains_[kPanel];
@@ -1227,7 +1412,10 @@ void Session::end_frame(const Views& views, bool draw, const Quad* panel, const 
         quad.space = space_;
         quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
         quad.subImage.swapchain = ps.handle;
-        quad.subImage.imageRect = {{0, 0}, {int32_t(ps.width), int32_t(ps.height)}};
+        // (the part of the image the picture was drawn into, Quad::pixelWidth: the whole image when not said)
+        const uint32_t pw = panel->pixelWidth ? std::min(panel->pixelWidth, ps.width) : ps.width;
+        const uint32_t ph = panel->pixelHeight ? std::min(panel->pixelHeight, ps.height) : ps.height;
+        quad.subImage.imageRect = {{0, 0}, {int32_t(pw), int32_t(ph)}};
         const auto& q = panel->pose;
         quad.pose.orientation = {q.orientation.x, q.orientation.y, q.orientation.z, q.orientation.w};
         quad.pose.position = {q.position.x, q.position.y, q.position.z};
@@ -1303,6 +1491,16 @@ void Session::end_frame(const Views& views, bool draw, const Quad* panel, const 
     check(xrEndFrame_(session_, &ei), "xrEndFrame");
 }
 
+// (docs/VR_EYE_PROJECTION.md "Field of view") an eye's field as the runtime reports it, each side's tangent scaled by
+// vr::fov_scale (1: as reported). Everything after follows it: the projection, the eye picture's shape, what is
+// submitted (the compositor shows black past it)
+static Fov narrowed_fov(const XrFovf& f) {
+    const float k = vr::fov_scale();
+    if (!(k < 1.0f)) return {f.angleLeft, f.angleRight, f.angleUp, f.angleDown};
+    auto n = [k](float a) { return std::atan(std::tan(a) * k); };
+    return {n(f.angleLeft), n(f.angleRight), n(f.angleUp), n(f.angleDown)};
+}
+
 bool Session::locate_views(XrTime time, Views& out) {
     std::lock_guard<std::mutex> lock(trackingMutex_);
     out.valid = false;
@@ -1332,8 +1530,7 @@ bool Session::locate_views(XrTime time, Views& out) {
                 const Vec3 rel = rotate(back, lastViews_.eye[eye].pose.position - lastViews_.head.position);
                 out.eye[eye].pose.position = lastViews_.head.position + rotate(turned, rel);
                 out.eye[eye].pose.orientation = to_pose(views[eye].pose).orientation;
-                out.eye[eye].fov = {views[eye].fov.angleLeft, views[eye].fov.angleRight, views[eye].fov.angleUp,
-                                    views[eye].fov.angleDown};
+                out.eye[eye].fov = narrowed_fov(views[eye].fov);
                 out.eye[eye].display = out.eye[eye].fov;
             }
             out.head.orientation = turned;
@@ -1364,8 +1561,7 @@ bool Session::locate_views(XrTime time, Views& out) {
     }
     for (int eye = 0; eye < 2; ++eye) {
         out.eye[eye].pose = to_pose(views[eye].pose);
-        out.eye[eye].fov = {views[eye].fov.angleLeft, views[eye].fov.angleRight, views[eye].fov.angleUp,
-                            views[eye].fov.angleDown};
+        out.eye[eye].fov = narrowed_fov(views[eye].fov);
         out.eye[eye].display = out.eye[eye].fov;
     }
     XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
@@ -1511,11 +1707,105 @@ void Session::declare_thread(XrThread kind) {
 #endif
 }
 
+// The runtime's own counters (XR_META_performance_metrics; asked for after GalaxyQuest's port, 2026-11-12): the app's
+// and the compositor's GPU and CPU time a frame and how busy the GPU and CPU are, as the runtime measures them. The
+// GPU's own timers undercount on a Quest's tiled GPU (GalaxyQuest's finding); these say for certain whether a frame
+// rate is held by the GPU or the CPU. Switched on once a session, every counter the runtime has read once a second,
+// all of them logged every 10 s ("[vr] runtime counters (10 s, ...)"), the main ones kept for gpu_counters
+void Session::poll_perf_metrics() {
+    if (!perfMetricsExt_ || !session_) return;
+    const uint32_t begins = sessionBegins_.load(std::memory_order_relaxed);
+    if (perfMetricsSession_ != begins) {
+        perfMetricsSession_ = begins;
+        XrPerformanceMetricsStateMETA st{XR_TYPE_PERFORMANCE_METRICS_STATE_META};
+        st.enabled = XR_TRUE;
+        const XrResult r = xrSetPerformanceMetricsStateMETA_(session_, &st);
+        perfPaths_.clear();
+        perfNames_.clear();
+        uint32_t n = 0;
+        if (XR_SUCCEEDED(r) && XR_SUCCEEDED(xrEnumeratePerformanceMetricsCounterPathsMETA_(instance_, 0, &n, nullptr)) && n) {
+            perfPaths_.resize(n);
+            if (XR_FAILED(xrEnumeratePerformanceMetricsCounterPathsMETA_(instance_, n, &n, perfPaths_.data()))) n = 0;
+            perfPaths_.resize(n);
+            for (XrPath p : perfPaths_) {
+                char text[XR_MAX_PATH_LENGTH] = {};
+                uint32_t len = 0;
+                if (XR_FAILED(xrPathToString_(instance_, p, sizeof text, &len, text))) text[0] = 0;
+                std::string name = text;
+                const std::string prefix = "/perfmetrics_meta/";
+                if (name.rfind(prefix, 0) == 0) name = name.substr(prefix.size());
+                perfNames_.push_back(name.empty() ? "?" : name);
+            }
+        }
+        std::string list;
+        for (const auto& name : perfNames_) list += (list.empty() ? "" : ", ") + name;
+        LOG("[vr] runtime counters: %s (%u)%s%s", XR_SUCCEEDED(r) ? "on" : "refused", unsigned(perfPaths_.size()),
+            list.empty() ? "" : ": ", list.c_str());
+        perfLastRead_ = perfLastLog_ = std::chrono::steady_clock::now();
+        perfSums_.assign(perfPaths_.size(), 0.0);
+        perfMax_.assign(perfPaths_.size(), 0.0);
+        perfReads_ = 0;
+        return;
+    }
+    if (perfPaths_.empty()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - perfLastRead_ < std::chrono::seconds(1)) return;
+    perfLastRead_ = now;
+    GpuCounters latest;
+    for (size_t i = 0; i < perfPaths_.size(); ++i) {
+        XrPerformanceMetricsCounterMETA c{XR_TYPE_PERFORMANCE_METRICS_COUNTER_META};
+        if (XR_FAILED(xrQueryPerformanceMetricsCounterMETA_(session_, perfPaths_[i], &c))) continue;
+        double v;
+        if (c.counterFlags & XR_PERFORMANCE_METRICS_COUNTER_FLOAT_VALUE_VALID_BIT_META) v = c.floatValue;
+        else if (c.counterFlags & XR_PERFORMANCE_METRICS_COUNTER_UINT_VALUE_VALID_BIT_META) v = c.uintValue;
+        else continue;
+        perfSums_[i] += v;
+        perfMax_[i] = std::max(perfMax_[i], v);
+        const std::string& name = perfNames_[i];
+        if (name == "app/gpu_frametime") latest.appGpuMs = float(v);
+        else if (name == "compositor/gpu_frametime") latest.compositorGpuMs = float(v);
+        else if (name == "device/gpu_utilization") latest.gpuBusy = float(v);
+        else if (name == "app/cpu_frametime") latest.appCpuMs = float(v);
+        else if (name == "device/cpu_utilization_worst") latest.cpuWorst = float(v);
+    }
+    latest.valid = latest.appGpuMs >= 0 || latest.gpuBusy >= 0;
+    {
+        std::lock_guard<std::mutex> lock(perfMutex_);
+        perfLatest_ = latest;
+    }
+    ++perfReads_;
+    if (now - perfLastLog_ >= std::chrono::seconds(10)) {
+        perfLastLog_ = now;
+        std::string line;
+        for (size_t i = 0; i < perfPaths_.size(); ++i) {
+            char part[160];
+            std::snprintf(part, sizeof part, "%s%s %.2f (max %.2f)", line.empty() ? "" : ", ", perfNames_[i].c_str(),
+                          perfSums_[i] / double(perfReads_), perfMax_[i]);
+            line += part;
+            perfSums_[i] = perfMax_[i] = 0;
+        }
+        LOG("[vr] runtime counters (10 s, %u reads; averages): %s", perfReads_, line.c_str());
+        perfReads_ = 0;
+    }
+}
+Session::GpuCounters Session::gpu_counters() const {
+    std::lock_guard<std::mutex> lock(perfMutex_);
+    return perfLatest_;
+}
+
 void Session::cpu_boost(bool on) {
     if (!perfSettingsExt_ || !xrPerfSettingsSetPerformanceLevelEXT_ || !session_ || !running()) return;
     // (a new session starts at the runtime's default, Sustained High)
     const uint32_t begins = sessionBegins_.load(std::memory_order_relaxed);
-    if (cpuBoostSession_ != begins) cpuBoostSession_ = begins, cpuBoost_ = false;
+    if (cpuBoostSession_ != begins) {
+        cpuBoostSession_ = begins, cpuBoost_ = false;
+        // (docs/VR_PERFORMANCE.md, "GPU clock") the GPU's level asked for once a session: Sustained High, the top of
+        // what a session may hold (Boost is no more on a Quest, Meta's docs). Its top levels on a Quest 3 come from the
+        // manifest's com.oculus.trade_cpu_for_gpu_amount (one level traded from the CPU)
+        const XrResult g = xrPerfSettingsSetPerformanceLevelEXT_(session_, XR_PERF_SETTINGS_DOMAIN_GPU_EXT,
+                                                                 XR_PERF_SETTINGS_LEVEL_SUSTAINED_HIGH_EXT);
+        LOG("[vr] GPU level: Sustained High (%s)", XR_SUCCEEDED(g) ? "accepted" : "refused");
+    }
     if (on == cpuBoost_) return;
     const XrResult r = xrPerfSettingsSetPerformanceLevelEXT_(
         session_, XR_PERF_SETTINGS_DOMAIN_CPU_EXT,
@@ -1525,6 +1815,23 @@ void Session::cpu_boost(bool on) {
     if (cpuBoosts_ <= 20 || XR_FAILED(r))
         LOG("[vr] CPU level: %s (%s; %llu boosts so far)", on ? "Boost (the game is stalled)" : "Sustained High",
             XR_SUCCEEDED(r) ? "accepted" : "refused", (unsigned long long)cpuBoosts_);
+}
+
+// (2026-11-13) the headset model's controller calibration (vr.calibration.<model>.*, all 0 by default: nothing turned):
+// both poses turned in their own frame, the right hand by pitch (about its x), yaw (y) and roll (z), the left hand
+// mirrored (yaw and roll negated)
+void Session::apply_controller_calibration(int hand, Pose& grip, Pose& aim) const {
+    const Config& cfg = config();
+    float p = cfg.calibOtherPitch, y = cfg.calibOtherYaw, r = cfg.calibOtherRoll;
+    if (controllerModel_ == ControllerModel::Quest3) p = cfg.calibQuest3Pitch, y = cfg.calibQuest3Yaw, r = cfg.calibQuest3Roll;
+    else if (controllerModel_ == ControllerModel::Quest3S)
+        p = cfg.calibQuest3SPitch, y = cfg.calibQuest3SYaw, r = cfg.calibQuest3SRoll;
+    if (p == 0 && y == 0 && r == 0) return;
+    const float k = 3.14159265f / 180.0f, side = hand == 0 ? -1.0f : 1.0f;
+    const Quat turn = normalize(axis_angle({0, 1, 0}, y * side * k) * axis_angle({1, 0, 0}, p * k) *
+                                axis_angle({0, 0, 1}, r * side * k));
+    grip.orientation = normalize(grip.orientation * turn);
+    aim.orientation = normalize(aim.orientation * turn);
 }
 
 bool Session::sync_input(XrTime time, bool leftHanded, InputState& out) {
@@ -1573,6 +1880,7 @@ bool Session::sync_input_locked(XrTime time, bool leftHanded, InputState& out) {
             hand.active = hold_pose(gripHold_[h], false, false, {}, now, kHoldSeconds, hand.grip, &hand.held);
             Pose aim;
             hand.aim = hold_pose(aimHold_[h], false, false, {}, now, kHoldSeconds, aim) ? aim : hand.grip;
+            apply_controller_calibration(h, hand.grip, hand.aim);  // (held poses are the runtime's: turned as the live ones)
         }
         out.valid = out.hand[0].active || out.hand[1].active;
         return out.valid;
@@ -1626,6 +1934,7 @@ bool Session::sync_input_locked(XrTime time, bool leftHanded, InputState& out) {
         hand.aim = track_pose(aimHold_[h], al && pos(aim) && nearHead(aim), al && usable(aim), al && ori(aim), to_pose(aim.pose), now,
                               kHoldSeconds, aimPose)
                        ? aimPose : hand.grip;
+        apply_controller_calibration(h, hand.grip, hand.aim);  // (the headset model's own: vr.calibration.<model>)
         hand.trigger = value(trigger_, h);
         hand.grip_value = value(squeeze_, h);
         hand.stickClick = boolean(stickClick_, h);

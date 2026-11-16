@@ -1224,6 +1224,13 @@ static void test_45() {
     CHECK(cap_fps_vr_mode(120, 90, kVrHalf) == 45 && cap_fps_vr_mode(120, 90, kVrUnlocked) == 90);
     CHECK(cap_fps_vr_mode(120, 120, kVrHalf) == 60 && cap_fps_vr_mode(240, 120, kVrUnlocked) == 120);
     CHECK(cap_fps_vr_mode(120, 90, kVrOriginal) == 30 && cap_fps_vr_mode(120, 120, kVrOriginal) == 30);
+    // (2026-11-11) Capped 30 FPS at an actual rate that is not a multiple of 30 (the Steam Frame's 72 Hz default): the
+    // half cap, every frame a whole number of refreshes
+    CHECK(vr_mode_resolved(kVrOriginal, 72) == kVrHalf && vr_mode_resolved(kVrOriginal, 90) == kVrOriginal &&
+          vr_mode_resolved(kVrOriginal, 0) == kVrOriginal && vr_mode_resolved(kVrHalf, 72) == kVrHalf);
+    CHECK(vr_mode_cap(kVrOriginal, 72) == 36 && cap_fps_vr_mode(120, 72, kVrOriginal) == 36);
+    CHECK(vr_mode_cap(kVrOriginal, 60) == 30 && cap_fps_vr_mode(120, 60, kVrOriginal) == 30);
+    CHECK(cap_fps_vr_mode(120, 144, kVrOriginal) == cap_fps_vr_mode(120, 144, kVrHalf));
     CHECK(cap_fps_vr_mode(120, 72, kVrHalf) == 36 && cap_fps_vr_mode(120, 72, kVrUnlocked) == 60);
     CHECK(cap_fps_vr_mode(120, 0, kVrHalf) == 120);  // (no headset: the window's rules)
     constexpr vsync_pacing::Clock kClock{16'683'333, 12};
@@ -1295,6 +1302,19 @@ static void test_45() {
     // Auto Mode's two profiles: wired optimal (1.5 s, half below 90 %) and streamed optimal (6 s, half below 85 %)
     {
         // 88 % drawn: wired optimal goes to half after kAutoWindow steps; streamed optimal stays at the full rate
+        {  // (auto_rate_new_stage) a new stage: the waits start again from the first; at half, a try no later than that
+            AutoRate n;
+            n.half = true;
+            n.steps = 100;
+            n.backoff = kAutoBackoffMax;
+            n.tryAt = n.steps + kAutoBackoffMax;
+            auto_rate_new_stage(n);
+            CHECK(n.backoff == kAutoBackoff && n.tryAt == n.steps + kAutoBackoff);
+            n.tryAt = n.steps + 10;  // (sooner already: kept)
+            auto_rate_new_stage(n);
+            CHECK(n.tryAt == n.steps + 10);
+            CHECK(kAutoBackoffStreamed >= kAutoBackoff && kAutoBackoffStreamedMax >= kAutoBackoffMax);
+        }
         AutoRate wired, streamed;
         streamed.streamOptimal = streamed.streamed = true;
         int wiredAt = -1, streamedAt = -1;

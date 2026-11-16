@@ -340,6 +340,8 @@ static void test_baton() {
         in.dt = 0.1f;
         in.noteHand = 1;
         const Vec3 lc{-0.2f, 1.1f, -0.3f}, rc{0.2f, 1.1f, -0.3f};
+        in.haveHead = true;
+        in.head = Vec3{0, 1.5f, -0.1f};  // (the beat hand's bands: BatonBeatZones)
         in.tracked[0] = in.tracked[1] = true;
         in.hand[0] = lc;
         in.hand[1] = rc;
@@ -364,7 +366,7 @@ static void test_baton() {
         CHECK(o.dir[0] == D::Down);
         in.hand[1] = rc;
         for (int i = 0; i < 4; ++i) o = b.update(in);  // (a note is held kFlickHold at least)
-        in.hand[0] = lc + Vec3{-0.14f, 0, 0};  // the left hand left: the beat (3/4)
+        in.hand[0] = lc + Vec3{-0.16f, 0, 0};  // the left hand out past its middle band: the beat (3/4)
         o = b.update(in);
         CHECK(o.dir[1] == D::Left && o.dir[0] == D::None);
     }
@@ -390,6 +392,8 @@ static void test_baton() {
         in.dt = 0.1f;
         in.noteHand = 1;
         const Vec3 lc{-0.2f, 1.1f, -0.3f}, rc{0.2f, 1.1f, -0.3f};
+        in.haveHead = true;
+        in.head = Vec3{0, 1.5f, -0.1f};  // (the beat hand's bands: BatonBeatZones)
         in.tracked[0] = in.tracked[1] = true;
         in.hand[0] = lc;
         in.hand[1] = rc;
@@ -576,6 +580,8 @@ static void test_baton() {
         in.noteHand = 1;
         in.swapHands = true;
         const Vec3 lc{-0.2f, 1.1f, -0.3f}, rc{0.2f, 1.1f, -0.3f};
+        in.haveHead = true;
+        in.head = Vec3{0, 1.5f, -0.1f};  // (the beat hand's bands: BatonBeatZones)
         in.tracked[0] = in.tracked[1] = true;
         in.hand[0] = lc;
         in.hand[1] = rc;
@@ -590,7 +596,7 @@ static void test_baton() {
         in.hand[0] = lc + Vec3{-0.05f, 0, 0};  // the left hand 5 cm: not yet (its zone the full 12 cm)
         o = b.update(in);
         CHECK(o.dir[0] == D::None && o.dir[1] == D::None);
-        in.hand[0] = lc + Vec3{-0.14f, 0, 0};
+        in.hand[0] = lc + Vec3{-0.16f, 0, 0};
         o = b.update(in);
         CHECK(o.dir[0] == D::Left && o.dir[1] == D::None);  // the left hand: the left stick
     }
@@ -600,6 +606,8 @@ static void test_baton() {
         BatonInput in;
         in.dt = 0.1f;
         const Vec3 lc{-0.2f, 1.1f, -0.3f}, rc{0.2f, 1.1f, -0.3f};
+        in.haveHead = true;
+        in.head = Vec3{0, 1.5f, -0.1f};  // (the beat hand's bands: BatonBeatZones)
         in.tracked[0] = in.tracked[1] = true;
         in.hand[0] = lc;
         in.hand[1] = rc;
@@ -668,14 +676,37 @@ static void test_baton() {
         o = b.update(in);
         CHECK(o.dir[1] == D::Up && o.dir[0] == D::None);
         in.stick[1][1] = 0;
-        in.hand[1] = rc + Vec3{-0.14f, 0, 0};  // the right hand left: the beat (3/4)
+        in.hand[1] = rc + Vec3{-0.16f, 0, 0};  // the right hand in, across the body: the beat (3/4)
         o = b.update(in);
         CHECK(o.dir[1] == D::Left && o.dir[0] == D::None);
-        in.tracked[1] = false;  // its tracking lost: nothing from it
+        in.tracked[1] = false;  // its tracking lost: the band it was in is kept
+        o = b.update(in);
+        CHECK(o.dir[1] == D::Left);
+        in.tracked[1] = true;
+        for (int i = 0; i < 6; ++i) o = b.update(in);  // tracked again, still there: still in that band
+        CHECK(o.dir[1] == D::Left);
+        // (BatonBeatZones) held in a band it stays, however long; back in the middle band: 4/4, and it stays there
+        for (int i = 0; i < 100; ++i) o = b.update(in);
+        CHECK(o.dir[1] == D::Left);
+        in.hand[1] = rc + Vec3{-0.11f, 0, 0};  // 1 cm inside the middle band's edge: not yet (2 cm past it)
+        o = b.update(in);
+        CHECK(o.dir[1] == D::Left);
+        in.hand[1] = rc + Vec3{-0.09f, 0, 0};
         o = b.update(in);
         CHECK(o.dir[1] == D::None);
-        in.tracked[1] = true;
-        for (int i = 0; i < 6; ++i) o = b.update(in);  // tracked again where it is: settles there, no beat
+        for (int i = 0; i < 100; ++i) o = b.update(in);
+        CHECK(o.dir[1] == D::None);
+        in.hand[1] = rc + Vec3{0.16f, 0.2f, 0};  // out to its own side (up too: not read): the other beat (6/4)
+        o = b.update(in);
+        CHECK(o.dir[1] == D::Right);
+        in.hand[1] = rc + Vec3{0.16f, -0.25f, 0};
+        o = b.update(in);
+        CHECK(o.dir[1] == D::Right);
+        in.hand[1] = rc + Vec3{-0.3f, 0, 0};  // straight across to the far band
+        o = b.update(in);
+        CHECK(o.dir[1] == D::Left);
+        in.hand[1] = rc;
+        o = b.update(in);
         CHECK(o.dir[1] == D::None);
         // the hands switched off: only the sticks
         in.hands = false;
@@ -1017,6 +1048,32 @@ static void test_config() {
     e.moveDirection = MoveDirection::LeftHand;
     e.posture = Posture::Seated;
     const Config f = from_saved(to_kv(e));
+    // (format 26) "Move where you look" on by default again (off in formats 24 and 25): a hand saved by 24 or 25 (their
+    // default) takes it back; a hand chosen after 26 stays
+    CHECK(Config{}.moveDirection == MoveDirection::Head);
+    // (2026-11-13) each headset model its own controller calibration: all 0 by default, read back per model, clamped
+    {
+        const Config d;
+        CHECK(d.calibQuest3Pitch == 0 && d.calibQuest3SPitch == 0 && d.calibOtherPitch == 0 && d.calibQuest3SRoll == 0);
+        const Config q = from_saved({{"vr.calibration.quest3s.pitch", "35"}, {"vr.calibration.quest3s.roll", "-120"}});
+        CHECK(q.calibQuest3SPitch == 35 && q.calibQuest3SRoll == -90 && q.calibQuest3Pitch == 0 && q.calibOtherPitch == 0);
+    }
+    // (2026-11-12) the field of view: 0.85 on a Quest, 1 elsewhere; saved, read back, clamped to 0.75 .. 1
+    CHECK(Config{}.fieldOfView == (quest_headset() ? 0.85f : 1.0f));
+    CHECK(from_saved({{"vr.fieldOfView", "0.8"}}).fieldOfView == 0.8f);
+    CHECK(from_saved({{"vr.fieldOfView", "0.5"}}).fieldOfView == 0.75f && from_saved({{"vr.fieldOfView", "1.4"}}).fieldOfView == 1.0f);
+    CHECK(from_saved({{"vr.format", "23"}, {"vr.moveDirection", "head"}}).moveDirection == MoveDirection::Head);
+    CHECK(from_saved({{"vr.format", "25"}, {"vr.moveDirection", "hand"}}).moveDirection == MoveDirection::Head);
+    CHECK(from_saved({{"vr.format", "26"}, {"vr.moveDirection", "hand"}}).moveDirection == MoveDirection::LeftHand);
+    {
+        // format 29: Steam Frame - Native takes foveation Low and edge smoothing from a format 28 save; other builds keep
+        // what was saved; another level chosen stays everywhere
+        const Config m = from_saved({{"vr.format", "28"}, {"vr.foveation", "medium"}, {"vr.casFxaa", "0"}});
+        CHECK(m.foveation == (kSteamFrameNativeBuild ? 1 : 2));
+        CHECK(m.casFxaa == kSteamFrameNativeBuild);
+        CHECK(from_saved({{"vr.format", "28"}, {"vr.foveation", "high"}}).foveation == 3);
+        CHECK(from_saved({{"vr.format", "29"}, {"vr.foveation", "medium"}, {"vr.casFxaa", "0"}}).foveation == 2);
+    }
     CHECK(f.leftHanded && f.unitsPerMetre == 120 && f.moveDirection == MoveDirection::LeftHand &&
           f.posture == Posture::Seated);
     CHECK(keys().size() == to_kv(Config{}).size());
@@ -1031,7 +1088,10 @@ static void test_config() {
                              Row{80, "Capped 80 FPS", "Capped 40 FPS", 80, 40}, Row{90, "Capped 90 FPS", "Capped 45 FPS", 90, 45},
                              }) {
             const auto ch = frame_rate_choices(r.hz);
-            CHECK(ch.size() == 4);
+            // (2026-11-11) Steady 30 FPS a fifth where the rate is a multiple of 30 (not at 60 Hz: its half cap is 30)
+            const bool steady = r.hz % 30 == 0 && r.hz != 60;
+            CHECK(ch.size() == (steady ? 5u : 4u));
+            if (steady) CHECK(ch[4].rate == FrameRate::Original && ch[4].name == "Capped 30 FPS" && ch[4].fps == 30);
             CHECK(ch[0].rate == FrameRate::Unlocked && ch[0].name == "Unlocked FPS" && ch[0].fps == 0);
             CHECK(ch[1].rate == FrameRate::Full && ch[1].name == r.full && ch[1].fps == r.fullFps);
             CHECK(ch[2].rate == FrameRate::Half && ch[2].name == r.half && ch[2].fps == r.halfFps);
@@ -1042,8 +1102,9 @@ static void test_config() {
         // Auto Mode
         {
             const auto ch = frame_rate_choices(120);
-            CHECK(ch.size() == 2 && ch[0].rate == FrameRate::Half && ch[0].name == "Capped 60 FPS" && ch[0].fps == 60 &&
-                  ch[1].rate == FrameRate::Auto && ch[1].name == "Auto Mode");
+            CHECK(ch.size() == 3 && ch[0].rate == FrameRate::Half && ch[0].name == "Capped 60 FPS" && ch[0].fps == 60 &&
+                  ch[1].rate == FrameRate::Auto && ch[1].name == "Auto Mode" && ch[2].rate == FrameRate::Original &&
+                  ch[2].name == "Capped 30 FPS");
             for (FrameRate m : {FrameRate::Unlocked, FrameRate::Full, FrameRate::Half, FrameRate::Auto}) {
                 Config h;
                 h.frameRate = m;
@@ -1099,7 +1160,9 @@ static void test_config() {
         CHECK(from_saved({{"vr.format", "16"}, {"vr.menuZoomOut", "4"}}).menuZoomOut == 4.0f);
         CHECK(from_saved({{"vr.format", "7"}, {"vr.frameRate", "unlocked"}}).frameRate == FrameRate::Auto);
         CHECK(from_saved({{"vr.format", "9"}, {"vr.frameRate", "unlocked"}}).frameRate == FrameRate::Unlocked);
-        for (const char* v : {"45", "30", "half"}) CHECK(from_saved({{"vr.frameRate", v}}).frameRate == FrameRate::Half);
+        for (const char* v : {"45", "half"}) CHECK(from_saved({{"vr.frameRate", v}}).frameRate == FrameRate::Half);
+        for (const char* v : {"30", "steady30"}) CHECK(from_saved({{"vr.frameRate", v}}).frameRate == FrameRate::Original);
+        CHECK(from_saved({{"vr.frameRate", "steady30"}, {"vr.refreshRate", "72"}}).frameRate == FrameRate::Half);
         for (const char* v : {"60", "90", "120", "full"}) CHECK(from_saved({{"vr.frameRate", v}}).frameRate == FrameRate::Full);
         CHECK(from_saved({{"vr.frameRate", "fast"}}).frameRate == FrameRate::Auto);
         for (const char* v : {"0", "144", "61", "-5"}) CHECK(from_saved({{"vr.refreshRate", v}}).refreshRate == 90);
@@ -1110,7 +1173,10 @@ static void test_config() {
         Config orig;
         orig.frameRate = FrameRate::Original;
         validate(orig);
-        CHECK(orig.frameRate == FrameRate::Half);
+        CHECK(orig.frameRate == FrameRate::Original);  // (Steady 30 FPS at 90 Hz)
+        orig.refreshRate = 72;
+        validate(orig);
+        CHECK(orig.frameRate == FrameRate::Half);  // (72 Hz has no steady 30)
         // Detect Headset: the rate it runs selected, with the default frame rate, Auto Mode (whatever was chosen
         // before); 89.9 Hz is 90
         Config dc;
@@ -1523,11 +1589,8 @@ static void test_flap() {
             if (const int r = f.update(from + velocity * (float(i) * dt), dt)) got = r, ++n;
         return n == 1 ? got : n ? 99 : 0;
     };
+    // (2026-11-11, the user's choice: the quick up and down swings' checks removed, no longer required)
     CHECK(run({0, 1, -0.4f}, {0, 0.3f, 0}, 60) == 0);    // slow: none
-    f.reset();
-    CHECK(run({0, 1, -0.4f}, {0, 3.2f, 0}, 12) == 1);    // quick, up: once
-    f.reset();
-    CHECK(run({0, 1, -0.4f}, {0, -3.2f, 0}, 12) == -1);  // quick, down: once
     f.reset();
     CHECK(run({0, 1, -0.4f}, {3.2f, 0.3f, 0}, 12) == 0);  // quick, across: none
     f.reset();
@@ -1537,8 +1600,6 @@ static void test_flap() {
     run({0, 1, -0.4f}, {0, -3.2f, 0}, 12);
     for (int i = 0; i < 10; ++i) f.update({0, 0.57f, -0.4f}, dt);  // still, but too soon (kCooldown)
     CHECK(run({0, 0.57f, -0.4f}, {0, 3.2f, 0}, 12) == 0);
-    for (int i = 0; i < 90; ++i) f.update({0, 0.99f, -0.4f}, dt);  // still for longer (kCooldown)
-    CHECK(run({0, 0.99f, -0.4f}, {0, -3.2f, 0}, 12) == -1);
 }
 static void test_swing() {
     Config c;
@@ -3304,6 +3365,25 @@ static void test_sailing_views() {
         CHECK(!sailing_eligible(s) && !std::strcmp(sail_blocker(s), "a menu"));
         ViewCycle w{ViewMode::Neck};
         CHECK(w.update(sailing_eligible(s)) && w.mode == ViewMode::ThirdPerson);
+        // (2026-11-12) the menu closed, still on the boat: the boat's view taken back (Neck and Free Roam alike)
+        for (ViewMode m : {ViewMode::Neck, ViewMode::FreeRoam}) {
+            ViewCycle r{m};
+            CHECK(r.update(sailing_eligible(s), s.riding) && r.mode == ViewMode::ThirdPerson && r.resume_pending());
+            CHECK(!r.resume(false, true) && r.mode == ViewMode::ThirdPerson && r.resume_pending());  // menu still open
+            CHECK(r.resume(true, true) && r.mode == m && !r.resume_pending());                     // sailing again
+        }
+        {
+            ViewCycle r{ViewMode::Neck};
+            r.update(false, true);
+            CHECK(!r.resume(false, false) && !r.resume_pending());  // off the boat meanwhile: forgotten
+            ViewCycle c{ViewMode::Neck};
+            c.update(false, true);
+            c.click(false);  // the player switched view meanwhile: theirs
+            CHECK(!c.resume_pending() && !c.resume(true, true));
+            ViewCycle g{ViewMode::FreeRoam};
+            g.update(false, false);  // sailing ended off the boat: nothing to take back
+            CHECK(!g.resume_pending());
+        }
         s = ok;
         s.zoomView = true;
         CHECK(!sailing_eligible(s));
@@ -3697,11 +3777,15 @@ static void test_upscaling() {
     // auto, the best the device offers, one upscaler only: Super Resolution on a Quest, DLSS on an RTX PC, SGSR1 on
     // the Frame or a PC without DLSS when upscaled, else the blit
     auto a = choose(Mode::Auto, quest, 1.75f);
-    CHECK(a.superResolution && !a.sgsr1 && !a.dlss);
-    a = choose(Mode::Auto, frame, 1.75f);
-    CHECK(a.sgsr1 && !a.superResolution && !a.dlss);
-    a = choose(Mode::Auto, frame, 1.0f);  // not upscaled: the blit
-    CHECK(!a.sgsr1 && !a.superResolution && !a.dlss);
+    CHECK(a.cas && !a.superResolution && !a.sgsr1 && !a.dlss);  // (2026-11-11: CAS on a Quest)
+    {
+        Caps questNoPass = quest; questNoPass.shaderPass = false;  // (no shader pass: the compositor's)
+        CHECK(choose(Mode::Auto, questNoPass, 1.75f).superResolution);
+    }
+    a = choose(Mode::Auto, frame, 1.75f);  // (2026-11-11: CAS on the Frame too, upscaled or not)
+    CHECK(a.cas && !a.sgsr1 && !a.superResolution && !a.dlss);
+    a = choose(Mode::Auto, frame, 1.0f);
+    CHECK(a.cas && !a.sgsr1 && !a.superResolution && !a.dlss);
     a = choose(Mode::Auto, rtx, 1.5f);
     CHECK(a.dlss && !a.sgsr1 && !a.superResolution);
     a = choose(Mode::Auto, pc, 1.5f);
@@ -3727,7 +3811,11 @@ static void test_upscaling() {
     // a saved "dlss" (no longer offered) runs as Auto
     CHECK(choose(Mode::Dlss, rtx, 1.5f).dlss);
     CHECK(!choose(Mode::Dlss, pc, 1.5f).dlss && choose(Mode::Dlss, pc, 1.5f).sgsr1);
-    CHECK(!choose(Mode::Dlss, quest, 1.5f).dlss && choose(Mode::Dlss, quest, 1.5f).superResolution);
+    CHECK(!choose(Mode::Dlss, quest, 1.5f).dlss && choose(Mode::Dlss, quest, 1.5f).cas);
+    // CAS by choice anywhere the renderer draws its pass, alone
+    CHECK(choose(Mode::Cas, pc, 1.5f).cas && choose(Mode::Cas, frame, 1.5f).cas && !choose(Mode::Cas, noShader, 1.5f).cas);
+    CHECK(!choose(Mode::Cas, quest, 1.5f).superResolution && !choose(Mode::Cas, quest, 1.5f).sgsr1);
+    CHECK(!choose(Mode::Auto, pc, 1.5f).cas && !choose(Mode::Auto, rtx, 1.5f).cas);
     // manual choices, and their fallbacks where the device lacks them
     CHECK(choose(Mode::Sgsr1, quest, 1.5f).sgsr1 && !choose(Mode::Sgsr1, quest, 1.5f).superResolution);
     CHECK(choose(Mode::Sgsr1, pc, 1.0f).sgsr1);
@@ -3740,13 +3828,13 @@ static void test_upscaling() {
         CHECK(!c.sgsr1 && !c.superResolution);
     }
     // every choice gives a reason for the log and the status line
-    for (Mode m : {Mode::Auto, Mode::Off, Mode::Sgsr1, Mode::SuperResolution, Mode::Dlss, Mode::Sgsr2, Mode::Fsr1})
+    for (Mode m : {Mode::Auto, Mode::Off, Mode::Sgsr1, Mode::SuperResolution, Mode::Dlss, Mode::Sgsr2, Mode::Fsr1, Mode::Cas})
         for (const Caps& k : {quest, frame, pc, rtx, temporalQuest}) CHECK(choose(m, k, 1.5f).why && *choose(m, k, 1.5f).why);
     // settings: default auto and sharpness 2; saved and read back; the sharpness clamped to 1..2
     vr::Config c;
     CHECK(c.upscaler == (vr::kPcVrBuild ? Mode::Off : Mode::Auto) &&
           c.upscaleSharpness == (vr::kSteamFrameBuild ? 1.5f : 2.0f));  // (PC VR: off; the Steam Frame: 1.5)
-    for (Mode m : {Mode::Off, Mode::Sgsr1, Mode::SuperResolution, Mode::Dlss, Mode::Sgsr2, Mode::Fsr1, Mode::Auto}) {
+    for (Mode m : {Mode::Off, Mode::Sgsr1, Mode::SuperResolution, Mode::Dlss, Mode::Sgsr2, Mode::Fsr1, Mode::Cas, Mode::Auto}) {
         vr::Config w; w.upscaler = m; w.upscaleSharpness = 1.25f;
         vr::Config r;
         for (const auto& kv : vr::to_kv(w)) vr::from_kv(r, kv.first, kv.second);
@@ -3827,7 +3915,16 @@ static void test_frame_synthesis() {
     CHECK(0.0f * sx == 0.0f);
     // settings: off by default; saved and read back
     vr::Config d;
-    CHECK(d.frameSynthesis == Mode::Off);  // (off by default on every build: PC VR, Steam Frame, Quest)
+    CHECK(d.frameSynthesis == Mode::Off);  // (off by default on PC VR and the Steam Frame; Auto on a Quest, run time only)
+    CHECK(!d.headSmoothing);  // (Head movement smoothing: off by default until tested in a headset)
+    {  // (2026-11-14: Head movement smoothing an option again, saved and read back; movement smoothing removed from the
+       // settings: never saved, an old value in a settings file ignored, it stays off)
+        vr::Config w; w.headSmoothing = true; w.movementSmoothing = true; vr::Config hr;
+        for (const auto& kv : vr::to_kv(w)) vr::from_kv(hr, kv.first, kv.second);
+        vr::from_kv(hr, "vr.movementSmoothing", "1");
+        CHECK(hr.headSmoothing);
+        CHECK(!hr.movementSmoothing);
+    }
     for (Mode m : {Mode::Off, Mode::On, Mode::Auto}) {
         vr::Config w; w.frameSynthesis = m;
         vr::Config r;

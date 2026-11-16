@@ -6,6 +6,9 @@
 #include <thread>
 #include <vector>
 
+// (loader.cpp's quest_rendering_guard logs what it does)
+void log_msg(const char*, ...) {}
+
 namespace {
 std::atomic<int> active{}, maximum{}, calls{}, renderingLookups{};
 VkResult work() {

@@ -520,6 +520,9 @@ if(WWHD_VR AND WWHD_HAS_VULKAN AND NOT APPLE AND (NOT ANDROID OR WWHD_ANDROID_VR
     set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
     set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
     set(DYNAMIC_LOADER ON CACHE BOOL "" FORCE)
+    # (2026-11-15) the loader's own jsoncpp, never the build machine's: with a system jsoncpp installed the loader linked
+    # that machine's libjsoncpp and put its /usr/include ahead of the pinned zig's headers (the 0.5.1 Linux release build)
+    set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
     add_subdirectory(${openxr_sdk_SOURCE_DIR} ${CMAKE_BINARY_DIR}/openxr-sdk EXCLUDE_FROM_ALL)
     if(MINGW)
       # outside MSVC the loader's CMake links with a GNU version script, which llvm-mingw's lld does not

@@ -140,7 +140,12 @@ Button bindings (`vr.bind.*`): [VR_CONTROL_MAPPING.md](VR_CONTROL_MAPPING.md).
 | Key | Default | Range | Unit | Meaning |
 |---|---|---|---|---|
 | `vr.refreshRate` | 90 | 0 .. 240 | Hz | ask the headset for this rate where the runtime lets applications choose (`XR_FB_display_refresh_rate`); 0 = the runtime's choice |
-| `vr.renderScale` | 1 (0.65 on a standalone headset) | 0.5 .. 2 | x | the headset resolution: the eye pictures' size relative to the runtime's recommended eye image (see "Headset resolution") |
+| `vr.renderScale` | 1 (0.70 on a Quest, 0.65 on other standalone headsets) | 0.5 .. 2 | x | the headset resolution: the eye pictures' size relative to the runtime's recommended eye image (see "Headset resolution") |
+| `vr.desktopView` | left | left, right, both, off, leftDominant, rightDominant | | the desktop window's VR View while the headset plays (PC; SteamVR's choices): the left eye, the right eye, both side by side, nothing (a black window), or both eyes blended into one wider picture, the left or right eye dominant; the headset's picture is unchanged |
+| `vr.desktopViewFill` | off | on, off | | the desktop window's eye picture fills the window, its edges cropped, instead of the whole picture with black bars |
+| `vr.foveation` | off (low on a Quest, medium on Steam Frame - Native) | off, low, medium, high | | foveated rendering: the edges of each eye drawn at less detail on GPUs that support it (docs/VR_FOVEATION.md); applies at once |
+| `vr.drawDistance` | 1.0 (0.7 on a Quest) | 0.4 .. 1.0 | | the share of the game's culling distance things are drawn to (docs/VR_PERFORMANCE.md "Draw distance"); applies at once |
+| `vr.lensFlare` | 1 (0 on a Quest) | 0, 1 | | the sun's lens flare in the headset (docs/VR_PERFORMANCE.md "Expensive effects"); applies at once |
 | `vr.autoFrameRate` | 1 | 0, 1 | | frame interpolation on (120 fps, paced) for the session when it is off; not saved |
 | `vr.debugCollision` | 0 | 0, 1 | | reserved (the collision visualisation is not implemented) |
 

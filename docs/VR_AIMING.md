@@ -249,3 +249,28 @@ draw list. In the eye pictures each eye drew it at the same pixel of a different
 red dot) in third person, on land and on the boat. It is now drawn once into the UI layer's image, as the boomerang's
 lock-on sights already were (`mods/vr_hooks.cpp` hook_02414834, hook_020CDBFC). First person with the laser still
 draws it at size 0 (the laser's dot marks the point).
+
+## The bow turns only with the hand (2026-11-14)
+
+Reported with a video ("WWVR Bow Flipping Issue when moving"): aiming while moving left or right, the bow kept turning
+over, upside down and back, about one axis. Asked for: the bow moves and turns only as the player's hand does.
+
+**Why.** The hand that holds the bow was not held to its controller as an empty hand is (`ArmStyle::rigid`, since
+2026-11-10). A hand holding an item kept the game's hold: its roll was the animation's plus the controller's
+(`vr_arm.h`), and the aiming animation rolls the hand as Link moves sideways, the same roll that once turned the empty
+hands over when he ran left or right. The bow is placed from that hand, so it turned over with it. The controller's
+roll was also clamped at 100 degrees either way. Its place in the hand was also taken again every aiming step, though
+this doc said once.
+
+**Changed** (`vr_game.cpp`, not yet tried in a headset):
+- `link_arms`: the bow's hand is held rigidly to its controller, as an empty hand is (the controller's orientation
+  through the hand's fixed offset, `g_ctrlToHand`, within the wrist's limit of the forearm).
+- `place_held`: the bow is turned by that controller frame itself, not by the posed hand (which the wrist's limit may
+  turn back), at the posed hand's place. Without the controller or the offset, the posed hand as before.
+- `measure_held`: its place in the hand (`g_bowHold`) is taken once, after the aim settles, and kept until the bow is
+  put away or another is taken out. The log says `[vr] bow: its place in the hand taken from the aiming pose (kept
+  while it is held)`.
+
+To check: aim and strafe left and right, walk in circles, and sail with the bow (the boat's aim, 0x8D). The bow should
+stay as the hand holds it. Also check the string and the arrow still sit at the drawing hand, and the bow looks held
+upright when the controller is held as usual.

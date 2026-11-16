@@ -3,6 +3,8 @@
 #include "gamepad_backdrop.h"
 #include "gamepad_backdrop_blend.h"
 #include "gamepad_backdrop_replay.h"
+#include "pod_commands.h"  // (draw_guard_left_out: the standalone draw guard's count)
+#include "crash_track.h"  // (the crash log's frame numbers)
 #include "gx2/gx2_regs.h"
 #include "vertex_cpu_policy.h"
 #include <set>
@@ -23,6 +25,7 @@
 #include "backend.h"
 #include "dynres.h"
 #include "stereo.h"
+#include "foveation.h"
 #include "texture_pack_vk.h"
 #ifdef WWHD_VR
 #include "../../vr/vr.h"
@@ -55,6 +58,8 @@
 #include "uniform_snapshot.h"
 #include "batch_glsl.h"
 #include "vr_framesynth.h"
+#include "vr_vulkan.h"
+#include "vr_genframe.h"
 #include "shader_compiler.h"
 #include "../draw_batch.h"
 #include "index_conversion.h"
@@ -84,6 +89,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <atomic>
+#include <mutex>
 #include <fstream>
 #include <memory>
 #include <thread>
@@ -310,10 +316,27 @@ bool trace() {
 // Virtual Desktop). The game's colours are linear in its picture; an sRGB image keeps them so (encoded on write,
 // decoded on read and blending), at 8 bits a channel, and the blit into the sRGB swapchain copies them unchanged
 constexpr uint32_t kUiGx2Format = 0x41A;  // (GX2 RGBA8 sRGB)
+// (2026-11-12, a Quest 3S player: "the UI is blurry") the image's height: an eye picture's on a PC (the headset's
+// images that size too); on a standalone headset the eye pictures are drawn smaller (vr.renderScale, 0.70 on a Quest)
+// and upscaled into the headset's images, so the UI, a few flat draws, is drawn at the headset images' pixels per
+// degree instead: the picture's height / vr.renderScale (at most twice it), the 3D view's resolution unchanged
+uint32_t height_for(uint32_t picture) {
+#ifdef WWHD_VR
+  if constexpr (!vr::kPcVrBuild) {
+    // (read once: the eye pictures' size is set at the session's start; a new Headset resolution takes a restart)
+    static const float k = [] {
+      const float s = vr::config().renderScale;
+      return s > 0.0f ? std::clamp(1.0f / s, 1.0f, 2.0f) : 1.0f;
+    }();
+    return uint32_t(std::lround(double(picture) * double(k)));
+  }
+#endif
+  return picture;
+}
 Surface* surface(const Surface* like) {
   static const FormatInfo uiFormat = format_info(kUiGx2Format, false);
   const float shared = aspect::game();
-  const uint32_t h = like->extent.height;
+  const uint32_t h = height_for(like->extent.height);
   const uint32_t w = uint32_t(std::lround(double(h) * double(shared > 0 ? shared : 16.0f / 9.0f)));
   const auto limit = R.properties.limits.maxImageDimension2D;
   if (!w || !h || w > limit || h > limit) exception_report::raise("UI layer image dimensions exceed device limits");
@@ -353,6 +376,605 @@ Surface* ui_layer_drawn() {
 }
 // (the frame dumps) the image as the last frame with UI left it
 Surface* ui_layer_last() { return ui_layer::g_surface.image ? &ui_layer::g_surface : nullptr; }
+
+// (docs/VR_HANDS_LAYER_PLAN.md, step 2) Link's draws (his lists, bracketed by OP_VR_HANDS: his hands, arms and what he
+// holds once his body is hidden) into an image of their own per eye instead of the eye's picture, tested against the
+// eye's depth as before (walls still hide the sword), the alpha written as coverage; the eye's picture then has no
+// hands. Off by default while it is built: WWHD_VR_HANDS_LAYER=1
+extern "C" bool wwhd_vr_hands_bracket_active();  // (gx2_core.cpp: a draw inside Link's lists now)
+extern "C" bool wwhd_vr_hands_own_bracket_active();  // (gx2_core.cpp: inside his own packets, not the rest of his lists)
+namespace hands_layer {
+Surface g_surface[2];
+uint64_t g_drawnFrame[2] = {~uint64_t{0}, ~uint64_t{0}};
+// (step 5) the code's switch: on unless WWHD_VR_HANDS_LAYER=0 for the start; whether it runs is active() (the setting
+// vr.handsLayer, 30/45 fps: vrvk::hands_layer_wanted)
+bool enabled() {
+#ifdef WWHD_VR
+  static const bool on = [] {
+    const char* e = getenv("WWHD_VR_HANDS_LAYER");
+    return !(e && *e == '0');
+  }();
+  return on;
+#else
+  return false;
+#endif
+}
+// (on the render thread only: the bracket is the render thread's place in the command stream; a drawing thread (the
+// scene's, the atlas's) draws commands from elsewhere in it, and checked against the render thread's place, a headset
+// run sent most of the world into the hands image, 2026-11-12. Link's draws stay on the render thread: batch_can_hold
+// and the scene thread's hand-over leave them there)
+// (2026-11-13) Link's lists' bracket depth as the thread drawing now sees it, in the draws' order: set by the render thread
+// while it draws them itself, by the scene's thread (kStateHands, handed in order with the draws) while a part runs
+// there. One of the two draws at a time (the render thread joins a part before it draws). The second drawing thread
+// never draws inside it (scene_thread::switch_to_b)
+int g_execDepth = 0;
+bool executing_thread() {
+  return !draw_threads::on_draw_thread() || (scene_thread::on_scene_thread() && !scene_thread::on_scene_b());
+}
+// (step 5, 2026-11-13: "we don't hit 90 fps at all") on only while the game runs under the headset's rate; at a real 90
+// nothing of it runs (no copies, the second drawing thread free). Decided on the render thread once a frame
+std::atomic<bool> g_wanted{false};
+bool active() {
+  if (!enabled()) return false;
+  static uint64_t decided = ~uint64_t{0};
+  if (!draw_threads::on_draw_thread() && decided != R.frame) {
+    decided = R.frame;
+    bool wanted = vrvk::hands_layer_wanted();
+#ifdef WWHD_VR
+    // (diagnostics, WWHD_VR_HANDS_AB=<seconds>: steady hands' parts in turn, the phase logged; vr::hands_ab_mode)
+    static const int abSeconds = [] {
+      const char* e = getenv("WWHD_VR_HANDS_AB");
+      const int s = e ? atoi(e) : 0;
+      if (s > 0) LOG("[vr hands test] on: phases of %d s: 0 steady hands as in play, 1 all of it off, 2 off but Link's "
+                     "lists split, 3 on but Link drawn into the eye's picture", s);
+      return s;
+    }();
+    if (abSeconds > 0) {
+      static const auto start = std::chrono::steady_clock::now();
+      const long long s = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count();
+      const int mode = int((s / abSeconds) % 4);
+      if (mode != vr::hands_ab_mode()) {
+        static const char* const kNames[4] = {"steady hands as in play", "steady hands all off",
+                                              "off, Link's lists still split and bracketed",
+                                              "on, Link drawn into the eye's picture (no hands image)"};
+        LOG("[vr hands test] phase %d: %s (frame %llu)", mode, kNames[mode], (unsigned long long)R.frame);
+        vr::set_hands_ab_mode(mode);
+      }
+      if (mode == 1 || mode == 2) wanted = false;
+    }
+#endif
+    if (wanted != g_wanted.load(std::memory_order_relaxed))
+      LOG("[vr hands] the hands layer %s", wanted ? "on (30/45 fps, Steady hands while turning)" : "off");
+    g_wanted.store(wanted, std::memory_order_relaxed);
+#ifdef WWHD_VR
+    vr::set_hands_layer_on(wanted);
+#endif
+  }
+  return g_wanted.load(std::memory_order_relaxed);
+}
+bool candidate() {
+#ifdef WWHD_VR
+  if (vr::hands_ab_mode() == 3) return false;  // (the test's phase 3: Link drawn into the eye's picture)
+#endif
+  if (overlap::handsThreadTls) return active() && stereo::frame.mode == stereo::XR;  // (Link's span: all of it his)
+  return active() && stereo::frame.mode == stereo::XR && g_execDepth > 0 && executing_thread();
+}
+// (render thread, deciding how a draw is drawn: batched or not) inside his lists in the command stream now
+// (2026-11-14) by the game's marks alone, not also active(): the game splits his lists by the flag active() set a frame
+// before (vr::hands_layer_on), so at a switch (Auto Mode's) a frame of split lists came here as normal draws, the test
+// run's black phase
+bool dispatch_inside() { return stereo::frame.mode == stereo::XR && wwhd_vr_hands_bracket_active(); }
+// the eye's own picture (its size: vr::picture_size), not the game's smaller buffers his lists are also drawn into
+bool eye_picture(const Surface* s) {
+#ifdef WWHD_VR
+  uint32_t pw = 0, ph = 0;
+  return s && vr::picture_size(pw, ph) && s->extent.width == pw && s->extent.height == ph;
+#else
+  (void)s;
+  return false;
+#endif
+}
+bool is(const Surface* s) { return s && ((s == &g_surface[0] && g_surface[0].image) || (s == &g_surface[1] && g_surface[1].image)); }
+constexpr uint32_t kHandsGx2Format = 0x41A;  // (GX2 RGBA8 sRGB, as the UI layer's: 8 bits of coverage)
+Surface* surface(int eye, const Surface* like) {
+  static const FormatInfo handsFormat = format_info(kHandsGx2Format, false);
+  Surface& s = g_surface[eye & 1];
+  const uint32_t w = like->extent.width, h = like->extent.height;
+  if (!w || !h) return nullptr;
+  if (!s.image || s.extent.width != w || s.extent.height != h || s.width != like->width || s.height != like->height) {
+    end_encoder();
+    destroy_surface_image(&s);
+    s = *like;
+    s.own_image_only();
+    s.mipChain.reset(); s.forget_replacement();
+    s.image = VK_NULL_HANDLE; s.memory = VK_NULL_HANDLE; s.view = VK_NULL_HANDLE;
+    s.layerViews.clear(); s.sampledViews.clear(); s.guestLayout.reset();
+    s.addr = s.mipAddr = 0;
+    s.slices = s.mips = 1;
+    s.dim = uint32_t(Latte::E_DIM::DIM_2D);
+    s.format = kHandsGx2Format;
+    s.fmt = handsFormat;
+    s.gpuWritten = true;  // (a private image: never uploaded from guest memory)
+    s.dirty = false;
+    create_surface_image(&s, false, {w, h, 1});
+    g_drawnFrame[eye & 1] = ~uint64_t{0};
+    LOG("[vr hands] eye %d image %ux%u", eye & 1, w, h);
+  }
+  if (g_drawnFrame[eye & 1] != R.frame) {
+    g_drawnFrame[eye & 1] = R.frame;
+    end_encoder();
+    transition_image(&s, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    // (2026-11-14: starting it at alpha 1 did not bring the Master Sword's glow back in a headset run (its draws over
+    // the empty background come out a faint dark halo, added onto the world: no glow); the user chose the glow off)
+    const VkClearColorValue clear{};
+    const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    record::vkCmdClearColorImage(command_buffer(), s.image, s.layout, &clear, 1, &range);
+  }
+  return &s;
+}
+// the eye's depth as it was before Link's draws, put back after them (the bracket's end): his draws write it (two-pass
+// models need it) but the world drawn later must not be hidden behind his hands. Once per bracket and eye
+Surface g_depthSave[2];
+Surface* g_depthSaved[2] = {};
+uint32_t g_depthSavedLayer[2] = {};
+VkImageAspectFlags depth_aspect(const Surface& s) {
+  return VK_IMAGE_ASPECT_DEPTH_BIT | (s.fmt.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+}
+void copy_depth(Surface& from, uint32_t fromLayer, Surface& to, uint32_t toLayer) {
+  end_encoder();
+  transition_image(&from, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+  transition_image(&to, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+  VkImageCopy region{};
+  region.srcSubresource = {depth_aspect(from), 0, fromLayer, 1};
+  region.dstSubresource = {depth_aspect(to), 0, toLayer, 1};
+  region.extent = {std::min(from.extent.width, to.extent.width), std::min(from.extent.height, to.extent.height), 1};
+  record::vkCmdCopyImage(command_buffer(), from.image, from.layout, to.image, to.layout, 1, &region);
+}
+// (diagnostics, 2026-11-13: the background's shadows still on Link with his own mask in use) one frame's order of his
+// brackets, the pass and its second run, logged from the second run's first frame on, twice
+uint64_t g_traceFrame = 0;
+int g_traceLeft = 2;
+inline bool tracing() { return g_traceFrame && R.frame <= g_traceFrame + 1 && R.frame >= g_traceFrame; }
+Surface g_depthCombined[2];
+Surface* g_depthTarget[2] = {};
+uint32_t g_depthTargetAddr[2] = {};
+uint32_t g_depthTargetLayer[2] = {};
+uint64_t g_combinedFrame[2] = {~uint64_t{0}, ~uint64_t{0}};
+void save_depth(int eye, Surface* depth, uint32_t slice) {
+  eye &= 1;
+  if (!depth || !depth->image || g_depthSaved[eye]) return;
+  Surface& s = g_depthSave[eye];
+  if (!s.image || s.extent.width != depth->extent.width || s.extent.height != depth->extent.height ||
+      s.fmt.pixel != depth->fmt.pixel) {
+    end_encoder();
+    destroy_surface_image(&s);
+    s = *depth;
+    s.own_image_only();
+    s.mipChain.reset(); s.forget_replacement();
+    s.image = VK_NULL_HANDLE; s.memory = VK_NULL_HANDLE; s.view = VK_NULL_HANDLE;
+    s.layerViews.clear(); s.sampledViews.clear(); s.guestLayout.reset();
+    s.addr = s.mipAddr = 0;
+    s.slices = s.mips = 1;
+    s.dim = uint32_t(Latte::E_DIM::DIM_2D);
+    s.gpuWritten = true;
+    s.dirty = false;
+    create_surface_image(&s, false, {depth->extent.width, depth->extent.height, 1});
+  }
+  if (!s.image) return;
+  const uint32_t layer = depth->baseLayer + slice;
+  copy_depth(*depth, layer, s, 0);
+  g_depthSaved[eye] = depth;
+  g_depthSavedLayer[eye] = layer;
+  // (2026-11-13) his lists come as several brackets a frame: each bracket's end kept the depth with his draws, the last
+  // one's (without his hands, maybe) replacing the earlier ones'. A later bracket of the same frame now starts from the
+  // depth with his earlier draws (as the game draws them), so the depth kept at its end holds all of them
+  const bool accumulate = g_combinedFrame[eye] == R.frame && g_depthTarget[eye] == depth &&
+                          g_depthTargetLayer[eye] == layer && g_depthCombined[eye].image;
+  if (accumulate) copy_depth(g_depthCombined[eye], 0, *depth, layer);
+  if (tracing())
+    LOG("[vr hands trace] frame %llu eye %d: his bracket begins (depth %p layer %u)%s", (unsigned long long)R.frame, eye,
+        (const void*)depth, layer, accumulate ? ", from his earlier draws' depth" : "");
+}
+// The passes that read the eye's depth after Link's draws (its downsample, ambient occlusion, the sun's shadow mask, the
+// point lights) must see his hands in it, as the game draws them: with the depth put back without them, his hands were
+// shaded from what lies behind them (a headset run: distant objects' shadows on his hands). The depth with his hands is
+// kept at the bracket's end and copied in for those passes, the depth without them copied back at the next draw of
+// another kind (the world drawn after them is not hidden behind his hands)
+bool g_combinedIn[2] = {};
+void make_like(Surface& s, const Surface& like) {
+  if (s.image && s.extent.width == like.extent.width && s.extent.height == like.extent.height && s.fmt.pixel == like.fmt.pixel)
+    return;
+  end_encoder();
+  destroy_surface_image(&s);
+  s = like;
+  s.own_image_only();
+  s.mipChain.reset(); s.forget_replacement();
+  s.image = VK_NULL_HANDLE; s.memory = VK_NULL_HANDLE; s.view = VK_NULL_HANDLE;
+  s.layerViews.clear(); s.sampledViews.clear(); s.guestLayout.reset();
+  s.addr = s.mipAddr = 0;
+  s.slices = s.mips = 1;
+  s.dim = uint32_t(Latte::E_DIM::DIM_2D);
+  s.gpuWritten = true;
+  s.dirty = false;
+  create_surface_image(&s, false, {like.extent.width, like.extent.height, 1});
+}
+// (2026-11-14, stage 1 of his own thread) Link's own depth image per eye: the eye's depth copied in at his first
+// bracket of the frame, his draws then test and write it, not the eye's. The world's depth is never changed, so nothing
+// is put back (the save and restore copies are gone: 16 full-size copies a frame on a standalone headset, about 36 with
+// the shading passes' swaps on PC, now 2 plus the swaps); it is also the depth with him the passes and the frame's end
+// read (g_depthCombined). His later brackets of the frame go on in it (the world drawn between them is hidden from him
+// at the frame's end, vr_genframe dilate)
+Surface* own_depth(int eye, Surface* depth, uint32_t slice) {
+  eye &= 1;
+  if (!depth || !depth->image) return nullptr;
+  const uint32_t layer = depth->baseLayer + slice;
+  Surface& c = g_depthCombined[eye];
+  if (g_combinedFrame[eye] != R.frame || g_depthTarget[eye] != depth || g_depthTargetLayer[eye] != layer || !c.image) {
+    make_like(c, *depth);
+    if (!c.image) return nullptr;
+    copy_depth(*depth, layer, c, 0);
+    // (back as an attachment at once: the main pass's depth is never left in a transfer layout, which the second
+    // drawing thread drawing into it beside the scene's thread does not expect)
+    transition_image(depth, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+    g_depthTarget[eye] = depth;
+    g_depthTargetAddr[eye] = depth->addr;
+    g_depthTargetLayer[eye] = layer;
+    g_combinedFrame[eye] = R.frame;
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      LOG("[vr hands] Link's draws test and write a depth image of their own (%ux%u): the eye's depth is not put back",
+          depth->extent.width, depth->extent.height);
+    }
+  }
+  return &c;
+}
+// (Link's span, render thread) the eye's depth surface of his last frames, still in the eye's map (the pointer compared,
+// never followed, until it is found there)
+bool depth_known(int eye) {
+  eye &= 1;
+  const Surface* t = g_depthTarget[eye];
+  if (!t || !g_depthTargetAddr[eye]) return false;
+  draw_threads::CacheLock lock(draw_threads::surface_mutex());
+  auto range = surfaces_of(eye).equal_range(g_depthTargetAddr[eye]);
+  for (auto it = range.first; it != range.second; ++it)
+    if (it->second.get() == t) return true;
+  return false;
+}
+// (Link's span, render thread, the eye selected) his depth image for this frame made now, in the eye's own stream, so
+// the scene's thread finds it ready (its first draws then copy nothing)
+bool prepare_own_depth(int eye) {
+  eye &= 1;
+  if (!depth_known(eye)) return false;
+  Surface* t = g_depthTarget[eye];
+  return own_depth(eye, t, g_depthTargetLayer[eye] - t->baseLayer) != nullptr;
+}
+void restore_eye(int eye);
+void restore_depth() {
+  for (int eye = 0; eye < 2; ++eye) restore_eye(eye);
+}
+void restore_eye(int eye) {
+  eye &= 1;
+  {
+    Surface* target = g_depthSaved[eye];
+    if (!target) return;
+    g_depthSaved[eye] = nullptr;
+    if (!target->image || !g_depthSave[eye].image) return;
+    {
+      static std::atomic<int> logged{0};
+      if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
+        LOG("[vr hands diag] bracket end: eye %d frame %llu depth %p addr %08X %ux%u layer %u", eye,
+            (unsigned long long)R.frame, (const void*)target, target->addr, target->extent.width, target->extent.height,
+            g_depthSavedLayer[eye]);
+    }
+    // (the depth with his hands: read by the second sun shadow pass only, his own mask; the game's passes read the depth
+    // without them: with his hands in it they darkened the world behind his hands' edges, which slid out from under
+    // them in a turn as black edges)
+#if defined(__ANDROID__) || defined(__aarch64__)
+    if (false) {  // (a standalone headset: no second shadow pass, so no depth with his hands kept)
+#else
+    make_like(g_depthCombined[eye], *target);
+    if (g_depthCombined[eye].image) {
+#endif
+      copy_depth(*target, g_depthSavedLayer[eye], g_depthCombined[eye], 0);  // (with his hands: for the passes below)
+      g_depthTarget[eye] = target;
+      g_depthTargetLayer[eye] = g_depthSavedLayer[eye];
+      g_combinedFrame[eye] = R.frame;
+      g_combinedIn[eye] = false;
+    }
+    copy_depth(g_depthSave[eye], 0, *target, g_depthSavedLayer[eye]);  // (without them: the world drawn next)
+    if (tracing())
+      LOG("[vr hands trace] frame %llu eye %d: his bracket ends (his depth kept)", (unsigned long long)R.frame, eye);
+  }
+}
+#if defined(__ANDROID__) || defined(__aarch64__)
+constexpr bool kNativeDepthEarly = false;
+#else
+constexpr bool kNativeDepthEarly = true;
+#endif
+bool pass_program(uint32_t p);
+Surface g_depthWorld[2];      // (native depth) the eye's depth without him while the passes read the one with him
+bool g_swapIn = false;
+bool g_swappedEye[2] = {};
+uint64_t g_swapFrame = ~uint64_t{0};
+void swap_out(const char* why) {
+  if (!g_swapIn) return;
+  g_swapIn = false;
+  if (g_swapFrame != R.frame) return;  // (a new frame: the depth is the game's own again)
+  for (int eye = 0; eye < 2; ++eye) {
+    if (!g_swappedEye[eye]) continue;
+    g_swappedEye[eye] = false;
+    Surface* t = g_depthTarget[eye];
+    if (t && t->image && g_depthWorld[eye].image) copy_depth(g_depthWorld[eye], 0, *t, g_depthTargetLayer[eye]);
+  }
+  if (tracing()) LOG("[vr hands trace] frame %llu: the depth without him back (%s)", (unsigned long long)R.frame, why);
+}
+void swap_in() {
+  if (g_swapIn && g_swapFrame == R.frame) return;
+  g_swapIn = false;
+  bool any = false;
+  for (int eye = 0; eye < 2; ++eye) {
+    g_swappedEye[eye] = false;
+    Surface* t = g_depthTarget[eye];
+    if (!t || !t->image || !g_depthCombined[eye].image || g_combinedFrame[eye] != R.frame) continue;
+    make_like(g_depthWorld[eye], *t);
+    if (!g_depthWorld[eye].image) continue;
+    copy_depth(*t, g_depthTargetLayer[eye], g_depthWorld[eye], 0);       // (the world as it is now)
+    copy_depth(g_depthCombined[eye], 0, *t, g_depthTargetLayer[eye]);    // (with him)
+    g_swappedEye[eye] = any = true;
+  }
+  if (!any) return;
+  g_swapIn = true;
+  g_swapFrame = R.frame;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    LOG("[vr hands] the game's screen passes read the depth with Link in it (his shadows and shading as the game draws them)");
+  }
+  if (!g_traceFrame) g_traceFrame = R.frame + 30;
+  if (tracing()) LOG("[vr hands trace] frame %llu: the depth with him in, for the passes", (unsigned long long)R.frame);
+}
+// (the scene's thread, in order: Worker::in_order, once per eye) the same, for the eye in hand
+bool swap_wanted_in(const uint32_t* r) {
+  return kNativeDepthEarly && active() && stereo::frame.mode == stereo::XR && pass_program(r[mmSQ_PGM_START_PS]) &&
+         (g_combinedFrame[0] == R.frame || g_combinedFrame[1] == R.frame) && !(g_swapIn && g_swapFrame == R.frame);
+}
+bool swap_wanted_out(const uint32_t* r) {
+  if (!kNativeDepthEarly || !enabled() || !g_swapIn) return false;
+  if (g_swapFrame != R.frame) { g_swapIn = false; return false; }
+  return !pass_program(r[mmSQ_PGM_START_PS]) && g_depthTarget[0] && r[mmDB_DEPTH_BASE] &&
+         r[mmDB_DEPTH_BASE] == g_depthTarget[0]->addr;
+}
+void swap_in_eye(int eye) {
+  eye &= 1;
+  g_swappedEye[eye] = false;
+  Surface* t = g_depthTarget[eye];
+  if (!t || !t->image || !g_depthCombined[eye].image || g_combinedFrame[eye] != R.frame) return;
+  make_like(g_depthWorld[eye], *t);
+  if (!g_depthWorld[eye].image) return;
+  copy_depth(*t, g_depthTargetLayer[eye], g_depthWorld[eye], 0);
+  copy_depth(g_depthCombined[eye], 0, *t, g_depthTargetLayer[eye]);
+  g_swappedEye[eye] = true;
+  g_swapIn = true;
+  g_swapFrame = R.frame;
+}
+void swap_out_eye(int eye) {
+  eye &= 1;
+  if (!g_swappedEye[eye]) return;
+  g_swappedEye[eye] = false;
+  Surface* t = g_depthTarget[eye];
+  if (t && t->image && g_depthWorld[eye].image) copy_depth(g_depthWorld[eye], 0, *t, g_depthTargetLayer[eye]);
+  if (!g_swappedEye[0] && !g_swappedEye[1]) g_swapIn = false;
+}
+// (render thread, a draw it draws itself: not while a part runs on the scene's thread, whose draws do this there)
+void before_dispatch(const uint32_t* r) {
+  if (!kNativeDepthEarly || !enabled() || stereo::frame.mode != stereo::XR || draw_threads::on_draw_thread()) return;
+  if (switches::kSceneThread && scene_thread::running()) return;
+  if (!active()) { swap_out("the hands layer off now"); return; }
+  if (g_swapIn && g_swapFrame != R.frame) g_swapIn = false;
+  if (pass_program(r[mmSQ_PGM_START_PS])) {
+    if (g_combinedFrame[0] == R.frame || g_combinedFrame[1] == R.frame) {
+      hands_thread_join_emit();  // (Link's span: his depth complete on the GPU before it is copied in)
+      swap_in();
+    }
+    return;
+  }
+  if (g_swapIn && g_depthTarget[0] && r[mmDB_DEPTH_BASE] && r[mmDB_DEPTH_BASE] == g_depthTarget[0]->addr)
+    swap_out("a draw into the eye's depth");
+}
+bool reads_depth(gfx::ProgramKind k) {
+  return k == gfx::ProgramKind::DepthDownsample || k == gfx::ProgramKind::OcclusionPixel ||
+         k == gfx::ProgramKind::SunShadowMask || k == gfx::ProgramKind::PointLight;
+}
+// The sun's shadow mask (a screen-space image: each pixel shadowed or not, from the depth): Link's hands are in their
+// own image and the mask is made from the depth without them, so a pixel of his hands holds the shadow of what lies
+// behind it (a headset run: a cliff's shadow edge across his shield). His draws are given a mask that shadows nothing
+// instead (asked for, 2026-11-12: "shadow do not draw onto Link's weapons or body, but his weapons and body can cast a
+// shadow"); his own shadow on the ground is the sun's shadow map, not this
+Surface* g_shadowMask[2] = {};
+Surface g_noShadow[2];
+// (asked for, 2026-11-12: "if Link is under a tree the shadow should draw on him, but a shadow cast on the ground from an
+// object not near him should not") his own mask: the sun shadow pass drawn a second time for each eye, into this image,
+// from the depth with his hands (g_depthCombined): each pixel of his hands shadowed by what lies between it and the sun
+Surface g_handsMask[2];
+uint64_t g_handsMaskFrame[2] = {~uint64_t{0}, ~uint64_t{0}};
+bool g_inShadowPass = false;  // (the second run: its target and depth input are his)
+// (2026-11-13, a headset run's log: in play the game's sun shadow pass was drawn on the scene's drawing thread, 600 of
+// 600 draws, so the second run never happened) the pass's pixel program, noted at its first draw on any thread: with
+// the hands layer on (PC VR) the pass stays on the render thread (scene_thread dispatch), the second run after it
+std::atomic<uint32_t> g_shadowPassProgram{0};
+// (2026-11-13: no longer: the second run's own mask did not take the background's shadows off him in a headset run;
+// the game's passes read the depth with him instead, native_depth below)
+constexpr bool kSecondShadowPass = false;
+// (2026-11-13) The game's screen passes (the depth's downsample, ambient occlusion, the sun's shadow mask, the point
+// lights, and what they feed) read the eye's depth to shade each pixel by what is there. With Link's draws in their own
+// image and the depth put back without him, they shaded his pixels from the background behind him: the background's
+// shadows on him (headset runs, 2026-11-12/13), whatever the sun mask he was given. Now, as the game draws it: from his
+// first bracket's end in a frame, every draw of those passes reads the depth with him (copied in, both eyes), and the
+// first draw after that writes into the eye's depth (the world, his own brackets) gets the depth without him back, as
+// it is then (copied out first, so nothing the world drew is lost). PC only (two depth copies an eye per change).
+#if defined(__ANDROID__) || defined(__aarch64__)
+constexpr bool kNativeDepth = false;
+#else
+constexpr bool kNativeDepth = true;
+#endif
+std::atomic<uint32_t> g_passPrograms[16] = {};
+void note_pass_program(uint32_t p) {
+  if (!p) return;
+  for (auto& slot : g_passPrograms) {
+    uint32_t v = slot.load(std::memory_order_relaxed);
+    if (v == p) return;
+    if (!v && slot.compare_exchange_strong(v, p)) return;
+    if (v == p) return;
+  }
+}
+bool pass_program(uint32_t p) {
+  if (!p) return false;
+  for (auto& slot : g_passPrograms) {
+    const uint32_t v = slot.load(std::memory_order_relaxed);
+    if (!v) return false;
+    if (v == p) return true;
+  }
+  return false;
+}
+bool keep_shadow_pass_here(const uint32_t* r) {
+  return kNativeDepth && enabled() && stereo::frame.mode == stereo::XR && pass_program(r[mmSQ_PGM_START_PS]);
+}
+void note_shadow_mask(int eye, Surface* s) {
+  if (s) g_shadowMask[eye & 1] = s;
+}
+// (the second run, resolve_targets) its target: his mask, the game's mask's like
+Surface* shadow_pass_target(int eye, Surface* gameMask) {
+  Surface& m = g_handsMask[eye & 1];
+  make_like(m, *gameMask);
+  if (!m.image) return nullptr;
+  g_handsMaskFrame[eye & 1] = R.frame;
+  return &m;
+}
+// (the second run, resolve_texture) its depth input: the depth with his hands, for the eye's depth
+Surface* shadow_pass_depth(int eye, Surface* s) {
+  eye &= 1;
+  // (this frame's or the last's: the pass may come before his draws in a frame, reading the depth the last left)
+  if (s && s == g_depthTarget[eye] && g_depthCombined[eye].image && g_combinedFrame[eye] + 1 >= R.frame) {
+    if (tracing())
+      LOG("[vr hands trace] frame %llu eye %d: second run reads his depth (kept frame %llu)", (unsigned long long)R.frame,
+          eye, (unsigned long long)g_combinedFrame[eye]);
+    return &g_depthCombined[eye];
+  }
+  if (tracing())
+    LOG("[vr hands trace] frame %llu eye %d: second run samples %p addr %08X %ux%u, not his depth (%p)",
+        (unsigned long long)R.frame, eye, (const void*)s, s ? s->addr : 0u, s ? s->extent.width : 0u,
+        s ? s->extent.height : 0u, (const void*)g_depthTarget[eye]);
+  return nullptr;
+}
+bool shadow_pass_ready(int eye) {
+  eye &= 1;
+  return g_depthTarget[eye] && g_depthCombined[eye].image && g_combinedFrame[eye] + 1 >= R.frame && g_shadowMask[eye];
+}
+Surface* no_shadow_for(Surface* s) {
+  if (!s) return nullptr;
+  if (vr::config().shadowsOnLink) return nullptr;  // (the game's mask, made from the depth with him: native_depth)
+  for (int eye = 0; eye < 2; ++eye) {
+    const Surface* m = g_shadowMask[eye];
+    // (2026-11-13, the log: his draws sample a copy of the mask at its address, not the pass's target itself)
+    if (!m || (s != m && (s->addr != m->addr || s->extent.width != m->extent.width ||
+                          s->extent.height != m->extent.height)))
+      continue;
+    // his own mask when made (this frame or the last); else none
+    if (g_handsMask[eye].image && g_handsMaskFrame[eye] + 1 >= R.frame) {
+      if (g_handsMask[eye].fmt.pixel == s->fmt.pixel) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true))
+          LOG("[vr hands] Link's draws given his own shadow mask (%ux%u, eye %d)", s->extent.width, s->extent.height, eye);
+        static uint64_t tracedFrame = 0;
+        if (tracing() && tracedFrame != R.frame * 2 + eye) {
+          tracedFrame = R.frame * 2 + eye;
+          LOG("[vr hands trace] frame %llu eye %d: his draw samples his own mask (made frame %llu)",
+              (unsigned long long)R.frame, eye, (unsigned long long)g_handsMaskFrame[eye]);
+        }
+        return &g_handsMask[eye];
+      }
+      static std::atomic<bool> loggedFmt{false};
+      if (!loggedFmt.exchange(true))
+        LOG("[vr hands] his own shadow mask's format %u is not the sampled one's %u: no screen shadow instead",
+            unsigned(g_handsMask[eye].fmt.pixel), unsigned(s->fmt.pixel));
+    }
+    Surface& n = g_noShadow[eye];
+    const bool fresh = !n.image || n.extent.width != s->extent.width || n.extent.height != s->extent.height ||
+                       n.fmt.pixel != s->fmt.pixel;
+    if (fresh) {
+      make_like(n, *s);
+      if (!n.image) return nullptr;
+      end_encoder();
+      transition_image(&n, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+      VkClearColorValue white{};
+      white.float32[0] = white.float32[1] = white.float32[2] = white.float32[3] = 1.0f;
+      const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      record::vkCmdClearColorImage(command_buffer(), n.image, n.layout, &white, 1, &range);
+      LOG("[vr hands] Link's draws given no screen shadow (the sun's shadow mask %ux%u, eye %d)", s->extent.width,
+          s->extent.height, eye);
+    }
+    return &n;
+  }
+  return nullptr;
+}
+// (diagnostics, 2026-11-13: Link's own mask was never made in any run, nor the fallback used) what his draws and the sun
+// shadow pass sample, the first of each, once
+static std::atomic<int> g_diagCount{0};
+void diag_sampled(const char* who, const Surface* s, int eye) {
+  if (!s || g_diagCount.load(std::memory_order_relaxed) >= 80) return;
+  static std::mutex m;
+  static std::vector<std::pair<const Surface*, const char*>> seen;
+  std::lock_guard<std::mutex> l(m);
+  for (auto& e : seen)
+    if (e.first == s && e.second == who) return;
+  seen.emplace_back(s, who);
+  g_diagCount.fetch_add(1, std::memory_order_relaxed);
+  LOG("[vr hands diag] %s (eye %d, frame %llu, %s) samples %p addr %08X %ux%u fmt %u layers %u base %u map-eye %u%s%s", who,
+      eye, (unsigned long long)R.frame, draw_threads::on_draw_thread() ? "drawing thread" : "render thread", (const void*)s,
+      s->addr, s->extent.width, s->extent.height, unsigned(s->fmt.pixel), s->arrayLayers, s->baseLayer, unsigned(s->eye),
+      (s == g_shadowMask[0] || s == g_shadowMask[1]) ? " = the noted shadow mask" : "",
+      (s == g_depthTarget[0] || s == g_depthTarget[1]) ? " = the eye depth" : "");
+}
+// (the render thread, before each draw) the eye's depth with or without his hands, for the pass about to be drawn
+void before_draw(gfx::ProgramKind kind, int eye) {
+  return;  // (no longer used: no_shadow_for)
+  eye &= 1;
+  if (draw_threads::on_draw_thread() || g_combinedFrame[eye] != R.frame || !g_depthTarget[eye] || !g_depthTarget[eye]->image)
+    return;
+  Surface& target = *g_depthTarget[eye];
+  if (reads_depth(kind)) {
+    if (!g_combinedIn[eye] && g_depthCombined[eye].image) {
+      copy_depth(g_depthCombined[eye], 0, target, g_depthTargetLayer[eye]);
+      g_combinedIn[eye] = true;
+    }
+  } else if (g_combinedIn[eye] && g_depthSave[eye].image) {
+    copy_depth(g_depthSave[eye], 0, target, g_depthTargetLayer[eye]);
+    g_combinedIn[eye] = false;
+    g_combinedFrame[eye] = ~uint64_t{0};  // (done for this frame)
+  }
+}
+}  // namespace hands_layer
+// (gx2_core.cpp, render thread: Link's lists' bracket closed) the eyes' depth put back as it was before his draws
+extern "C" void wwhd_vr_hands_bracket_end() { hands_layer::restore_depth(); }
+// (gx2_core.cpp, render thread, no part on the scene's thread) the bracket's depth after a marker, the render thread
+// drawing the draws around it
+extern "C" void wwhd_vr_hands_exec_depth(int depth) {
+  const bool began = hands_layer::g_execDepth == 0 && depth > 0;
+  const bool ended = hands_layer::g_execDepth > 0 && depth == 0;
+  hands_layer::g_execDepth = depth;
+  // (2026-11-14) his draws on the scene's thread while the render thread draws on (a light frame: no part there)
+  // (begun at his bracket's first draw handed out, draw_stereo_one: a part that starts there takes his draws instead)
+  (void)began;
+  if (ended) scene_thread::hands_span_end();
+}
+// (vr_vulkan.cpp: the eye's hands image this frame; null: none drawn)
+Surface* hands_layer_drawn_here(int eye) {
+  const Surface& s = hands_layer::g_surface[eye & 1];
+  return s.image && hands_layer::g_drawnFrame[eye & 1] == R.frame ? const_cast<Surface*>(&s) : nullptr;
+}
 
 float f32(uint32_t v) {
   float f;
@@ -904,7 +1526,7 @@ PipelineKey pipeline_key(const uint32_t* r, const vk::Shader* vs, const vk::Shad
       key.blend[i] = raw & (raw & (1u << 29) ? 0x3FFF1FFFu : 0x00001FFFu);
     }
   key.colorControl = (colorControl & 0x00FF0000u) | (blending << 8);  // ROP, blend enables
-  if (ui_layer::is(colors[0])) key.colorControl |= 1u << 31;  // (the UI layer's image: alpha as coverage, below)
+  if (ui_layer::is(colors[0]) || hands_layer::is(colors[0])) key.colorControl |= 1u << 31;  // (the UI layer's image: alpha as coverage, below)
   key.targetMask = ncolor >= 8 ? r[REGADDR::CB_TARGET_MASK]
                                : r[REGADDR::CB_TARGET_MASK] & ((1u << (4 * ncolor)) - 1);
   if (depth) {
@@ -1509,6 +2131,10 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
   VkPipelineDepthStencilStateCreateInfo ds{
       VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
   ds.depthTestEnable = depth && dc.get_Z_ENABLE();
+  // (Link's hands into their own image, hands_layer: written into the eye's depth as the game asks (models drawn in two
+  // passes, depth then colour where it is equal, drew nothing without it: held items and the hands gripping them were
+  // invisible); the eye's depth is put back after his draws (hands_layer save_depth / bracket end), so the world drawn
+  // after them is not hidden behind his hands)
   ds.depthWriteEnable = depth && dc.get_Z_WRITE_ENABLE();
   ds.depthCompareOp = VkCompareOp(dc.get_Z_FUNC());
   ds.stencilTestEnable = depth && depth->fmt.stencil && dc.get_STENCIL_ENABLE();
@@ -1566,11 +2192,41 @@ Pipeline &pipeline(const uint32_t *r, vk::Shader *vs, vk::Shader *ps,
             int(b.dstAlphaBlendFactor), unsigned(b.colorWriteMask),
             dc.get_Z_ENABLE() || dc.get_STENCIL_ENABLE() ? " (the game tests depth or stencil: none here)" : "");
     }
-    if (i == 0 && ui_layer::is(colors[0]) && (b.colorWriteMask & 7)) {
+    if (i == 0 && (ui_layer::is(colors[0]) || (hands_layer::is(colors[0]) && !vr_genframe::hands_coverage_from_depth())) &&
+        (b.colorWriteMask & 7)) {
       b.colorWriteMask |= VK_COLOR_COMPONENT_A_BIT;
+      if (b.blendEnable && hands_layer::is(colors[0])) {
+        // (diagnostics, 2026-11-14: the Master Sword's white glow a black outline in his image) each blend of his, once
+        static std::mutex m;
+        static std::vector<uint64_t> seen;
+        const uint64_t key = uint64_t(b.srcColorBlendFactor) | uint64_t(b.dstColorBlendFactor) << 8 |
+                             uint64_t(b.colorBlendOp) << 16 | uint64_t(b.srcAlphaBlendFactor) << 24 |
+                             uint64_t(b.dstAlphaBlendFactor) << 32 | uint64_t(b.alphaBlendOp) << 40;
+        std::lock_guard<std::mutex> l(m);
+        if (std::find(seen.begin(), seen.end(), key) == seen.end() && seen.size() < 32) {
+          seen.push_back(key);
+          LOG("[vr hands] a blended draw of Link's: colour %d*src %d %d*dst, alpha %d*src %d %d*dst (VkBlendFactor/Op), "
+              "writes %X", int(b.srcColorBlendFactor), int(b.colorBlendOp), int(b.dstColorBlendFactor),
+              int(b.srcAlphaBlendFactor), int(b.alphaBlendOp), int(b.dstAlphaBlendFactor), unsigned(b.colorWriteMask));
+        }
+      }
       if (b.blendEnable) {
+        // (also Link's hands' blended draws, hands_layer: "over", their alpha their coverage. Counted as fully covered
+        // they showed the sword's soft edge and glow as a black outline over the layer's empty background, a headset
+        // run; the invisible items were their depth, written again since)
         b.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
         b.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        b.alphaBlendOp = VK_BLEND_OP_ADD;
+      } else if (hands_layer::is(colors[0])) {
+        // (Link's hands, hands_layer: a solid draw covers fully. Its shader's alpha is not coverage (a headset run had
+        // his hands see-through): the colour replaced as without a blend, the alpha the blend constant's, set to 1 for
+        // these draws in the draw's state)
+        b.blendEnable = VK_TRUE;
+        b.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+        b.dstColorBlendFactor = VK_BLEND_FACTOR_ZERO;
+        b.colorBlendOp = VK_BLEND_OP_ADD;
+        b.srcAlphaBlendFactor = VK_BLEND_FACTOR_CONSTANT_ALPHA;
+        b.dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
         b.alphaBlendOp = VK_BLEND_OP_ADD;
       }
     }
@@ -2008,7 +2664,7 @@ VkSampler sampler(const uint32_t *words, bool compare, bool integer, bool allowA
       ? std::min(1u << std::min(uint32_t(w.get_MAX_ANISO_RATIO()), 4u), 16u) : 1;
   if (forceAniso && uint32_t(w.get_MIP_FILTER()) != 0 && ci.minFilter == VK_FILTER_LINEAR &&
       uint32_t(w.get_DEPTH_COMPARE_FUNCTION()) == 0)
-    anisotropy = std::max(anisotropy, aniso_max_ratio());  // (16, or 4 on a standalone headset: settings.cpp)
+    anisotropy = std::max(anisotropy, aniso_max_ratio());  // (16; 8 on a Quest, 2 on the Steam Frame: settings.cpp)
   if (R.enabledFeatures.samplerAnisotropy && !nearestOnly && anisotropy > 1) {
     ci.anisotropyEnable = VK_TRUE;
     ci.maxAnisotropy = std::min(float(anisotropy), R.properties.limits.maxSamplerAnisotropy);
@@ -2799,6 +3455,41 @@ bool resolve_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& t) {
     for (int i = 1; i < 8; ++i) colors[i] = nullptr;
     depth = nullptr;
   }
+  // (docs/VR_HANDS_LAYER_PLAN.md) the sun shadow pass's second run: into Link's own mask
+  if (hands_layer::g_inShadowPass && colors[0] && colors[0] == hands_layer::g_shadowMask[stereoEye() & 1]) {
+    if (Surface* m = hands_layer::shadow_pass_target(stereoEye(), colors[0])) {
+      colors[0] = m;
+      t.slices[0] = 0;
+    }
+  }
+  // (docs/VR_HANDS_LAYER_PLAN.md, step 2) Link's draws into the eye's hands image, the eye's depth kept
+  if (hands_layer::candidate() && colors[0] && stereo_screen_target(colors[0]->width, colors[0]->height) &&
+      hands_layer::eye_picture(colors[0])) {
+    if (Surface* hs = hands_layer::surface(stereoEye(), colors[0])) {
+      {  // (diagnostics, 2026-11-13) where Link's draws are drawn: the scene's thread now, not the render thread
+        static std::atomic<uint64_t> onRender{0}, onScene{0};
+        static std::atomic<int64_t> since{0};
+        (draw_threads::on_draw_thread() ? onScene : onRender).fetch_add(1, std::memory_order_relaxed);
+        const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t was = since.load(std::memory_order_relaxed);
+        if (!was) since.compare_exchange_strong(was, now);
+        else if (now - was >= 10 && since.compare_exchange_strong(was, now))
+          LOG("[vr hands] (10 s) Link's draws: %llu on the scene's thread, %llu on the render thread",
+              (unsigned long long)onScene.exchange(0), (unsigned long long)onRender.exchange(0));
+      }
+      colors[0] = hs;
+      t.slices[0] = 0;
+      for (int i = 1; i < 8; ++i) colors[i] = nullptr;
+      if (depth) {
+        if (!overlap::handsThreadTls) hands_layer::swap_out("his bracket");
+        // (stage 1 of his own thread) his own depth image, the eye's copied in once a frame; nothing put back
+        if (Surface* own = hands_layer::own_depth(stereoEye(), depth, t.depthSlice)) {
+          depth = own;
+          t.depthSlice = 0;
+        }
+      }
+    }
+  }
   Surface *target = depth;
   for (auto *c : colors)
     if (c) {
@@ -2884,7 +3575,7 @@ bool resolve_replay_targets(const uint32_t* r, vk::Shader* ps, DrawTargets& targ
   PER_THREAD_STATIC(keyedCache, KeyedCache);
   const auto& log = gx2::thread_change_log();
   const uint64_t keys[3] = {log.groupHash[gx2::kSgTargets], log.groupHash[gx2::kSgOutput], log.groupHash[gx2::kSgOther]};
-  const bool ao = aoPrivateReplay(), ui = ui_layer::candidate();
+  const bool ao = aoPrivateReplay(), ui = ui_layer::candidate() || hands_layer::candidate() || hands_layer::g_inShadowPass;
   const uint32_t eyeSize = stereo_eye_size_generation();
   const uint32_t scissorBR = r[REGADDR::PA_SC_GENERIC_SCISSOR_BR];
   for (auto& c : keyedCache.entries) {
@@ -3008,6 +3699,16 @@ Surface* resolve_texture(const uint32_t* r, vk::Shader* sh, uint32_t unit, const
         if (guest) *guest = s;
         return replacement;
       }
+  if (hands_layer::is(colors[0])) hands_layer::diag_sampled(sh->vertex ? "Link's draw (vs)" : "Link's draw", s, stereoEye());
+  if (overlap::handsThreadTls) scene_thread::hands_span_note(words, depthCompare, reach, s);  // (Link's span)
+  else if (!sh->vertex && sh->kind == gfx::ProgramKind::SunShadowMask && !hands_layer::g_inShadowPass)
+    hands_layer::diag_sampled("the sun shadow pass", s, stereoEye());
+  // (docs/VR_HANDS_LAYER_PLAN.md) Link's hands' draws: the sun's shadow mask as his own (made from his depth)
+  if (hands_layer::is(colors[0]))
+    if (Surface* own = hands_layer::no_shadow_for(s)) return own;
+  // (the sun shadow pass's second run: the eye's depth as the depth with his hands)
+  if (hands_layer::g_inShadowPass)
+    if (Surface* hd = hands_layer::shadow_pass_depth(stereoEye(), s)) return hd;
   return s;
 }
 bool aliases_target(const Surface* s, const std::array<Surface*, 8>& colors, const Surface* depth) {
@@ -4984,7 +5685,7 @@ const bool kSameL3 = switches::env_on("WWHD_VK_SCENE_THREAD_SAME_L3");
 constinit thread_local bool onSceneThreadTls = false;
 constinit thread_local bool onSceneBTls = false;  // (stage S6) the second drawing thread
 enum : uint32_t { kPass = DrawThread::kUser, kDraw, kEndEye1, kState, kClearColor, kClearDepth, kCopy, kScan,
-                  kEndA1, kEndB, kDoneB, kDrawRun };
+                  kEndA1, kEndB, kDoneB, kDrawRun, kHandsOn, kHandsOff };
 // (stage S6) the scene's thread's span before the second thread's (A1) and the second thread's (B): A1 recorded, B
 // done, the waits for them, and B's counters (diagnostics)
 struct Split {
@@ -5094,6 +5795,8 @@ private:
         layout_.drawDepth = j.a[0];
         layout_.photograph = j.a[1] != 0;
         contentClip_ = j.a[2] != 0;
+        layout_.sky = j.a[3] != 0;
+        layout_.full = j.a[4] != 0;
         ++t_partEpochSalt;  // (its draws bind everything themselves: its last span's state is not in this stream)
         if (kTwoSequential) g_split.spanBWaitNs.fetch_add(split_wait(&Split::a1Done, g_split.bWaitNs), std::memory_order_relaxed);  // (S6.2: after A1, one at a time)
       }
@@ -5106,6 +5809,12 @@ private:
       break;
     case kDraw: {
       t_drawIndex = j.a[6];
+      // (docs/VR_HANDS_LAYER_PLAN.md, native depth) the game's screen passes with the depth with Link, the world's draws
+      // without him: copied in order, per eye
+      if (hands_layer::enabled() && !overlap::handsThreadTls) [[unlikely]] {
+        if (hands_layer::swap_wanted_in(regs())) in_order([] { hands_layer::swap_in_eye(stereoEye()); });
+        else if (hands_layer::swap_wanted_out(regs())) in_order([] { hands_layer::swap_out_eye(stereoEye()); });
+      }
       // (diagnostics) one draw in 16 timed by phase, as the render thread's are
       struct Sampled {
         bool on;
@@ -5117,10 +5826,14 @@ private:
     }
     case kDrawRun: {  // (docs/VR_SCENE_THREADS.md, "S6: batched runs on the drawing threads")
       t_drawIndex = j.a[6];
+      if (hands_layer::enabled() && hands_layer::swap_wanted_out(regs())) [[unlikely]]
+        in_order([] { hands_layer::swap_out_eye(stereoEye()); });
       draw_run(j, words);
       break;
     }
     case kEndEye1: as_eye1([] { end_encoder(); }); break;  // eye 1's pass ends at the end of its commands
+    case kHandsOn: overlap::handsThreadTls = true; break;   // (docs/VR_HANDS_LAYER_PLAN.md: Link's span)
+    case kHandsOff: overlap::handsThreadTls = false; break;
     case kEndA1: {
       // (stage S6, the scene's thread) A1 ends here: its passes end and its eye 1 halves follow, so the second drawing
       // thread's commands come after all of it. Then it waits for that thread, and its commands follow
@@ -5173,8 +5886,17 @@ private:
         aspect::set_content_clip(j.n && words[0]);
         if (j.n >= 2) stereo::layout_draw(words[1] != 0);
         stereo::layoutPhotograph = j.n >= 3 && words[2];
+        stereo::layoutFull = j.n >= 4 && words[3];
         break;
       case render::kStateLayoutRoot: aspect::layout_root_target(words[0], words[1] != 0); break;
+      case render::kStateSky: stereo::skyDepth = j.n ? words[0] : 0; break;  // (the sky at infinity)
+      case render::kStateHands: {  // (docs/VR_HANDS_LAYER_PLAN.md) Link's lists' depth: his draws drawn here
+        const int depth = j.n ? int(words[0]) : 0;
+        const bool ended = hands_layer::g_execDepth > 0 && depth == 0;
+        hands_layer::g_execDepth = depth;
+        if (ended) in_order([] { hands_layer::restore_eye(stereoEye()); });
+        break;
+      }
       }
       break;
     }
@@ -5399,6 +6121,7 @@ stereo::LayoutState g_handed;
 bool g_handedClip = false;
 // (stage S6, render thread) the second drawing thread's span: the main geometry run's later half, last frame's
 bool g_bActive = false, g_bUsed = false;
+bool g_handsInPart = false;  // (docs/VR_HANDS_LAYER_PLAN.md) Link's brackets handed in this part: no second thread
 uint32_t g_runFirst = 0, g_runEnd = 0;
 // (docs/VR_SCENE_THREADS.md, "S6: the split balanced") where in the run the second drawing thread's span starts, as a
 // share of it: half to start, then balanced by A's wait for it at A1's end (later after a wait over 0.1 ms, earlier
@@ -5448,6 +6171,159 @@ void switch_back() {
   a.hand();
 }
 }  // namespace
+// ---------------------------------------------------------------- Link's span (docs/VR_HANDS_LAYER_PLAN.md, 2026-11-14)
+// In a frame with no part on the scene's thread (a light frame), his draws go to that thread anyway, from his bracket's
+// start to its end, while the render thread draws the world on. They draw only into his own images (his hands image
+// and his depth image, which the render thread fills from the eye's depth at the bracket's start, in each eye's own
+// stream); his commands go into two held streams, emitted at the join: before a submission, the swap, a part, and the
+// screen passes that read his depth. The scene's thread's arena, pool and register machine are its own; the caches'
+// locks are on from the span's start to its join (draw_threads::g_handsThreadActive); a surface both threads touch in
+// the wrong order switches the span off for the session (atlas_overlap.h hands_mark). Off by default:
+// WWHD_VR_HANDS_SPAN=1 for a test start
+namespace hands_span {
+struct Texture { uint32_t words[7]; bool depth; uint32_t maxLevels; Surface* surface; };
+bool g_spanOpen = false;      // (render thread) his bracket's draws go to the scene's thread now
+bool g_spanTried = false;     // (render thread) this bracket's span tried (begun or not)
+bool g_spanRunning = false;   // the scene's thread has a span begun and not completed
+bool g_spanPending = false;   // its commands not emitted yet
+uint64_t g_spans = 0;
+std::vector<Texture> g_textures, g_lastTextures;  // (the span's, on its thread; the last span's, render thread)
+struct Stats { uint64_t spans = 0, draws = 0, joins = 0, waitNs = 0, lockedAlready = 0, skipped = 0; } g_stats;
+// (2026-11-14: off by default, the user's choice to stay with stage 1; it never ran in the busy frames measured)
+const bool kOn = [] { const char* e = std::getenv("WWHD_VR_HANDS_SPAN"); return e && *e == '1'; }();
+bool still_cached(const Surface* s, uint32_t addr) {
+  auto range = surfaces_of(0).equal_range(addr);
+  for (auto it = range.first; it != range.second; ++it)
+    if (it->second.get() == s) return true;
+  return false;
+}
+void log_stats() {
+  static auto since = std::chrono::steady_clock::now();
+  const auto now = std::chrono::steady_clock::now();
+  if (now - since < std::chrono::seconds(10)) return;
+  since = now;
+  if (!g_stats.spans && !g_stats.skipped) return;
+  LOG("[vr hands] (10 s) Link's span on the scene's thread: %llu spans, %llu draws; %llu joins, the render thread waited "
+      "%.2f ms in all; %llu began with the caches' locks already on; %llu brackets drawn the other way%s",
+      (unsigned long long)g_stats.spans, (unsigned long long)g_stats.draws, (unsigned long long)g_stats.joins,
+      double(g_stats.waitNs) * 1e-6, (unsigned long long)g_stats.lockedAlready, (unsigned long long)g_stats.skipped,
+      overlap::g_handsSpanOff.load() ? " (off for this session)" : "");
+  g_stats = {};
+}
+}  // namespace hands_span
+bool hands_span_begin() {
+  using namespace hands_span;
+  if (g_spanTried) return false;  // (once a bracket)
+  g_spanTried = true;
+  // (a light frame only: in a busy one the scene's thread takes parts, his draws with them; a span begun there was cut
+  // after one draw by the part starting at the next, a headset run, 2026-11-14)
+  if (!kOn || overlap::g_handsSpanOff.load(std::memory_order_relaxed) || !switches::kSceneThread || !enabled() || g_running ||
+      sceneSplit.threadOn ||
+      !hands_layer::active() || stereo::frame.mode != stereo::XR || draw_threads::on_draw_thread()) {
+    ++g_stats.skipped;
+    return false;
+  }
+  if (!hands_layer::depth_known(0) || !hands_layer::depth_known(1)) {
+    ++g_stats.skipped;
+    return false;
+  }
+  auto& w = worker();
+  if (g_spanRunning) {  // (his earlier bracket of this frame: done before this one begins; its commands stay held)
+    const auto t0 = std::chrono::steady_clock::now();
+    w.complete();
+    g_spanRunning = false;
+    g_stats.waitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+  }
+  // his depth image per eye, each in its eye's own stream (eye 1's after its held draws so far)
+  if (!hands_layer::prepare_own_depth(0)) { ++g_stats.skipped; return false; }
+  stereo_select_eye(1);
+  const bool eye1 = hands_layer::prepare_own_depth(1);
+  stereo_select_eye(0);
+  if (!eye1) { ++g_stats.skipped; return false; }
+  // the textures his last span sampled, made ready here (their uploads and layouts before his commands)
+  for (auto& t : g_lastTextures) {
+    const uint32_t addr = t.words[2] << 8;
+    draw_threads::CacheLock lock(draw_threads::surface_mutex());
+    if (hands_span::still_cached(t.surface, addr) || hands_span::still_cached(t.surface, addr & ~0x700u))
+      if (Surface* s = sampled_texture(t.words, t.depth, t.maxLevels))
+        transition_image(s, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                         VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                         VK_ACCESS_SHADER_READ_BIT);
+  }
+  end_encoder();
+  if (draw_threads::second_thread_active()) ++g_stats.lockedAlready;
+  draw_threads::g_handsThreadActive.store(true, std::memory_order_relaxed);
+  overlap::g_handsOverlap.store(++g_spans, std::memory_order_release);
+  w.pass = {};
+  w.eye1Stream = stereo_hands_stream(1);
+  w.eye1Drawn.store(false, std::memory_order_relaxed);
+  w.begin(stereo_hands_stream(0));
+  w.add(DrawThread::Job{kPass});
+  w.add(DrawThread::Job{kHandsOn});
+  w.hand();
+  g_spanOpen = g_spanRunning = g_spanPending = true;
+  ++g_stats.spans;
+  return true;
+}
+void hands_span_end() {
+  using namespace hands_span;
+  g_spanTried = false;
+  if (!g_spanOpen) return;
+  g_spanOpen = false;
+  auto& w = worker();
+  w.add(DrawThread::Job{kEndEye1});
+  w.finish_async(DrawThread::Job{kHandsOff});  // (forwarding stops; the render thread goes on at once)
+}
+bool hands_span_draw(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
+                     uint32_t instances) {
+  using namespace hands_span;
+  if (!g_spanOpen) return false;
+  DrawThread::Job j{kDraw};
+  j.a[0] = prim; j.a[1] = count; j.a[2] = indexType; j.a[3] = indexAddr; j.a[4] = baseVertex; j.a[5] = instances;
+  j.a[6] = t_drawIndex;
+  worker().add(j);
+  worker().hand();
+  ++g_stats.draws;
+  return true;
+}
+void hands_span_note(const uint32_t* words, bool depth, uint32_t maxLevels, Surface* s) {
+  using namespace hands_span;
+  for (auto& t : g_textures)
+    if (t.surface == s && t.depth == depth && !std::memcmp(t.words, words, sizeof t.words)) return;
+  Texture t{};
+  std::memcpy(t.words, words, sizeof t.words);
+  t.depth = depth;
+  t.maxLevels = maxLevels;
+  t.surface = s;
+  g_textures.push_back(t);
+}
+void hands_span_join_emit() {
+  using namespace hands_span;
+  log_stats();
+  if (!g_spanPending || draw_threads::on_draw_thread()) return;
+  if (g_spanOpen) hands_span_end();  // (joined inside his bracket: the rest of it is drawn here)
+  if (g_spanRunning) {
+    if (draw_threads::held_locks()) {
+      if (!overlap::g_handsSpanOff.exchange(true)) LOG("[vr hands] Link's span: off for this session (joined while holding a cache lock)");
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    worker().complete();
+    g_spanRunning = false;
+    g_stats.waitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+  }
+  ++g_stats.joins;
+  overlap::g_handsOverlap.store(0, std::memory_order_release);
+  draw_threads::g_handsThreadActive.store(false, std::memory_order_relaxed);
+  g_lastTextures.swap(g_textures);
+  g_textures.clear();
+  g_spanPending = false;
+  // the render thread's held streams first (his depth image's copies are in them), then his
+  stereo_flush();
+  stereo_hands_emit();
+}
+}  // namespace scene_thread
+void hands_thread_join_emit() { scene_thread::hands_span_join_emit(); }  // (stereo.h)
+namespace scene_thread {
 bool enabled() {
   static const bool on = [] {
     if (!switches::kSceneThread) return false;
@@ -5698,7 +6574,8 @@ bool draw(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
         return false;
       }
     }
-    if (!g_bActive && !g_bUsed && !g_split.off.load(std::memory_order_relaxed) && g_runEnd >= g_runFirst + 2 * kMinBDraws &&
+    if (!g_bActive && !g_bUsed && !g_handsInPart && !hands_layer::dispatch_inside() &&
+        !g_split.off.load(std::memory_order_relaxed) && g_runEnd >= g_runFirst + 2 * kMinBDraws &&
         t_drawIndex >= g_runFirst + uint32_t(g_bStart * float(g_runEnd - g_runFirst)) && t_drawIndex + kMinBDraws <= g_runEnd)
       switch_to_b();
   }
@@ -5722,6 +6599,9 @@ bool draw(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr,
 bool hand_state(int kind, const uint32_t* words, uint32_t n) {
   if (!g_running) return false;
   switch_back();  // (stage S6: the second drawing thread's span is draws only)
+  // (docs/VR_HANDS_LAYER_PLAN.md) Link's brackets copy the eyes' depth (a layout change of the main pass's target), so
+  // the second drawing thread, drawing into it beside the scene's thread, does not start in a part that has them
+  if (kind == render::kStateHands) g_handsInPart = true;  // (by the game's marks alone: dispatch_inside)
   if (kind == render::kStateLayoutContent) {  // (as the scene's thread will apply it: the switch's copy, g_handed)
     g_handedClip = n && words[0];
     if (n >= 2) {
@@ -5777,6 +6657,7 @@ bool copy_to_scan(const uint32_t* colorBuffer, uint32_t target) {
 void finish() {
   if (!g_running) return;
   struct End { ~End() { g_running = false; } } end;
+  g_handsInPart = false;
   switch_back();  // (stage S6: A1 ends, A waits for the second drawing thread, its commands follow)
   worker().add(DrawThread::Job{kEndEye1});
   worker().finish();
@@ -5895,6 +6776,8 @@ bool front_begin(const uint32_t* r) {
   pass.a[0] = stereo::layoutDrawDepth;  // (the layouts' state as it is now: the thread's copy for its span)
   pass.a[1] = stereo::layoutPhotograph;
   pass.a[2] = aspect::content_clip();
+  pass.a[3] = stereo::skyDepth;  // (the sky at infinity)
+  pass.a[4] = stereo::layoutFull;
   b.add(pass);
   g_partOverlapping = true;  // (the render thread records nothing while the span runs: it ends the span first)
   f.span = f.overlap = true;
@@ -6047,7 +6930,7 @@ bool batch_can_hold(const uint32_t* r) {
   // without it, S1 to S3's diagnostics, still holds none)
   return batch_runs_on() && R.device && (!sun_atlas_target(r) || atlas_thread::enabled()) &&
          !(switches::kSceneSplit && !switches::kSceneThread) && !eye_thread::enabled() &&
-         !ui_layer::candidate();  // (the game's UI: drawn one by one into its own image, in order: ui_layer)
+         !ui_layer::candidate() && !hands_layer::dispatch_inside();  // (the game's UI, Link's hands: drawn one by one into their own images, in order)
 }
 [[maybe_unused]] const bool g_batchHoldSet = (draw_batch::can_hold() = batch_can_hold, true);
 // a vertex shader's batched variant for some blocks: compiled on a thread of its own the first time it is wanted
@@ -6285,6 +7168,7 @@ void draw_stereo(const uint32_t *r,uint32_t prim,uint32_t count,uint32_t indexTy
     }
   } motionNote{motionStats && !draw_threads::on_draw_thread(), r, prim, count, indexType, indexAddr, baseVertex,
                instances, run};
+  hands_layer::before_dispatch(r);  // (docs/VR_HANDS_LAYER_PLAN.md: the eye's depth with or without Link, native_depth)
   if (!run) [[likely]] {
     draw_stereo_one(r,prim,count,indexType,indexAddr,baseVertex,instances);
     return;
@@ -6516,9 +7400,31 @@ static void draw_stereo_one(const uint32_t *r,uint32_t prim,uint32_t count,uint3
   // ends first if eye 1 holds commands, or a draw of it was drawn as two
   // (docs/VR_EYE_PROJECTION.md) the game's UI into its own image stays here, in order with the image's clear: drawn on the
   // scene's thread, the file-select menu's panels and text were missing from the image
+  // (docs/VR_HANDS_LAYER_PLAN.md) Link's span: his bracket's draws to the scene's thread, the render thread going on
+  // (begun at his bracket's first draw here, after a part may have started above: then the part takes them)
+  // (diagnostics, 2026-11-14: the boat's fix) the rest of his lists' draws (in order, not his): handed to a part on the
+  // scene's thread, or drawn here; per 10 s
+  if (hands_layer::dispatch_inside() && !wwhd_vr_hands_own_bracket_active()) [[unlikely]] {
+    static uint64_t handed = 0, here = 0;
+    static auto since = std::chrono::steady_clock::now();
+    ++((switches::kSceneThread && scene_thread::running()) ? handed : here);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(10)) {
+      since = now;
+      LOG("[vr hands check] (10 s) the rest of Link's lists drawn in order: %llu draws handed to the scene's thread's part, "
+          "%llu drawn on the render thread (none batched or on the second drawing thread: dispatch_inside)",
+          (unsigned long long)handed, (unsigned long long)here);
+      handed = here = 0;
+    }
+  }
+  // (his own packets only: the rest of his lists, the boat's, is drawn in order here, never in his span: it would go to his image)
+  if(hands_layer::dispatch_inside() && wwhd_vr_hands_own_bracket_active() &&
+     !(switches::kSceneThread && scene_thread::running())) [[unlikely]] {
+    scene_thread::hands_span_begin();
+    if(scene_thread::hands_span_draw(prim,count,indexType,indexAddr,baseVertex,instances)) return;
+  }
   if(switches::kSceneThread && scene_thread::running()) [[unlikely]] {
-    if(!stereo_eye1_holding() && !ui_layer::candidate() &&
-       scene_thread::draw(prim,count,indexType,indexAddr,baseVertex,instances)) return;
+    if(!stereo_eye1_holding() && !ui_layer::candidate() && scene_thread::draw(prim,count,indexType,indexAddr,baseVertex,instances)) return;
     stereo_part_join_at(PartJoinSite::Eye1);
   }
   if(t_sceneRun) return;  // (a held run not handed over: nothing of it drawn here, draw_stereo batches it)
@@ -6544,6 +7450,7 @@ static void draw_stereo_one(const uint32_t *r,uint32_t prim,uint32_t count,uint3
     StereoShaders* out=eyeThread?static_cast<StereoShaders*>(eye_thread::handoff_slot(handoffSeq)):&stereoShaders();
     out->reset();
     stereoShadersOut()=out;
+    hands_layer::before_dispatch(r);  // (a part joined above: drawn here, so swapped here)
     draw(r,prim,count,indexType,indexAddr,baseVertex,instances,&shared);
     const Clock::time_point t1=timed?Clock::now():Clock::time_point{};
     if(timed) stereo_eye_time(0,t1-t0,shared);
@@ -6906,7 +7813,39 @@ static void motion_packet(const uint32_t* r, const StereoShaders& rec, int eye, 
 #endif
   motion_pass::add(p);
 }
+static thread_local gfx::ProgramKind t_lastDrawKind = gfx::ProgramKind::Other;
+static void draw_body(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+          uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent);
+// (docs/VR_HANDS_LAYER_PLAN.md) a draw; after the game's sun shadow pass (each eye, on the render thread, with the hands
+// layer on), that pass once more into Link's own mask from the depth with his hands
 void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
+          uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
+  t_lastDrawKind = gfx::ProgramKind::Other;
+  draw_body(r, prim, count, indexType, indexAddr, baseVertex, instances, viewIndependent);
+  // (PC VR only, asked for 2026-11-12: a standalone headset (Quest) gives his draws no screen shadow instead, the
+  // cheaper way, no_shadow_for's fallback; a VR option for it to come with the hands layer's setting)
+  if (hands_layer::kSecondShadowPass && t_lastDrawKind == gfx::ProgramKind::SunShadowMask && hands_layer::enabled() && !hands_layer::g_inShadowPass &&
+      !draw_threads::on_draw_thread() && hands_layer::shadow_pass_ready(stereoEye())) {
+    if (!hands_layer::g_traceFrame && hands_layer::g_traceLeft > 0) hands_layer::g_traceFrame = R.frame + 30;
+    if (hands_layer::tracing())
+      LOG("[vr hands trace] frame %llu eye %d: the game's sun shadow pass drawn; second run now",
+          (unsigned long long)R.frame, stereoEye());
+    hands_layer::g_inShadowPass = true;
+    try {
+      draw_body(r, prim, count, indexType, indexAddr, baseVertex, instances, nullptr);
+    } catch (...) {
+      hands_layer::g_inShadowPass = false;
+      throw;
+    }
+    hands_layer::g_inShadowPass = false;
+    static bool logged = false;
+    if (!logged) {
+      logged = true;
+      LOG("[vr hands] the sun shadow pass drawn a second time into Link's own mask (from the depth with his hands)");
+    }
+  }
+}
+static void draw_body(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
           uint32_t indexAddr, uint32_t baseVertex, uint32_t instances, bool* viewIndependent) {
   thread_check::note(thread_check::Area::Draws);  // (diagnostics: thread_check.h)
   const uint32_t dirtyGroups = gx2::take_thread_dirty_groups();  // register groups changed since the previous draw
@@ -6968,7 +7907,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   BatchDraw* const batch = batch_draw();
   // (the game's UI into its own image, ui_layer: its targets and blend are not the registers' alone, so neither continued
   // from a draw before it nor continued by one after)
-  const bool uiDraw = ui_layer::candidate();
+  const bool uiDraw = ui_layer::candidate() || hands_layer::candidate() || hands_layer::g_inShadowPass;
   const bool fastPathDraw = fastPath.on && !aoPrivateReplay() && !replay && !batch && !uiDraw &&
                             !(backdropOn && gamepad_backdrop_replaying());
   if (replay || batch || uiDraw) {
@@ -7298,6 +8237,27 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
     targets.colors[0] = backdrop;
     targets.slices[0] = 0;
   }
+  // (diagnostics, 2026-11-14: a transition's "two eye holes") the frames after a transition's dump: each shader pair drawn
+  // into a screen-size target (an eye's picture or the UI image), once
+  if (stereo::transitionTrace.load(std::memory_order_relaxed) > 0 && targets.target) [[unlikely]] {
+    static std::mutex m;
+    static std::vector<uint64_t> seen;
+    static int gen = -1;
+    const uint64_t key = (uint64_t(r[mmSQ_PGM_START_VS]) << 32 | r[mmSQ_PGM_START_PS]) ^
+                         (uint64_t(targets.target->extent.width) << 48) ^ (uint64_t(targets.target->extent.height) << 20) ^
+                         uint64_t(stereoEye() & 1) << 63;
+    std::lock_guard<std::mutex> l(m);
+    if (const int g = stereo::transitionTraceGen.load(std::memory_order_relaxed); g != gen) gen = g, seen.clear();
+    if (seen.size() < 200 && std::find(seen.begin(), seen.end(), key) == seen.end()) {
+      seen.push_back(key);
+      LOG("[vr transition trace] (picture %d) eye %d VS %08X PS %08X count %u into %s %ux%u, layout depth %u full %d, blend %d",
+          stereo::transitionShot.load(std::memory_order_relaxed), stereoEye(),
+          r[mmSQ_PGM_START_VS] << 8, r[mmSQ_PGM_START_PS] << 8, count, ui_layer::is(targets.target) ? "the UI image" :
+          stereo_screen_target(targets.target->width, targets.target->height) ? "an eye picture" : "a target",
+          targets.target->extent.width, targets.target->extent.height, stereo::layout_draw_depth(), int(stereo::layout_full()),
+          int((r[REGADDR::CB_BLEND0_CONTROL] >> 30) & 1));
+    }
+  }
   // (the UI layer: drawn once, by eye 0, into its own image; eye 1's copy of a UI draw into its picture is left out)
   if (ui_layer::trace()) [[unlikely]]
     LOG("[vr ui trace] eye %d VS %08X PS %08X count %u: into %s%s (%ux%u)%s%s", stereoEye(), r[mmSQ_PGM_START_VS] << 8,
@@ -7410,6 +8370,40 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (fov_diag::kOn) [[unlikely]] fov_diag::layout_draw_begin(stereo::t_layoutInEye, stereoEye(), r[mmSQ_PGM_START_VS]);
   // (the sun shadow and the point lights rebuild positions from depth: both stages adjusted for each eye, never
   // replayed from eye 0 nor drawn as multiview; the name kept from when the sun shadow was the only one)
+  // (docs/VR_HANDS_LAYER_PLAN.md) the sun's shadow mask this eye draws: the one Link's hands are not given
+  t_lastDrawKind = ps->kind;
+  if (hands_layer::enabled() && hands_layer::reads_depth(ps->kind)) hands_layer::note_pass_program(r[mmSQ_PGM_START_PS]);
+  // (diagnostics, "[vr hands] sun shadow pass (10 s)") where the game's sun shadow pass is drawn: Link's own mask needs
+  // it on the render thread
+  if (hands_layer::enabled() && ps->kind == gfx::ProgramKind::SunShadowMask && !hands_layer::g_inShadowPass) {
+    static std::atomic<uint64_t> onRender{0}, onThread{0};
+    static std::atomic<int64_t> since{0};
+    (draw_threads::on_draw_thread() ? onThread : onRender).fetch_add(1, std::memory_order_relaxed);
+    const int64_t now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t was = since.load(std::memory_order_relaxed);
+    if (!was) since.compare_exchange_strong(was, now);
+    else if (now - was >= 10 && since.compare_exchange_strong(was, now))
+      LOG("[vr hands] sun shadow pass (10 s): %llu draws on the render thread, %llu on a drawing thread (eye %d's target %s)",
+          (unsigned long long)onRender.exchange(0), (unsigned long long)onThread.exchange(0), stereoEye(),
+          targets.colors[0] ? "set" : "none");
+  }
+  if (hands_layer::enabled() && ps->kind == gfx::ProgramKind::SunShadowMask && !hands_layer::g_inShadowPass) {
+    static std::atomic<int> logged{0};
+    if ((hands_layer::g_combinedFrame[stereoEye() & 1] != ~uint64_t{0} || logged.load() < 4) &&
+        logged.fetch_add(1, std::memory_order_relaxed) < 12) {
+      const Surface* c = targets.colors[0];
+      const int e = stereoEye() & 1;
+      LOG("[vr hands diag] sun shadow pass: eye %d frame %llu %s target %p fmt %u addr %08X %ux%u base %u; his depth kept frame "
+          "%llu, depth %p, mask noted %p",
+          e, (unsigned long long)R.frame, draw_threads::on_draw_thread() ? "drawing thread" : "render thread",
+          (const void*)c, c ? unsigned(c->fmt.pixel) : 0u, c ? c->addr : 0u, c ? c->extent.width : 0u, c ? c->extent.height : 0u, c ? c->baseLayer : 0u,
+          (unsigned long long)hands_layer::g_combinedFrame[e], (const void*)hands_layer::g_depthTarget[e],
+          (const void*)hands_layer::g_shadowMask[e]);
+    }
+  }
+  if (hands_layer::enabled() && ps->kind == gfx::ProgramKind::SunShadowMask && !draw_threads::on_draw_thread() &&
+      !hands_layer::g_inShadowPass)
+    hands_layer::note_shadow_mask(stereoEye(), targets.colors[0]);
   const bool sunShadow = ps->kind == gfx::ProgramKind::SunShadowMask ||
                          (ps->kind == gfx::ProgramKind::PointLight && point_light_eyes() != kPointLightOff);
   const gfx::ProgramKind eyeRebuild = sunShadow ? ps->kind : gfx::ProgramKind::Other;
@@ -7605,6 +8599,9 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (mv.depthTwin && layoutOf(mv.depthTwin) != VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
     reusePass = false;
   struct DrawStateCache {
+    // (standalone safeguard, below) the command buffer and submission this cache's binds were recorded into
+    VkCommandBuffer boundCommand = VK_NULL_HANDLE;
+    uint64_t boundGeneration = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkBuffer indexBuffer = VK_NULL_HANDLE;
     VkDeviceSize indexOffset = 0;
@@ -7645,6 +8642,37 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   if (!reusePass || state.partEpoch != part_epoch()) state = {};  // (stage S1: a scene part binds everything itself)
   state.partEpoch = part_epoch();
   auto cmd = command_buffer();
+  // (standalone safeguard, 2026-11-12: a Quest 3S crashed in the Adreno driver's vkCmdDrawIndexed, address 0xf8, as
+  // the record worker replayed a draw) the binds this cache skips as already made (pipeline, index buffer, dynamic
+  // state) belong to one command buffer: a draw recorded into another one, or after a submission, binds everything
+  // again, so no draw reaches a command buffer without its pipeline or index buffer. Only standalone headsets (their
+  // scene threads switch command buffers mid-pass); x64 PC builds unchanged
+#if defined(__ANDROID__) || defined(__aarch64__)
+  constexpr bool kCacheSafeguard = true;
+#else
+  constexpr bool kCacheSafeguard = false;
+#endif
+  if constexpr (kCacheSafeguard) {
+    if (crash_track::enabled()) crash_track::g_frame.store(R.frame, std::memory_order_relaxed);  // (crash_track.h)
+    if (state.boundCommand != cmd || state.boundGeneration != R.submissionGeneration) {
+      const uint64_t epoch = state.partEpoch;
+      state = {};
+      state.partEpoch = epoch;
+      state.boundCommand = cmd;
+      state.boundGeneration = R.submissionGeneration;
+    }
+    // the record worker's draw guard (pod_commands.cpp), its count logged as it grows (the first 8, then at each doubling)
+    static std::atomic<uint64_t> reportedGuard{0};
+    uint64_t noPipeline = 0, noPass = 0;
+    if (const uint64_t n = draw_guard_left_out(&noPipeline, &noPass); n != reportedGuard.load(std::memory_order_relaxed)) {
+      const uint64_t before = reportedGuard.exchange(n, std::memory_order_relaxed);
+      if (before != n && (n <= 8 || std::bit_width(n) != std::bit_width(before)))
+        LOG("[vulkan draw guard] %llu replayed draws left out so far: no render pass open in their command buffer %llu, "
+            "no graphics pipeline %llu, no index buffer %llu (each would have crashed a Quest's driver)",
+            (unsigned long long)n, (unsigned long long)noPass, (unsigned long long)noPipeline,
+            (unsigned long long)(n - noPipeline - noPass));
+    }
+  }
   auto bindIndex = [&](VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
     if (state.indexBuffer == buffer && state.indexOffset == offset && state.indexType == type) return;
     record::vkCmdBindIndexBuffer(cmd, buffer, offset, type);
@@ -7655,6 +8683,33 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
 #ifdef WWHD_MOBILE_GPU_PATHS
     mix_barrier(colors, depth, mv.on);
 #endif
+    // (2026-11-11, surfaces.cpp "held clears") a target's held clear becomes this pass's loadOp CLEAR when the pass draws
+    // into all of it: the whole render area, both eyes' layers of a two-eye image with the same clear held (multiview),
+    // or a surface of its own (a single-layer pass into one eye's layer of a two-eye image never folds: the clear keeps
+    // its wait before it, wait_before_layer_clear, the black squares' fix); a depth clear only of all its aspects. Any
+    // other held clear is recorded first, as before. Not on the second drawing thread (its layout changes wait: S6)
+    auto foldable = [&](Surface* s, Surface* twin, uint8_t kind) {
+      if (!s || s->pendingClear != kind || !fold_clears_on() || scene_thread::on_scene_b()) return false;
+      if (width != s->extent.width || height != s->extent.height) return false;
+      if (kind == 2) {
+        const VkImageAspectFlags all = VK_IMAGE_ASPECT_DEPTH_BIT | (s->fmt.stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : 0);
+        if ((s->pendingAspects & all) != all) return false;
+      }
+      if (mv.on) return twin && twin->pendingClear == kind && twin->pendingAspects == s->pendingAspects &&
+                        !std::memcmp(&twin->pendingValue, &s->pendingValue, sizeof s->pendingValue);
+      const bool shared = (s->layerTwin && s->layerTwin->image == s->image) || (s->layerOwner && s->layerOwner->image == s->image);
+      return !shared;
+    };
+    // (foveation.cpp) an eye-sized two-eye pass's shading rate map: the edges of each eye shaded in 2x2 / 4x4 blocks.
+    // Looked up first, as a new map's upload is recorded here, before this pass's layout changes
+    VkRenderingFragmentShadingRateAttachmentInfoKHR rateMap{VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
+    if (mv.on && R.fsr) [[unlikely]]
+      if (const VkImageView map = foveation_map(width, height)) {
+        rateMap.imageView = map;
+        rateMap.imageLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+        rateMap.shadingRateAttachmentTexelSize = {R.fsrTexel, R.fsrTexel};
+      }
+    FoldClearScope foldScope;  // (the transitions below leave a folded clear held for this pass)
     std::array<VkRenderingAttachmentInfo, 8> attachments{};
     uint32_t ncolor = 0;
     for (int i = 0; i < 8; i++) {
@@ -7663,6 +8718,14 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
       attachments[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       if (colors[i]) {
+        if (foldable(colors[i], mv.twins[i], 1)) {
+          attachments[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+          attachments[i].clearValue = colors[i]->pendingValue;
+          for (Surface* s : {colors[i], mv.twins[i]}) if (s) s->pendingClear = 0;
+          note_clear_folded();
+        } else {
+          for (Surface* s : {colors[i], mv.twins[i]}) if (s && s->pendingClear) flush_pending_clear(s);
+        }
         for (Surface* s : {colors[i], mv.twins[i]}) {  // (a multiview pass: eye 1's layer too)
           if (!s) continue;
           upload_surface(s);
@@ -7676,7 +8739,17 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       }
     }
     VkRenderingAttachmentInfo da{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    bool depthFolded = false;
+    VkClearValue depthClear{};
     if (depth) {
+      if (foldable(depth, mv.depthTwin, 2)) {
+        depthFolded = true;
+        depthClear = depth->pendingValue;
+        for (Surface* s : {depth, mv.depthTwin}) if (s) s->pendingClear = 0;
+        note_clear_folded();
+      } else {
+        for (Surface* s : {depth, mv.depthTwin}) if (s && s->pendingClear) flush_pending_clear(s);
+      }
       for (Surface* s : {depth, mv.depthTwin}) {
         if (!s) continue;
         upload_surface(s);
@@ -7688,13 +8761,15 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
       }
       da.imageView = mv.on ? multiview_view(depth) : layer_view(depth, depthSlice);
       da.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-      da.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      da.loadOp = depthFolded ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
       da.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      if (depthFolded) da.clearValue = depthClear;
     }
     VkRenderingInfo ri{VK_STRUCTURE_TYPE_RENDERING_INFO};
     ri.renderArea.extent = {width, height};
     ri.layerCount = 1;
     ri.viewMask = mv.on ? 0b11 : 0;  // (stage M4) both eyes' layers
+    if (rateMap.imageView) ri.pNext = &rateMap;  // (foveation.cpp)
     ri.colorAttachmentCount = ncolor;
     ri.pColorAttachments = attachments.data();
     ri.pDepthAttachment = depth ? &da : nullptr;
@@ -7829,7 +8904,7 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   // (moved like the text by vr::layout_offset_y), so what the game parks just outside the screen (a "GAME OVER", a
   // minigame timer) stays out of view instead of shrinking into it
   if (const float s = vr::layout_scale();
-      s < 1.0f && stereo::layout_draw_depth() && layoutFactors()) {
+      s < 1.0f && stereo::layout_draw_depth() && !stereo::layout_full() && layoutFactors()) {
     // (in the UI layer's image, square pixels over the symmetric field: the shrunk screen keeps its 16:9; the eye picture's
     // height factor cut the menus' top and bottom)
     const float rw = float(width) * s / ax,
@@ -7889,9 +8964,13 @@ void draw(const uint32_t *r, uint32_t prim, uint32_t count, uint32_t indexType,
   }
   std::array<uint32_t, 4> blendBits;
   std::copy_n(r + REGADDR::CB_BLEND_RED, blendBits.size(), blendBits.begin());
+  // (Link's hands into their own image, hands_layer: the constant's alpha 1, a solid draw's coverage; see the blend)
+  if (hands_layer::is(colors[0])) {
+    const float one = 1.0f;
+    std::memcpy(&blendBits[3], &one, 4);
+  }
   if (!state.blendValid || state.blend != blendBits) {
-    record::vkCmdSetBlendConstants(
-        cmd, reinterpret_cast<const float *>(r + REGADDR::CB_BLEND_RED));
+    record::vkCmdSetBlendConstants(cmd, reinterpret_cast<const float *>(blendBits.data()));
     state.blend = blendBits;
     state.blendValid = true;
   }
@@ -8317,4 +9396,20 @@ std::shared_ptr<PipelineRecipe> derive_guest_pipeline_recipe(const uint32_t* r, 
 namespace gfxvk {
 Surface* ui_layer_image() { return ui_layer_drawn(); }  // (stereo.h)
 Surface* ui_layer_drawn_last() { return ui_layer_last(); }  // (stereo.h)
+Surface* hands_layer_drawn(int eye) { return hands_layer_drawn_here(eye); }  // (stereo.h)
+bool hands_layer_depths(int eye, Surface*& link, Surface*& world) {  // (stereo.h)
+  eye &= 1;
+  link = world = nullptr;
+  if (!hands_layer::g_depthCombined[eye].image || hands_layer::g_combinedFrame[eye] == ~uint64_t{0} ||
+      hands_layer::g_combinedFrame[eye] + 1 < R.frame || !hands_layer::g_depthTarget[eye] || !hands_layer::g_depthTarget[eye]->image)
+    return false;
+  link = &hands_layer::g_depthCombined[eye];
+  world = hands_layer::g_depthTarget[eye];
+  // (the screen passes' depth with him still in the eye's depth at the frame's end: the world's own depth, as it was
+  // copied out, so his pixels are not taken for the world's and left out: Link invisible)
+  if (hands_layer::g_swapIn && hands_layer::g_swapFrame == R.frame && hands_layer::g_swappedEye[eye] &&
+      hands_layer::g_depthWorld[eye].image)
+    world = &hands_layer::g_depthWorld[eye];
+  return true;
+}
 }  // namespace gfxvk

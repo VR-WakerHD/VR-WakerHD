@@ -176,14 +176,20 @@ inline float pass_fraction_45(int phase, int n, bool exact) {
 // - kVrAuto: capped at the refresh rate while its frames fit, else at half (auto_rate_step below): the rates the
 //   headset shows evenly (90 or 45 at 90 Hz, 120 or 60 at 120 Hz) instead of a mix of three and two frames a step when
 //   three do not quite fit;
-// - kVrOriginal: the game's own 30 fps (settings from before the half cap; not offered any more).
+// - kVrOriginal: the game's own 30 fps, Capped 30 FPS (offered again 2026-11-11 where the rate is a multiple of 30;
+//   at an actual rate that is not, the half cap: vr_mode_resolved).
 // A cap the pacer has no schedule for (72 and 80 fps: vr_drawable_fps) draws the fastest one below it. 36 fps (half of
 // 72 Hz) has its own schedule (is_fps36).
 // The game logic runs at 30 steps a second in every mode.
 enum VrFrameMode : int { kVrUnlocked = 0, kVrHalf = 1, kVrOriginal = 2, kVrAuto = 3, kVrFull = 4 };
 constexpr int kVrLastMode = kVrFull;
 // the cap a mode asks for at refresh rate hz (rounded, 0: unknown): 0 for unlocked and auto (no cap of their own)
+// (2026-11-11) Capped 30 FPS (kVrOriginal) on a headset whose actual rate is not a multiple of 30 (the Steam Frame's
+// runtime picks its rate itself, 72 Hz by default, an app cannot ask for 90): the half cap instead (36 at 72 Hz), so
+// every frame stays a whole number of refreshes; 30 at 72 Hz would be 2.4 refreshes a frame, the judder it avoids
+inline int vr_mode_resolved(int mode, int hz) { return mode == kVrOriginal && hz > 0 && hz % 30 ? kVrHalf : mode; }
 inline int vr_mode_cap(int mode, int hz) {
+    mode = vr_mode_resolved(mode, hz);
     if (mode == kVrOriginal) return 30;
     if (hz <= 0) return 0;
     if (mode == kVrFull) return hz;
@@ -209,7 +215,7 @@ inline int vr_drawable_fps(int cap, bool streamed = false) {
 struct AutoRate {
     bool half = false;   // the next steps run at half the rate
     bool trial = false;  // unlocked again, on trial
-    int64_t steps = 0, tryAt = 0, backoff = 300;  // (kAutoBackoff, below)
+    int64_t steps = 0, tryAt = 0, backoff = 1800;  // (kAutoBackoff, below)
     int windowSteps = 0, windowDrawn = 0, windowPossible = 0, warmup = 0;
     double lastShare = -1;  // the share of the last window judged (for the log)
     bool streamed = false;  // a streamed headset (docs/VR_STREAMING.md): the waits below are kAutoBackoffStreamed's
@@ -218,14 +224,24 @@ struct AutoRate {
     // headset with Streaming optimal: kAutoWindowStreamed, kAutoDropStreamed, kAutoKeepStreamed)
     bool streamOptimal = false;
 };
-constexpr int kAutoWindow = 45, kAutoTrial = 60, kAutoWarmup = 15;
-constexpr int64_t kAutoBackoff = 300, kAutoBackoffMax = 1200;  // (steps: 10 s, at most 40 s)
+// (2026-11-12, docs/FRAME_INTERPOLATION_IMPLEMENTATION.md change 2: PC VR players found interpolation off smoother;
+// each change of rate is a hitch, and on a computer near its limit Auto changed again and again) judged over 3 s, not
+// 1.5 (a load's or a shader's hitch no longer drops it), and after a try of the full rate that failed it waits 20 s,
+// doubling to at most 80 s (10 and 40 before): fewer tries, each a change down and up
+constexpr int kAutoWindow = 90, kAutoTrial = 60, kAutoWarmup = 15;
+// (2026-11-14, a PS VR2 run in the Tower of the Gods with a video: "blinking graphics", then the rainbow hands and the
+// rope flickering. The log: Auto at 45 there, trying the full rate every 20 to 80 s for a second or two, each try a
+// change of rate and of steady hands, off and on again, 19 times. Now it waits 60 s after dropping, doubling after each
+// failed try to at most 5 minutes; a new stage starts the waits again from 60 s (auto_rate_new_stage): a lighter area
+// is tried within a minute)
+constexpr int64_t kAutoBackoff = 1800, kAutoBackoffMax = 9000;  // (steps: 60 s, at most 5 minutes)
 static_assert(AutoRate{}.backoff == kAutoBackoff, "AutoRate starts with kAutoBackoff");
 // a streamed headset (Virtual Desktop, a Quest on a PC: docs/VR_STREAMING.md) holds half the rate longer once there:
 // 40 s before the full rate is tried again, at most 160 s. Each try and return is a change of smoothness, and its own
 // frame smoothing (Virtual Desktop's SSW) also works at half the rate (a Quest through VDXR on Wi-Fi: Auto went between
 // 90 and 45 again and again, and the player saw judder)
-constexpr int64_t kAutoBackoffStreamed = 1200, kAutoBackoffStreamedMax = 4800;  // (steps: 40 s, at most 160 s)
+// (2026-11-14: never shorter than the wired waits: 80 s, at most 5 minutes)
+constexpr int64_t kAutoBackoffStreamed = 2400, kAutoBackoffStreamedMax = 9000;  // (steps: 80 s, at most 5 minutes)
 // (VR fork: favours the full rate. It was strict, 97 % to stay and 99 % to come back: each frame unlocked misses is a
 // 22 ms gap in 11 ms ones, about six a second at 90 %, which the headset shows as judder; in busy scenes it then sat at
 // 45 fps most of the time (unlocked drew 56 to 68 % there). It then stayed while 85 % were drawn and came back at 90 %,
@@ -287,6 +303,13 @@ inline bool auto_rate_step(AutoRate& a, int drawn, int possible) {
 // held at 45 fps all session on an RTX 5080 busy 5 % of the time). Coming back into gameplay at the unlocked rate it
 // waits kAutoSettle steps (3 s: the scene's first draws, its shaders) before a window is judged
 constexpr int kAutoSettle = 90;
+// a new stage (a room of a dungeon keeps its stage): the waits start again from the first one; at half, the next try is
+// no later than that first wait from now
+inline void auto_rate_new_stage(AutoRate& a) {
+    const int64_t first = a.streamed ? kAutoBackoffStreamed : kAutoBackoff;
+    a.backoff = first;
+    if (a.half && a.tryAt > a.steps + first) a.tryAt = a.steps + first;
+}
 inline void auto_rate_settle(AutoRate& a) {
     if (a.half) return;
     a.warmup = std::max(a.warmup, kAutoSettle);
@@ -342,6 +365,7 @@ inline int vr_even_fps(int cap, int hz) {
 // one the refresh rate shows evenly where there is one near it (vr_even_fps); unlocked (and auto, resolved to unlocked
 // or half before this) cap_fps_vr; 30 means frame interpolation off
 inline int cap_fps_vr_mode(int fps, int hz, int mode, bool streamed = false) {
+    mode = vr_mode_resolved(mode, hz);
     if (const int cap = vr_mode_cap(mode, hz)) {
         if (mode == kVrHalf)
             if (const int even = vr_even_fps(cap, hz)) return even;

@@ -285,8 +285,50 @@ void directScalarEquivalenceAndAtomicity() {
   assert(direct.failure_reason()==gfxvk::PodFailureReason::AllocationFailure&&direct.snapshot()==before&&direct.command_count()==count);
   assert(direct.vkCmdDrawIndexed(cmd,3,1,0,-2,0));
 }
+// (foveation.cpp) a pass's fragment shading rate map, its only pNext, survives encoding and replay; any other chain on it
+// is still refused
+VKAPI_ATTR void VKAPI_CALL renderingWithRateMap(VkCommandBuffer, const VkRenderingInfo *v) {
+  const auto *rateMap = static_cast<const VkRenderingFragmentShadingRateAttachmentInfoKHR *>(v->pNext);
+  assert(rateMap && rateMap->sType == VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR && !rateMap->pNext &&
+         rateMap->imageView == handle<VkImageView>(9) &&
+         rateMap->imageLayout == VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR &&
+         rateMap->shadingRateAttachmentTexelSize.width == 16 && rateMap->shadingRateAttachmentTexelSize.height == 16 && v->viewMask == 3 &&
+         v->colorAttachmentCount == 1 && v->pColorAttachments[0].imageView == handle<VkImageView>(5));
+  calls.push_back(70);
+}
+void rate_map_round_trip() {
+  using namespace gfxvk;
+  const VkCommandBuffer cmd = handle<VkCommandBuffer>(1);
+  VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  attachment.imageView = handle<VkImageView>(5);
+  VkRenderingFragmentShadingRateAttachmentInfoKHR rateMap{VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR};
+  rateMap.imageView = handle<VkImageView>(9);
+  rateMap.imageLayout = VK_IMAGE_LAYOUT_FRAGMENT_SHADING_RATE_ATTACHMENT_OPTIMAL_KHR;
+  rateMap.shadingRateAttachmentTexelSize = {16, 16};
+  VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+  info.pNext = &rateMap;
+  info.layerCount = 1;
+  info.viewMask = 3;
+  info.colorAttachmentCount = 1;
+  info.pColorAttachments = &attachment;
+  PodCommands p;
+  assert(p.vkCmdBeginRendering(cmd, &info));
+  rateMap.imageView = {};  // (the packet owns its copy)
+  const auto saved = vkCmdBeginRendering;
+  vkCmdBeginRendering = renderingWithRateMap;
+  calls.clear();
+  PodCommands::replay(p.take());
+  assert(calls.size() == 1 && calls[0] == 70);
+  calls.clear();
+  vkCmdBeginRendering = saved;
+  PodCommands refuse;
+  VkRenderingAttachmentInfo other{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+  rateMap.pNext = &other;  // (a chain after the map)
+  assert(!refuse.vkCmdBeginRendering(cmd, &info));
+}
 int main() {
   directScalarEquivalenceAndAtomicity();
+  rate_map_round_trip();
   failure_reason_regressions();
   using namespace gfxvk;
   vkCmdDraw = draw;

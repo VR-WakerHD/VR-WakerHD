@@ -15,7 +15,7 @@
         android:required="false" tools:replace="android:required" />
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
-    <!-- the VR launcher's Install game tab: an extract location in the device's shared storage, by path (asked for
+    <!-- the VR launcher's Extract Game tab: an extract location in the device's shared storage, by path (asked for
          only when that location is chosen: the system's All files access screen) -->
     <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
         tools:ignore="ScopedStorage" />
@@ -45,6 +45,10 @@
         <uses-native-library android:name="libopenxr.google.so" android:required="false" />
         <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
         <meta-data android:name="com.oculus.vr.focusaware" android:value="true" />
+        <!-- (docs/VR_PERFORMANCE.md, "GPU clock", 2026-11-11) one processor level traded from the CPU to the GPU: on a
+             Quest 3 / 3S the GPU's level 5 (599 MHz) is only reachable this way or with the engines' dynamic
+             resolution; the game is GPU-bound there. logcat: "CreateClient: Value of tradeCpuForGpu is 1" -->
+        <meta-data android:name="com.oculus.trade_cpu_for_gpu_amount" android:value="1" />
         <!-- (2026-11-11) the app's icon opens setup (SetupActivity, as on a phone): until the game is installed it
              shows the setup screens, then it opens the VR launcher (its own process: one SDL lifetime per process),
              whose Play VR / Play Flat start the game -->

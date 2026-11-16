@@ -57,3 +57,12 @@
 - **Limits.** The
   game's own telescope messages (looking at something that has one) use the game camera's aim, which the head does
   not move. Still to check in the headset: comfort while zoomed and turning the head, left-handed mode.
+
+## The eyepiece sized as the Picto Box's viewfinder (2026-11-14)
+
+Players: "too zoomed in and can't see the controls for it". The eyepiece had been enlarged until its black covered
+the whole eye picture (about 1.9 times the layout on a PS VR2's tall eye picture) and then drawn at `vr.telescopeSize`
+(0.85) of that: about 1.6 times its own size, with the zoom gauge and the stick prompts ("Zoom", "Look Around")
+outside what the lenses show. It is now drawn as the Picto Box's viewfinder is (docs/VR_PICTO_BOX.md): at
+`vr.telescopeSize` of its own full size, centred (default 0.70, 0.5 to 1; F1 and the launcher: "Telescope eyepiece
+size"), and the eye picture outside the layout's area is black. Not yet tried in the headset.

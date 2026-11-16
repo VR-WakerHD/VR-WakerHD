@@ -165,7 +165,9 @@ inline int64_t present_due() { return g_backend->present_due ? g_backend->presen
 inline void service_present() { if (g_backend->service_present) g_backend->service_present(); }
 inline void before_idle() { if (g_backend->before_idle) g_backend->before_idle(); }
 inline void before_draw_state() { if (g_backend->before_draw_state) g_backend->before_draw_state(); }
-enum draw_state_kind : int { kStateProjectionTag, kStateLayoutContent, kStateLayoutRoot };
+// kStateHands (docs/VR_HANDS_LAYER_PLAN.md, 2026-11-13): Link's lists' bracket depth, words[0], after a marker: handed to
+// the scene's thread in order with his draws, so they are drawn there, not on the render thread
+enum draw_state_kind : int { kStateProjectionTag, kStateLayoutContent, kStateLayoutRoot, kStateHands, kStateSky };
 inline bool hand_draw_state(int kind, const uint32_t* words, uint32_t n) {
     return g_backend->hand_draw_state && g_backend->hand_draw_state(kind, words, n);
 }

@@ -23,18 +23,26 @@ size_t bytes(uint32_t count,size_t element) {
     return size_t(count)*element;
 }
 size_t sum(size_t a,size_t b) { return b>std::numeric_limits<size_t>::max()-a?std::numeric_limits<size_t>::max():a+b; }
+// (foveation.cpp) a pass's only pNext: its fragment shading rate map, alone; null if it has none or another chain
+const VkRenderingFragmentShadingRateAttachmentInfoKHR* rate_map_of(const VkRenderingInfo& info) {
+    const auto* rateMap=static_cast<const VkRenderingFragmentShadingRateAttachmentInfoKHR*>(info.pNext);
+    return rateMap&&rateMap->sType==VK_STRUCTURE_TYPE_RENDERING_FRAGMENT_SHADING_RATE_ATTACHMENT_INFO_KHR&&!rateMap->pNext?rateMap:nullptr;
+}
 struct Rendering {
     VkRenderingInfo info{};
     std::vector<VkRenderingAttachmentInfo> colors;
     std::optional<VkRenderingAttachmentInfo> depth,stencil;
+    std::optional<VkRenderingFragmentShadingRateAttachmentInfoKHR> rateMap;
     explicit Rendering(const VkRenderingInfo& value):info(value),colors(own(value.colorAttachmentCount,value.pColorAttachments)) {
         if(value.pDepthAttachment)depth=*value.pDepthAttachment;
         if(value.pStencilAttachment)stencil=*value.pStencilAttachment;
-        info.pColorAttachments=nullptr;info.pDepthAttachment=nullptr;info.pStencilAttachment=nullptr;
+        if(const auto* map=rate_map_of(value))rateMap=*map;
+        info.pNext=nullptr;info.pColorAttachments=nullptr;info.pDepthAttachment=nullptr;info.pStencilAttachment=nullptr;
     }
     void emit(VkCommandBuffer cmd) const {
         auto value=info;value.pColorAttachments=data(colors);
         value.pDepthAttachment=depth?&*depth:nullptr;value.pStencilAttachment=stencil?&*stencil:nullptr;
+        value.pNext=rateMap?&*rateMap:nullptr;
         gfxvk::vkCmdBeginRendering(cmd,&value);
     }
 };
@@ -69,7 +77,7 @@ size_t DeferredCommands::held_command_count() const { return held_ ? held_->comm
 void DeferredCommands::seal_held() {
     if (!held_ || held_->empty()) return;
     commands_.reserve(commands_.size()+1);
-    commands_.emplace_back([bytes = held_->take()] { PodCommands::replay(bytes); });
+    commands_.emplace_back([bytes = held_->take()] { note_direct_recording(); PodCommands::replay(bytes); });
 }
 std::vector<std::function<void()>> DeferredCommands::take() {
     if (pod_) throw std::logic_error("POD worker owns no lambda tail");
@@ -452,7 +460,7 @@ void DeferredCommands::vkCmdBeginRendering(VkCommandBuffer cmd, const VkRenderin
         }
         return;
     }
-    record(info?sum(sizeof(VkRenderingInfo)+2*sizeof(VkRenderingAttachmentInfo),bytes(info->colorAttachmentCount,sizeof(VkRenderingAttachmentInfo))):0,info&&!info->pNext&&chains(info->colorAttachmentCount,info->pColorAttachments)&&(!info->pDepthAttachment||!info->pDepthAttachment->pNext)&&(!info->pStencilAttachment||!info->pStencilAttachment->pNext),[=] {
+    record(info?sum(sizeof(VkRenderingInfo)+2*sizeof(VkRenderingAttachmentInfo),bytes(info->colorAttachmentCount,sizeof(VkRenderingAttachmentInfo))):0,info&&(!info->pNext||rate_map_of(*info))&&chains(info->colorAttachmentCount,info->pColorAttachments)&&(!info->pDepthAttachment||!info->pDepthAttachment->pNext)&&(!info->pStencilAttachment||!info->pStencilAttachment->pNext),[=] {
         return [cmd,copy=Rendering(*info)] { copy.emit(cmd); };
     },[=] { gfxvk::vkCmdBeginRendering(cmd, info); });
 }

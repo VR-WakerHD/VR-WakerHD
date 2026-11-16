@@ -155,3 +155,27 @@ is the portable temporal alternative. Not started: FSR 1 was asked for first.
 2. Steam Frame: `upscaling: SGSR1 (auto)`; edges sharper than the blit; no halos at high contrast (HUD text is drawn
    before, so it is sharpened too); sharpness 1 vs 2.
 3. Both: frame times with each choice against `vr.upscaler=off` (logs).
+
+## CAS, the Quest's Auto (2026-11-11)
+
+`vr.upscaler` = `cas` (`gfx/vulkan/vr_cas.cpp`): contrast adaptive sharpening with upscaling, after AMD FidelityFX
+CAS (MIT): each output pixel blends the four input pixels round it, each sharpened against its four neighbours by a
+weight that falls where the local contrast is already high (no halos on edges, flat areas flat). One pass from the eye
+picture's shown region into the swapchain image, 12 texel reads, once a game frame. `vr.casSharpness` 0..1 (0.5).
+
+**Auto on a Quest** (standalone, Meta's compositor, the shader pass available) is now CAS instead of Quest Super
+Resolution: Super Resolution is the compositor's, about 0.7 ms of the GPU at every display refresh (three per frame at
+30 fps on 90 Hz); AstroQuest (a Quest 3 port) sharpens its pictures itself once a frame for that reason and measured it
+"too little to measure". Quest Super Resolution stays a choice; without the shader pass Auto still takes it. The
+picture is drawn at the swapchain's size (the native-picture copy is only for Super Resolution).
+
+### Edge smoothing (FXAA) in the CAS pass (2026-11-12, `vr.casFxaa`)
+
+The Quest draws without anti-aliasing (no multisampling; the game's FXAA option only works on the desktop picture,
+`present.cpp`), and a player reported many jagged edges. The CAS pass can now smooth edges first: the classic
+directional FXAA at the output pixel's place in the source (the lumas of four bilinear reads round it give the edge's
+direction, two to four reads along it are averaged; reads kept inside the shown region), then CAS's sharpening is added
+back except on the edges it smoothed (in proportion to how strong the edge is), so the steps it took out do not return.
+One pass as before, about 0.5-1 ms of the GPU a frame (estimate from AstroQuest's 1 ms for a separate FXAA pass at
+816x870). "Edge smoothing (FXAA)" under CAS sharpness in the launcher and F1 > VR; on by default on a Quest, off
+elsewhere.

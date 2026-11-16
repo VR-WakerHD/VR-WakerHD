@@ -60,6 +60,12 @@ inline constexpr bool kSteamFrameBuild = true;
 #else
 inline constexpr bool kSteamFrameBuild = false;
 #endif
+// Steam Frame - Native (Linux arm64, not the Android layer)
+#if defined(WWHD_STEAM_FRAME_NATIVE) || (defined(__linux__) && defined(__aarch64__) && !defined(__ANDROID__))
+inline constexpr bool kSteamFrameNativeBuild = true;
+#else
+inline constexpr bool kSteamFrameNativeBuild = false;
+#endif
 // the frame rate drawn for the headset, by meaning (docs/VR_FRAME_RATE.md; interp_pacing.h VrFrameMode): unlocked (as
 // fast as the headset shows evenly and the computer draws), capped at the refresh rate (Full: 90 fps at 90 Hz), at
 // half of it (Half: 45 fps at 90 Hz), or auto (full while its frames fit, else half). Original (the game's own 30 fps)
@@ -69,6 +75,10 @@ enum class FrameRate : int { Unlocked = 0, Half = 1, Original = 2, Auto = 3, Ful
 // choose (XR_FB_display_refresh_rate), and the one the frame-rate caps are named after
 inline constexpr int kRefreshRates[] = {60, 72, 80, 90, 120};
 constexpr int kDefaultRefreshRate = 90;
+// the refresh rate a headset starts at: 90 Hz (a Quest too since format 21, 2026-11-11, the user's choice: with Steady
+// 30 FPS every frame is shown for exactly three refreshes, AstroQuest's pacing; 72 Hz with 36 fps, format 20, judders
+// at the 20-25 fps a Quest 3 draws: its frames held three and four refreshes in turn)
+inline int default_refresh_rate() { return kDefaultRefreshRate; }
 // a refresh rate as one of kRefreshRates: within 0.6 Hz of one (runtimes report 89.9, 119.88, 59.94, 72.0: a rate
 // rounded or in NTSC steps; 61 or 88 Hz are other rates), else 0
 inline int supported_refresh_rate(float hz) {
@@ -85,8 +95,13 @@ inline int supported_refresh_rate(float hz) {
 // (migrate_bindings: it opens the item wheel); 14: frame synthesis auto on a Quest (2026-11-04, a test build only);
 // 15: off again there (the user's choice, the same day): a Quest's auto saved by format 14 back to off; 16: the menu
 // zoom; 17: vr.renderScale the headset resolution (the eye pictures' size), not the headset images' size alone; 18:
-// a standalone headset's default 0.55 -> 0.65; 19: ambient occlusion off by default on a Quest
-constexpr int kSettingsFormat = 19;
+// a standalone headset's default 0.55 -> 0.65; 19: ambient occlusion off by default on a Quest; 20: a Quest at 72 Hz,
+// capped at half (36 fps), by default; 21: a Quest at 90 Hz with Steady 30 FPS (each frame three refreshes) by default; 22: foveation Medium by
+// default on a Quest and Steam Frame - Native (High before); 23: Steam Frame - Native at 90 Hz with Capped 30 FPS by
+// default; 25: a Quest's Headset resolution 0.70 by default; 24: "Move where you look" off by default (the left stick walks where the left controller points);
+// 26: "Move where you look" on by default again; 27: foveation Low by default on a Quest (Medium before); 28: frame
+// synthesis Auto on a Quest; 29: Steam Frame - Native foveation Low and edge smoothing (FXAA) on, as a Quest
+constexpr int kSettingsFormat = 29;
 
 // The defaults are the settings the project's VR port was tuned with in the headset (PS VR2, SteamVR; 2026-10-25)
 // Headset resolution's quick choices (the VR menus' buttons beside the slider; 2026-11-09: 0.70 between the 0.65
@@ -107,13 +122,18 @@ struct Config {
     Turn turn = Turn::Smooth;
     float snapDegrees = 30;
     float smoothDegreesPerSecond = 120;
+    // the left stick's forward (the menus' "Move where you look", under Hide Link's arms): the head's heading (on) or
+    // where the left controller points (off). On by default again since format 26 (2026-11-12, the user's choice; off
+    // was the default in formats 24 and 25)
     MoveDirection moveDirection = MoveDirection::Head;
     float moveSpeed = 1;                // scale of the left stick before the game reads it (the game runs/walks)
     // the headset resolution (docs/VR_SETTINGS.md, "Headset resolution"): the eye pictures drawn at this share of the
     // runtime's recommended eye image (on a PC the headset's images too, a 1:1 copy). 1 on a PC; 0.65 on a standalone
     // headset (the user's choice, 2026-11-08: Quest 3 1092x1144 of 1680x1760, 1.4x the pixels its 0.75x internal
     // resolution drew, sharper for some GPU time), upscaled there
-    float renderScale = kPcVrBuild ? 1.0f : 0.65f;
+    // (format 25, 2026-11-12) 0.70 on a Quest: a player's Quest 3 held 28-30 fps there with the GPU savings (the user's
+    // choice); other standalone headsets 0.65, PC VR 1
+    float renderScale = kPcVrBuild ? 1.0f : quest_headset() ? 0.70f : 0.65f;
     float maxHeadOffset = 1.0f;         // metres the head may lean / walk away from Link before it is held back
                                         // (VR fork: 1 m, was 0.6; walls hold it shorter: vr_game.cpp g_wallLean)
     // first person: metres the view sits in front of (+) or behind (-) Link's eyes (the game's eye point; 0 = his eyes)
@@ -155,7 +175,46 @@ struct Config {
     // headset): by default out in front of the fist, a little right and up, so its handle is in the hand (as set in the
     // headset). (Before format 12 it was in the controller's grip space, -0.13 z for the shield out of the back of the
     // hand.) Right-handed play only (vr.leftHanded off), where they were set
-    float shieldOffsetX = 0.072f, shieldOffsetY = 0.016f, shieldOffsetZ = -0.06f;
+    // (2026-11-14: the user's own placement, set in the game's VR menu, made the default)
+    float shieldOffsetX = 0.096f, shieldOffsetY = -0.016f, shieldOffsetZ = -0.004f;
+    // the shield turned freely with its controller (asked for, 2026-11-12, with a video of the stiff shield: "unlocked
+    // rotation on the wrist moving in and out and around"): its face where the controller points and its top along the
+    // controller's top, so rolling and twisting the wrist turn it. Off: held flush with the body, its top straight up
+    // and its face tilted at most 60 degrees (as before)
+    bool shieldFreeRotation = true;
+    // turn smoothing (docs/FRAME_INTERPOLATION_IMPLEMENTATION.md, change 3, stage 1; asked for, 2026-11-12): while the
+    // view turns (a smooth turn, the view following Link round) and the game draws fewer frames than the headset shows
+    // (Steady 30, 45 fps), the last frame is shown again on the refreshes between, turned by how far the view has turned
+    // since it was drawn, so turning is as smooth as the headset's refresh rate. Off: the runtime shows the last frame
+    // turned with the head only, the view's own turn stepping at the frame rate (as before). Off by default after its
+    // headset run at Capped 45 (2026-11-12: "its worse now"): turning at 118 degrees/s it showed 127 frames again in 10 s
+    // and the missed refreshes went from 10-36 to 147: a frame shown again took the slot a game frame wanted and delayed it.
+    // On again the same day, planned right after each game frame (vr_vulkan.cpp planned_repeats)
+    bool turnSmoothing = true;
+    // steady hands while turning (docs/VR_HANDS_LAYER_PLAN.md, step 5; asked for, 2026-11-12): with Turn smoothing, Link's
+    // hands, sword, shield and what he holds are sent to the headset as a layer of their own, so the refreshes between
+    // the game's frames turn the world but not his hands. Only at 30 and 45 fps (Steady 30, Capped 45, Auto Mode when it
+    // drops); never at a real 90. Off: his hands turn with the world (as before). On by default in every build (user,
+    // 2026-11-13: "always on by default"; its cost on a standalone headset still to be measured, step 6)
+    bool handsLayer = true;
+    // Head movement smoothing (vr.headSmoothing, 2026-11-13, asked for, its own setting next to Smooth Camera while
+    // Turning in the launcher's Comfort section and F1 > VR (under Streaming optimal until 2026-11-14); any
+    // headset, wired or streamed): at a frame rate under the headset's (45 fps at 90 Hz, 36 at 72), the refreshes between
+    // the game's frames get the last frame warped on the GPU by the eyes' movement since it was drawn, by its depth, so
+    // near things (the arms, the sword, close walls) no longer step as you look around; the runtime still turns it to the
+    // head. Not while the stick turns or the view moves (turn smoothing as set). Nothing at a real 90. Off by default
+    // until tested in a headset
+    // (2026-11-14: removed from the settings with movement smoothing, then back the same day as an option, asked for: in
+    // F1 > VR and the launcher, saved; off by default. Movement smoothing stays removed)
+    bool headSmoothing = false;
+    // movement smoothing (change 3, stage 2; asked for, 2026-11-12): as turn smoothing, for the view's movement (Link
+    // running, carried, sliding): the frames shown again moved on by how far the view has moved since they were drawn,
+    // with each eye's depth sent (XR_KHR_composition_layer_depth, enabled for it where the runtime offers it) so the
+    // runtime moves near things more than far ones. Not while Link rides the boat (the deck moves with the view). Applies
+    // at the next start (the depth is chosen when VR starts). Off by default after its first headset run at 45 and 30 fps
+    // (2026-11-12: "the world is ghosting"): the depth it turns on, never checked in a headset, changes the runtime's
+    // reprojection of every frame
+    bool movementSmoothing = false;
     // the drawn sword moved in the sword-hand controller's grip space (metres: +x right, +z towards you, along the fist)
     // from the game's grip mirrored onto the hand: its handle had sat a little out of the fist (reported in the
     // headset). Right-handed play only (vr.leftHanded off), where the game's grip is mirrored
@@ -198,6 +257,10 @@ struct Config {
     // first person: Link's arms not drawn, his hands are (and what they hold): each arm folded into its hand (docs/
     // VR_FIRST_PERSON_CAMERA.md, "Hiding the arms"); with hideBody or on its own. On by default (2026-11-04)
     bool hideArms = true;
+    // (docs/VR_HANDS_LAYER_PLAN.md; asked for, 2026-11-13) with Link's hands in their own layer: the game's shadows drawn
+    // on him (his body, hands and what they hold). Off: none are, his own shadow on the ground stays. Off by default in
+    // every build (user, 2026-11-13) until the background's shadows on him with it on are fixed (headset runs)
+    bool shadowsOnLink = false;
     // the game's screen effects in the headset (docs/VR_SCREEN_EFFECTS.md); on is the original picture, off the default
     // (asked for after the headset test, 2026-10-30). The screen blur (Swift Sail, some attacks: the last frame laid
     // over the new one, zoomed) and the bloom (the glow round bright light; the game's Bloom strength setting still
@@ -217,6 +280,21 @@ struct Config {
     // writes no occlusion and skips its depth taps (GPU time per eye), the sun's shadows unchanged. Off by default on a
     // Quest (the user's choice, 2026-11-10: the GPU is the limit there), still choosable
     bool ambientOcclusion = !quest_headset();
+    // the sun's lens flare (dKyr_drawLenzflare, interp.cpp hook_02570210: its rays, rings and glow over the picture,
+    // transparent quads across much of both eyes when looking near the sun). Off by default on a Quest (2026-11-11, the
+    // user's choice: fewer expensive effects where the GPU is the limit), on elsewhere; the sun itself is drawn either way
+    bool lensFlare = !quest_headset();
+    // the draw distance (aspect.cpp stereo_clipper, docs/VR_PERFORMANCE.md "Draw distance"): the share of the game's own
+    // culling distance (mDoLib_clipper's far plane) things are drawn to: actors, the islands' scenery, grass and trees
+    // past it are not drawn. The projection's far plane is unchanged. 0.7 on a Quest (2026-11-11, the user's choice:
+    // less detail in the distance where the GPU is the limit; Steam Frame - Native too, format 23), the game's whole
+    // distance elsewhere
+    float drawDistance = (quest_headset() || kSteamFrameNativeBuild) ? 0.7f : 1.0f;
+    // the field of view drawn (docs/VR_EYE_PROJECTION.md "Field of view", vr.cpp fov_scale): each eye's field narrowed
+    // to this share of its tangents, the eye pictures by as much (the same sharpness, fewer pixels), the rest black.
+    // 0.75 .. 1 in steps of 0.05, the launcher's slider, applied at the session's start. 0.85 on a Quest (2026-11-12, the
+    // user's choice, AstroQuest's default), 1 elsewhere; always 1 in PC VR (not offered there)
+    float fieldOfView = quest_headset() ? 0.85f : 1.0f;
     bool trackedSword = true;           // draw the sword at the tracked hand (else where Link's animation holds it)
     // TPVR's physical sword: while the sword hand swings (swingStartSpeed), the blade cuts and hits along its tracked
     // path without the game's attack animation; full swings still play the game's attack
@@ -245,9 +323,11 @@ struct Config {
     // conversations in first person (docs/VR_CUTSCENE_TEXT.md, "Conversations in first person"): the view stays at
     // Link's eyes (not the game's camera), and the text box stays in the world where you looked when it began
     bool firstPersonTalk = true;
-    // the telescope's eyepiece (the game's mask) drawn at this share of its full size; the eye picture around it is
-    // black (docs/VR_TELESCOPE.md). Full size put the black ring outside what the lenses show
-    float telescopeSize = 0.85f;
+    // the telescope's eyepiece (the game's mask, its zoom gauge and stick prompts) drawn at this share of its full size,
+    // centred, as the Picto Box's viewfinder; the eye picture around it is black (docs/VR_TELESCOPE.md). (Until
+    // 2026-11-14 a share of the size that covers the eye, 0.85: the gauge and prompts were outside the lenses' view)
+    // (0.50 since 2026-11-14 in the headset: at 0.70 its controls still could not all be read)
+    float telescopeSize = 0.50f;
     // the Picto Box's viewfinder (its frame, zoom gauge, count and prompts) drawn at this share of its full size,
     // centred; the photo is the part inside the frame, so it shrinks with it (docs/VR_PICTO_BOX.md). Full size put
     // the zoom gauge outside what the lenses show
@@ -264,26 +344,54 @@ struct Config {
     float menuHeight = -0.08f;          // metres above (+) or below (-) eye level
     float menuScale = 1.0f;             // times the base width of 0.8 m
     float menuCurvature = 0.0f;         // 0 flat .. 1 curved around the head (runtimes with cylinder layers)
-    float refreshRate = kDefaultRefreshRate;  // Hz, one of kRefreshRates: asked of the headset (XR_FB_display_refresh_rate)
-    bool autoFrameRate = true;          // switch frame interpolation on for the session if it is off
+    float refreshRate = float(default_refresh_rate());  // Hz, one of kRefreshRates: asked of the headset (XR_FB_display_refresh_rate)
+    // switch frame interpolation on for the session if it is off (the rates above 30 fps need it). On by default: briefly
+    // off on 2026-11-12, then on again the same day (the user's choice: 90 fps needs it; at 30 and 45 every frame shows
+    // two or three times and ghosts whatever smooths it)
+    bool autoFrameRate = true;
     // vr.frameRate: full (the refresh rate: 90 fps at 90 Hz), half, unlocked, auto. (VR fork) Auto Mode by default:
     // capped at the refresh rate while its frames fit, else at half (was full)
-    FrameRate frameRate = FrameRate::Auto;
+    // On a Quest capped at half the refresh rate: 36 fps at its default 72 Hz (the user's choice, 2026-11-11)
+    // (a Quest and Steam Frame - Native: Capped 30 FPS, steady at 90 Hz; the Frame since format 23, the user's choice)
+    FrameRate frameRate = (quest_headset() || kSteamFrameBuild) ? FrameRate::Original : FrameRate::Auto;  // (both Frame builds)
     // vr.upscaler (docs/VR_UPSCALING.md, vr_upscale.h): auto (the best the device offers: Quest Super Resolution, DLSS
     // on an NVIDIA RTX PC, else SGSR1 where the eye picture is upscaled), off, sgsr1, superResolution, dlss, and by
     // choice only sgsr2 and fsr1
     upscale::Mode upscaler = kPcVrBuild ? upscale::Mode::Off : upscale::Mode::Auto;  // (PC VR: off by default)
+    // vr.foveation (docs/VR_FOVEATION.md, gfx/vulkan/foveation.cpp): fixed foveated rendering on the two-eye passes, the
+    // edges of each eye shaded in 2x2 (and 4x4) blocks: 0 off, 1 low, 2 medium, 3 high. Medium on a Quest and on Steam
+    // Frame - Native (2026-11-11, the user's choice, High until the shading rate maps are seen in a headset: format 22),
+    // off elsewhere; only where the GPU supports it (the start's log says). Low on a Quest since format 27 (2026-11-12,
+    // the user's choice: a Quest 3S player saw the picture pixelated, and Medium shaded 69% of each eye in 2x2 blocks
+    // with the GPU busy half of the time at 30 fps)
+    // Low on Steam Frame - Native too since format 29 (2026-11-14, the user's choice: the Quest's)
+    int foveation = (quest_headset() || kSteamFrameNativeBuild) ? 1 : 0;
+    // vr.desktopView (2026-11-12, the user's choice; SteamVR's VR View choices): what the desktop window shows while the
+    // headset plays, on a PC: 0 the left eye (as before), 1 the right eye, 2 both eyes side by side, 3 nothing (black;
+    // the window's picture not composed), 4 / 5 both eyes, left / right dominant (SteamVR's: one picture of both eyes'
+    // fields, the dominant eye's with the other blended in, wider than one eye's). vr.desktopViewFill: the eye picture fills the window, its edges cropped,
+    // instead of the whole picture with black bars. Only the window: the headset's pictures are not changed
+    int desktopView = 0;
+    bool desktopViewFill = false;
     // SGSR1's edge sharpness, 1 (soft) .. 2 (Qualcomm's default); 1.5 on the Steam Frame (2026-11-03: 2 may halo the
     // game's dark outlines; STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md section 6)
     float upscaleSharpness = kSteamFrameBuild ? 1.5f : 2.0f;
+    // CAS's sharpness (vr.upscaler cas, the Quest's auto since 2026-11-11), 0 (soft) .. 1 (AMD's strongest); 0.5
+    float casSharpness = 0.5f;
+    // (2026-11-12) edge smoothing (FXAA) in the CAS pass, before its sharpening: the Quest draws without anti-aliasing,
+    // every edge stair-stepped (a player's report). On by default on a Quest (the user's choice), off elsewhere
+    // On Steam Frame - Native too since format 29 (2026-11-14, the user's choice: CAS is its Auto upscaler as a Quest's)
+    bool casFxaa = quest_headset() || kSteamFrameNativeBuild;
     float fsrSharpness = 0.2f;          // FSR 1's RCAS: stops of reduction, 0 (sharpest) .. 2 (AMD's samples: 0.2)
     // vr.frameSynthesis (docs/VR_FRAME_SYNTHESIS.md, vr_framesynth.h): auto (the runtime's frame synthesis on a
     // standalone headset that offers it, the game at half the refresh rate; depth for reprojection elsewhere), off, on.
     // Applies at the next start (the runtime's extensions are chosen when VR starts)
     // Off by default (the user's choices of 2026-11-03): PC VR; the Steam Frame until it is tested there (a player's
     // run with it smeared and tore, and QuakeVR's Frame port ships it off after artifacts). Off on a Quest too
-    // (2026-11-04: auto there for one test build, then off again by the user's choice). Every choice stays choosable
-    framesynth::Mode frameSynthesis = framesynth::Mode::Off;
+    // (2026-11-04: auto there for one test build, then off again by the user's choice). Every choice stays choosable.
+    // 2026-11-13: Auto by default on a Quest (the user's choice, after a Quest 3 player's run with it on felt good to
+    // them: about 21 fps drawn, shown about twice as smooth, the GPU 86-98% busy); still off on PC VR and the Steam Frame
+    framesynth::Mode frameSynthesis = quest_headset() ? framesynth::Mode::Auto : framesynth::Mode::Off;
     // vr.dynamicResolution (docs/VR_DYNAMIC_RESOLUTION.md, vr_dynres.h): off, quality, balanced, performance, custom;
     // Custom's range (of the internal resolution, linear), GPU target (busy %) and settle time (s). Applies at once
     dynres_vr::Mode dynamicResolution = dynres_vr::Mode::Off;  // (off everywhere by default)
@@ -295,12 +403,27 @@ struct Config {
     // a direction once it is batonHandReach metres out that way (held until it is back within 60 % of that)
     bool batonHands = true;
     float batonHandReach = 0.12f;
+    // (asked for, 2026-11-14) first person: the song starts by itself 1.5 s after the Wind Waker is raised or the song is
+    // back at its start (a new beat, a measure ended), as if its first note had been played (vr_game.cpp baton_auto_start).
+    // Off (the default): the game's own, the song starts with the first note
+    bool batonAutoStart = false;  // (off by default, asked for 2026-11-14)
+    // (2026-11-14) the layouts while Link conducts (the bar of notes and beat, a song's message) at this share of their
+    // size, as if farther away: at full size they were too close to read whole
+    float batonUiSize = 0.60f;
     bool armIK = true;                  // Link's arms follow the controllers
     // Link's arms reach where the controllers are: the hand target is not held to his shoulder's reach (the arm moves
     // out from the shoulder instead) and the wrist turns as far as the controller (docs/VR_ARM_ANIMATION.md)
     bool detachedArms = true;
     bool aimLaser = true;  // the red aiming laser while the bow, hookshot, boomerang or grappling hook aims (docs/VR_AIMING.md)
     float realArmLength = 0.6f;         // metres from shoulder to grip of the player (for scaling to Link's arms)
+    // (2026-11-13) controller calibration per headset model (openxr_session.cpp controller_profile): degrees the
+    // controllers' poses (aim and grip) are turned by in their own frame before anything reads them, pitch (+ up), yaw
+    // (+ left) and roll (+ counter-clockwise), the right hand's; the left hand's mirrored (yaw and roll negated). One set
+    // per model, so a correction for one never changes another: a Quest 3 (vr.calibration.quest3.*), a Quest 3S
+    // (vr.calibration.quest3s.*), every other headset (vr.calibration.other.*). All 0 by default
+    float calibQuest3Pitch = 0, calibQuest3Yaw = 0, calibQuest3Roll = 0;
+    float calibQuest3SPitch = 0, calibQuest3SYaw = 0, calibQuest3SRoll = 0;
+    float calibOtherPitch = 0, calibOtherYaw = 0, calibOtherRoll = 0;
     // replacement texture packs ("textures" mod packages, gfx/texture_pack.h; docs/superpowers/specs runtime texture
     // adapter): vr.texturePacks switches them on (does anything only with such a package enabled; applies at the next
     // start), and vr.texturePackBudgetMB is the VRAM their images may take (0: automatic, half of the graphics card's
@@ -368,6 +491,8 @@ inline const FloatKey kFloats[] = {
     {"vr.swingFullDistance", &Config::swingFullDistance, 0.1f, 1.0f},
     {"vr.swingAcrossDistance", &Config::swingAcrossDistance, 0.05f, 0.6f},
     {"vr.bodyFollowDegrees", &Config::bodyFollowDegrees, 10.0f, 90.0f},
+    {"vr.drawDistance", &Config::drawDistance, 0.4f, 1.0f},
+    {"vr.fieldOfView", &Config::fieldOfView, 0.75f, 1.0f},
     {"vr.swingDownDistance", &Config::swingDownDistance, 0.05f, 0.6f},
     {"vr.swingThrustDistance", &Config::swingThrustDistance, 0.05f, 0.6f},
     {"vr.swingCooldown", &Config::swingCooldown, 0.0f, 1.5f},
@@ -376,7 +501,8 @@ inline const FloatKey kFloats[] = {
     {"vr.cutsceneZoomOut", &Config::cutsceneZoomOut, 1.0f, 3.0f},
     {"vr.textZoomOut", &Config::textZoomOut, 1.0f, 3.0f},
     {"vr.textHeight", &Config::textHeight, -0.5f, 0.5f},
-    {"vr.telescopeSize", &Config::telescopeSize, 0.4f, 1.4f},
+    {"vr.telescopeSize", &Config::telescopeSize, 0.3f, 1.0f},
+    {"vr.batonUiSize", &Config::batonUiSize, 0.3f, 1.0f},
     {"vr.pictoBoxSize", &Config::pictoBoxSize, 0.5f, 1.0f},
     {"vr.wristHudAlong", &Config::wristHudAlong, -0.05f, 0.2f},
     {"vr.wristHudLift", &Config::wristHudLift, 0.0f, 0.1f},
@@ -388,9 +514,19 @@ inline const FloatKey kFloats[] = {
     {"vr.refreshRate", &Config::refreshRate, 0.0f, 240.0f},
     {"vr.stickDeadZone", &Config::stickDeadZone, 0.0f, 0.6f},
     {"vr.realArmLength", &Config::realArmLength, 0.3f, 1.0f},
+    {"vr.calibration.quest3.pitch", &Config::calibQuest3Pitch, -90.0f, 90.0f},
+    {"vr.calibration.quest3.yaw", &Config::calibQuest3Yaw, -90.0f, 90.0f},
+    {"vr.calibration.quest3.roll", &Config::calibQuest3Roll, -90.0f, 90.0f},
+    {"vr.calibration.quest3s.pitch", &Config::calibQuest3SPitch, -90.0f, 90.0f},
+    {"vr.calibration.quest3s.yaw", &Config::calibQuest3SYaw, -90.0f, 90.0f},
+    {"vr.calibration.quest3s.roll", &Config::calibQuest3SRoll, -90.0f, 90.0f},
+    {"vr.calibration.other.pitch", &Config::calibOtherPitch, -90.0f, 90.0f},
+    {"vr.calibration.other.yaw", &Config::calibOtherYaw, -90.0f, 90.0f},
+    {"vr.calibration.other.roll", &Config::calibOtherRoll, -90.0f, 90.0f},
     {"vr.batonHandReach", &Config::batonHandReach, 0.05f, 0.4f},
     {"vr.upscaleSharpness", &Config::upscaleSharpness, 1.0f, 2.0f},
     {"vr.fsrSharpness", &Config::fsrSharpness, 0.0f, 2.0f},
+    {"vr.casSharpness", &Config::casSharpness, 0.0f, 1.0f},
     {"vr.dynresMin", &Config::dynresMin, 0.5f, 1.0f},
     {"vr.dynresMax", &Config::dynresMax, 0.5f, 1.0f},
     {"vr.dynresGpuTarget", &Config::dynresGpuTarget, 50.0f, 98.0f},
@@ -400,9 +536,12 @@ inline const FloatKey kFloats[] = {
 struct BoolKey { const char* key; bool Config::*field; };
 inline const BoolKey kBools[] = {
     {"vr.enabled", &Config::enabled}, {"vr.leftHanded", &Config::leftHanded},
+    {"vr.desktopViewFill", &Config::desktopViewFill},
     {"vr.cutsceneFollow", &Config::cutsceneFollow}, {"vr.showBody", &Config::showBody},
     {"vr.hideBody", &Config::hideBody},
-    {"vr.hideArms", &Config::hideArms},
+    {"vr.hideArms", &Config::hideArms}, {"vr.shieldFreeRotation", &Config::shieldFreeRotation},
+    {"vr.shadowsOnLink", &Config::shadowsOnLink},
+    {"vr.turnSmoothing", &Config::turnSmoothing}, {"vr.handsLayer", &Config::handsLayer},
     {"vr.trackedSword", &Config::trackedSword}, {"vr.firstPersonTalk", &Config::firstPersonTalk}, {"vr.autoFrameRate", &Config::autoFrameRate},
     {"vr.physicalSword", &Config::physicalSword}, {"vr.itemWheel", &Config::itemWheel},
     {"vr.armIK", &Config::armIK}, {"vr.matchLinkBody", &Config::matchLinkBody},
@@ -414,10 +553,14 @@ inline const BoolKey kBools[] = {
     {"vr.spinCamera", &Config::spinCamera},
     {"vr.streamingOptimal", &Config::streamingOptimal},
     {"vr.vdxrDepth", &Config::vdxrDepth},
+    {"vr.headSmoothing", &Config::headSmoothing},
     {"vr.screenBlur", &Config::screenBlur}, {"vr.bloom", &Config::bloom}, {"vr.heatHaze", &Config::heatHaze},
     {"vr.depthOfField", &Config::depthOfField},
     {"vr.ambientOcclusion", &Config::ambientOcclusion},
+    {"vr.lensFlare", &Config::lensFlare},
+    {"vr.casFxaa", &Config::casFxaa},
     {"vr.debugCollision", &Config::debugCollision}, {"vr.batonHands", &Config::batonHands},
+    {"vr.batonAutoStart", &Config::batonAutoStart},
     {"vr.texturePacks", &Config::texturePacks},
 };
 }  // namespace detail
@@ -478,6 +621,24 @@ inline bool from_kv(Config& c, const std::string& key, const std::string& value)
         else return false;
         return true;
     }
+    if (key == "vr.desktopView") {
+        if (value == "left") c.desktopView = 0;
+        else if (value == "right") c.desktopView = 1;
+        else if (value == "both") c.desktopView = 2;
+        else if (value == "off") c.desktopView = 3;
+        else if (value == "leftDominant") c.desktopView = 4;
+        else if (value == "rightDominant") c.desktopView = 5;
+        else return false;
+        return true;
+    }
+    if (key == "vr.foveation") {
+        if (value == "off") c.foveation = 0;
+        else if (value == "low") c.foveation = 1;
+        else if (value == "medium") c.foveation = 2;
+        else if (value == "high") c.foveation = 3;
+        else return false;
+        return true;
+    }
     if (key == "vr.upscaler") {
         if (value == "auto") c.upscaler = upscale::Mode::Auto;
         else if (value == "off") c.upscaler = upscale::Mode::Off;
@@ -486,6 +647,7 @@ inline bool from_kv(Config& c, const std::string& key, const std::string& value)
         else if (value == "dlss") c.upscaler = upscale::Mode::Dlss;
         else if (value == "sgsr2") c.upscaler = upscale::Mode::Sgsr2;
         else if (value == "fsr1") c.upscaler = upscale::Mode::Fsr1;
+        else if (value == "cas") c.upscaler = upscale::Mode::Cas;
         else return false;
         return true;
     }
@@ -494,6 +656,7 @@ inline bool from_kv(Config& c, const std::string& key, const std::string& value)
         else if (value == "full") c.frameRate = FrameRate::Full;
         else if (value == "half") c.frameRate = FrameRate::Half;
         else if (value == "auto") c.frameRate = FrameRate::Auto;
+        else if (value == "steady30") c.frameRate = FrameRate::Original;
         // older formats: 45 (half the rate), 30 (the game's own), and the fixed 60, 90 and 120 fps of format 8 (all
         // three the full rate: each was chosen as the headset's own)
         else if (value == "45") c.frameRate = FrameRate::Half;
@@ -523,14 +686,14 @@ inline bool from_kv(Config& c, const std::string& key, const std::string& value)
 constexpr int kHalfOnlyRefreshRate = 120;
 // the swing thresholds must keep their order: the end speed below the start speed
 // the refresh rate is one of kRefreshRates (anything else, the runtime's choice 0 of older formats among it, the
-// default), the frame rate one the menu offers (Original: Half)
+// default), the frame rate one the menu offers (Original, Steady 30 FPS, where the rate is a multiple of 30: else Half)
 inline void validate(Config& c) {
     if (c.swingEndSpeed >= c.swingStartSpeed) c.swingEndSpeed = c.swingStartSpeed * 0.5f;
     const int hz = supported_refresh_rate(c.refreshRate);
-    c.refreshRate = float(hz ? hz : kDefaultRefreshRate);
-    if (c.frameRate == FrameRate::Original) c.frameRate = FrameRate::Half;
+    c.refreshRate = float(hz ? hz : default_refresh_rate());
+    if (c.frameRate == FrameRate::Original && int(c.refreshRate) % 30) c.frameRate = FrameRate::Half;
     if (int(c.frameRate) < 0 || int(c.frameRate) > int(FrameRate::Full)) c.frameRate = FrameRate::Full;
-    if (int(c.refreshRate) == kHalfOnlyRefreshRate && c.frameRate != FrameRate::Half)
+    if (int(c.refreshRate) == kHalfOnlyRefreshRate && c.frameRate != FrameRate::Half && c.frameRate != FrameRate::Original)
         c.frameRate = FrameRate::Auto;  // (its two choices: Capped 60 FPS and Auto Mode)
 }
 
@@ -544,12 +707,19 @@ struct FrameRateChoice {
 };
 inline std::vector<FrameRateChoice> frame_rate_choices(int refreshHz) {
     const int hz = supported_refresh_rate(float(refreshHz)) ? refreshHz : kDefaultRefreshRate;
+    // (2026-11-11) Capped 30 FPS: the game's own 30 frames a second, each shown for the same whole number of
+    // refreshes (3 at 90 Hz, 4 at 120, 2 at 60): no in-between frames, the most GPU time a frame. Only where the
+    // refresh rate is a multiple of 30 (72 and 80 Hz would show them unevenly)
+    std::vector<FrameRateChoice> out;
     if (hz == kHalfOnlyRefreshRate)
-        return {{FrameRate::Half, hz / 2, "Capped " + std::to_string(hz / 2) + " FPS"}, {FrameRate::Auto, 0, "Auto Mode"}};
-    return {{FrameRate::Unlocked, 0, "Unlocked FPS"},
-            {FrameRate::Full, hz, "Capped " + std::to_string(hz) + " FPS"},
-            {FrameRate::Half, hz / 2, "Capped " + std::to_string(hz / 2) + " FPS"},
-            {FrameRate::Auto, 0, "Auto Mode"}};
+        out = {{FrameRate::Half, hz / 2, "Capped " + std::to_string(hz / 2) + " FPS"}, {FrameRate::Auto, 0, "Auto Mode"}};
+    else
+        out = {{FrameRate::Unlocked, 0, "Unlocked FPS"},
+               {FrameRate::Full, hz, "Capped " + std::to_string(hz) + " FPS"},
+               {FrameRate::Half, hz / 2, "Capped " + std::to_string(hz / 2) + " FPS"},
+               {FrameRate::Auto, 0, "Auto Mode"}};
+    if (hz % 30 == 0 && hz / 2 != 30) out.push_back({FrameRate::Original, 30, "Capped 30 FPS"});
+    return out;
 }
 inline std::string frame_rate_name(FrameRate r, int refreshHz) {
     for (const auto& c : frame_rate_choices(refreshHz))
@@ -630,14 +800,19 @@ inline std::vector<std::pair<std::string, std::string>> to_kv(const Config& c) {
     out.emplace_back("vr.frameSynthesis", c.frameSynthesis == framesynth::Mode::Off  ? "off"
                                           : c.frameSynthesis == framesynth::Mode::On ? "on"
                                                                                      : "auto");
+    out.emplace_back("vr.desktopView", c.desktopView == 1 ? "right" : c.desktopView == 2 ? "both" : c.desktopView == 3 ? "off"
+                                       : c.desktopView == 4 ? "leftDominant" : c.desktopView == 5 ? "rightDominant" : "left");
+    out.emplace_back("vr.foveation", c.foveation <= 0 ? "off" : c.foveation == 1 ? "low" : c.foveation == 2 ? "medium" : "high");
     out.emplace_back("vr.upscaler", c.upscaler == upscale::Mode::Off               ? "off"
                                     : c.upscaler == upscale::Mode::Sgsr1           ? "sgsr1"
                                     : c.upscaler == upscale::Mode::SuperResolution ? "superResolution"
                                     : c.upscaler == upscale::Mode::Dlss            ? "dlss"
                                     : c.upscaler == upscale::Mode::Sgsr2           ? "sgsr2"
                                     : c.upscaler == upscale::Mode::Fsr1            ? "fsr1"
+                                    : c.upscaler == upscale::Mode::Cas             ? "cas"
                                                                                    : "auto");
-    out.emplace_back("vr.frameRate", c.frameRate == FrameRate::Half || c.frameRate == FrameRate::Original ? "half"
+    out.emplace_back("vr.frameRate", c.frameRate == FrameRate::Original ? "steady30"
+                                     : c.frameRate == FrameRate::Half ? "half"
                                      : c.frameRate == FrameRate::Auto                                      ? "auto"
                                      : c.frameRate == FrameRate::Full                                      ? "full"
                                                                           : "unlocked");
@@ -718,6 +893,48 @@ inline void migrate_config(Config& c, int savedFormat) {
     // format 19: ambient occlusion off by default on a Quest; a Quest's settings saved before (AO on, the old default)
     // take it
     if (savedFormat < 19 && quest_headset()) c.ambientOcclusion = Config{}.ambientOcclusion;
+    // format 20: a Quest's settings saved with the old defaults (90 Hz, Auto Mode) take the new ones (72 Hz, capped at
+    // half: 36 fps); a rate or frame rate chosen otherwise stays
+    if (savedFormat < 20 && quest_headset() && int(c.refreshRate) == kDefaultRefreshRate && c.frameRate == FrameRate::Auto) {
+        c.refreshRate = Config{}.refreshRate;
+        c.frameRate = Config{}.frameRate;
+    }
+    // format 21: a Quest's settings with format 20's defaults (72 Hz, capped at half: 36 fps), or the older ones (90 Hz,
+    // Auto Mode), take the new ones (90 Hz, Steady 30 FPS); a rate or frame rate chosen otherwise stays
+    if (savedFormat < 21 && quest_headset() &&
+        ((int(c.refreshRate) == 72 && c.frameRate == FrameRate::Half) ||
+         (int(c.refreshRate) == kDefaultRefreshRate && c.frameRate == FrameRate::Auto))) {
+        c.refreshRate = Config{}.refreshRate;
+        c.frameRate = Config{}.frameRate;
+    }
+    // format 22: foveation Medium by default where it was High (a Quest, Steam Frame - Native); High saved by the builds
+    // with that default takes Medium, another level chosen stays
+    if (savedFormat < 22 && (quest_headset() || kSteamFrameNativeBuild) && c.foveation == 3) c.foveation = Config{}.foveation;
+    // format 23 (24: Lepton too): a Steam Frame's settings with the old default (90 Hz, Auto Mode) take its new one (90 Hz, Capped
+    // 30 FPS); a rate or frame rate chosen otherwise stays
+    // format 24: "Move where you look" off by default; settings saved with the old default (head) take the new one
+    if (savedFormat < 24 && c.moveDirection == MoveDirection::Head) c.moveDirection = Config{}.moveDirection;
+    // format 25: a Quest's Headset resolution 0.70 by default; settings saved with the old default (0.65) take it, a
+    // resolution chosen otherwise stays
+    if (savedFormat < 25 && quest_headset() && std::fabs(c.renderScale - 0.65f) < 0.001f) c.renderScale = Config{}.renderScale;
+    // format 26: "Move where you look" on by default again; settings saved with the old default (hand) by formats 24 and
+    // 25 take the new one
+    if (savedFormat >= 24 && savedFormat < 26 && c.moveDirection == MoveDirection::LeftHand) c.moveDirection = Config{}.moveDirection;
+    // format 27: foveation Low by default on a Quest; Medium saved with the old default takes it, another level chosen
+    // stays
+    if (savedFormat < 27 && quest_headset() && c.foveation == 2) c.foveation = Config{}.foveation;
+    // format 28: frame synthesis Auto by default on a Quest; Off saved with the old default takes it, On chosen stays
+    if (savedFormat < 28 && quest_headset() && c.frameSynthesis == framesynth::Mode::Off)
+        c.frameSynthesis = Config{}.frameSynthesis;
+    // format 29: Steam Frame - Native takes the Quest's foveation Low and edge smoothing; the old defaults saved (Medium,
+    // edge smoothing off) take them, another foveation level chosen stays
+    if (savedFormat < 29 && kSteamFrameNativeBuild) {
+        if (c.foveation == 2) c.foveation = Config{}.foveation;
+        c.casFxaa = Config{}.casFxaa;
+    }
+    if (savedFormat < 24 && kSteamFrameBuild && int(c.refreshRate) == kDefaultRefreshRate &&
+        c.frameRate == FrameRate::Auto)
+        c.frameRate = Config{}.frameRate;
 }
 
 inline Config from_saved(const std::vector<std::pair<std::string, std::string>>& saved) {

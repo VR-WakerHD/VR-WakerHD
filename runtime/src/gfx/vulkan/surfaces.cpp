@@ -207,7 +207,14 @@ static void latch_aspect() {
         kx = (shared >= base ? shared / base : 1.0f) * a / shared;
     }
 #endif
-    if (kx != g_aspect_kx || ky != g_aspect_ky) LOG("[gfx] aspect %.4f: screen targets x%.4f wide, x%.4f tall", a, kx, ky);
+    // (logged when it changes: compared with what was logged, not with g_aspect_kx/ky, which latch_headset_resolution
+    // below sets to the headset resolution's factors in VR, so this line was logged every frame: 38,906 times in one
+    // 7-minute PC log, 2026-11-12)
+    static float loggedA = 0, loggedKx = 0, loggedKy = 0;
+    if (a != loggedA || kx != loggedKx || ky != loggedKy) {
+        loggedA = a, loggedKx = kx, loggedKy = ky;
+        LOG("[gfx] aspect %.4f: screen targets x%.4f wide, x%.4f tall", a, kx, ky);
+    }
     g_aspect_kx = kx;
     g_aspect_ky = ky;
 }
@@ -1306,7 +1313,11 @@ void create_surface_image(Surface* s, bool forRendering, VkExtent3D explicitExte
     if(forRendering&&attach_eye1_layers(s))return;
     const bool twoEyes=forRendering&&two_eye_target(s);
     VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    imageInfo.flags=(cube?VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:0)|VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    // (2026-11-11) not VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT: every view of a surface's image is in its own format
+    // (fmt.pixel; aliases in another format are surfaces of their own, copied across). A mutable image without a
+    // format list loses the Adreno GPU's bandwidth compression (UBWC), every render target's reads and writes at full
+    // size (AstroQuest's README: "without it Turnip has to store every colour image uncompressed")
+    imageInfo.flags=(cube?VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT:0);
     // volumes are render targets too (the game renders its colour-grading volumes slice by slice): their
     // slices get 2D attachment views (layer_view)
     if(threeD&&R.imageView2DOn3DImage&&(usage&VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT))imageInfo.flags|=VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT;
@@ -2430,6 +2441,57 @@ void upload_surface(Surface* s) {
     if(g_texture_packs_on)[[unlikely]]texture_pack_after_upload(s);
 }
 static void wait_before_layer_clear(const Surface* s);  // (below)
+static void record_color_clear(Surface* s,const VkClearColorValue& value,uint32_t first,uint32_t num);
+static void record_depth_clear(Surface* s,VkImageAspectFlags aspects,const VkClearDepthStencilValue& value,uint32_t first,uint32_t num);
+// ---- held clears (2026-11-11). On a tiled GPU (Quest, Steam Frame) a clear recorded on its own writes the whole cleared
+// image to memory, and the pass that draws into it next loads it all back into the GPU's tile memory (loadOp LOAD,
+// draw.cpp). A clear of a whole single-layer surface is held instead (Surface::pendingClear): the next pass that draws
+// into all of it starts with loadOp CLEAR, so neither the write nor the load happens. Anything else that uses the
+// surface first records the clear as before (transition_image: flush_pending_clear). Not with render-pass objects
+// (pass.cpp keeps one load operation for all colour targets), nor for a volume, an array or part of one, nor for a
+// depth clear 60 fps (generated) keeps. Mobile GPU builds by default (WWHD_VK_FOLD_CLEARS=0 turns it off); elsewhere
+// WWHD_VK_FOLD_CLEARS=1 turns it on
+static std::atomic<uint64_t> g_clearsHeld{0}, g_clearsFolded{0}, g_clearsFlushed{0};
+static thread_local int t_foldScope=0;
+FoldClearScope::FoldClearScope(){++t_foldScope;}
+FoldClearScope::~FoldClearScope(){--t_foldScope;}
+bool folding_clears_here(){return t_foldScope>0;}
+bool fold_clears_on() {
+    static const bool on=[]{
+        const char* e=getenv("WWHD_VK_FOLD_CLEARS");
+#ifdef WWHD_MOBILE_GPU_PATHS
+        const bool v=!(e&&e[0]=='0');
+#else
+        const bool v=e&&e[0]=='1';
+#endif
+        LOG("[vulkan] held clears %s: a whole surface's clear starts the next pass drawing into it (loadOp CLEAR)%s",
+            v?"on":"off",v?"; WWHD_VK_FOLD_CLEARS=0 turns them off":"");
+        return v;
+    }();
+    return on&&!R.renderPasses;
+}
+static bool hold_clear(const Surface* s,uint32_t first,uint32_t num) {
+    if(!fold_clears_on()||!s->image||s->imageType==VK_IMAGE_TYPE_3D||s->arrayLayers!=1||first!=0||num<1)return false;
+    g_clearsHeld.fetch_add(1,std::memory_order_relaxed);
+    return true;
+}
+void flush_pending_clear(Surface* s) {
+    if(!s||!s->pendingClear)return;
+    const uint8_t kind=s->pendingClear;s->pendingClear=0;  // (first: the clear's own layout change comes back here)
+    g_clearsFlushed.fetch_add(1,std::memory_order_relaxed);
+    if(kind==1)record_color_clear(s,s->pendingValue.color,0,1);
+    else record_depth_clear(s,s->pendingAspects,s->pendingValue.depthStencil,0,1);
+}
+// (draw.cpp, each pass begin) a held clear folded into the pass: counted, and logged every 600 frames
+void note_clear_folded() {
+    g_clearsFolded.fetch_add(1,std::memory_order_relaxed);
+    static uint64_t frame0=0;
+    if(R.frame>=frame0+600) {
+        const double f=frame0?double(R.frame-frame0):600.0;frame0=R.frame;
+        LOG("[vulkan] held clears per frame: %.1f held, %.1f folded into a pass (no clear, no load), %.1f recorded on their own",
+            g_clearsHeld.exchange(0)/f,g_clearsFolded.exchange(0)/f,g_clearsFlushed.exchange(0)/f);
+    }
+}
 void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
     uint32_t first,num;auto* s=surface_from_color_buffer(cb,&first,&num);if(!s)return;
     if(s->fmt.depth||s->fmt.compressed)exception_report::raise("GX2 clear color requires an uncompressed color surface");
@@ -2456,6 +2518,14 @@ void clear_color(const uint32_t*,uint32_t cb,const float rgba[4]) {
         }
         mark_gpu_written(s);return;
     }
+    if(hold_clear(s,first,num)) {  // (the next pass into all of it starts with this clear: fold_clears_on)
+        s->pendingClear=1;s->pendingAspects=VK_IMAGE_ASPECT_COLOR_BIT;s->pendingValue.color=value;
+        mark_gpu_written(s);return;
+    }
+    record_color_clear(s,value,first,num);
+}
+static void record_color_clear(Surface* s,const VkClearColorValue& value,uint32_t first,uint32_t num) {
+    end_encoder();
     wait_before_layer_clear(s);
     transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
     // a volume has one layer; its depth is in the extent
@@ -2504,12 +2574,21 @@ static void clear_depth_stencil_at(const GX2::GX2DepthBuffer* db,float depth,uin
     // 60 fps (generated, reproj.cpp): a second 3D pass of the frame keeps the first one's depth (only while on)
     const bool framegen=reproj::enabled()&&(flags&1);
     if(framegen)reproj::depth_clearing(s);
+    if(aspects&VK_IMAGE_ASPECT_DEPTH_BIT)std::atomic_ref<float>(s->clearedDepth).store(depth,std::memory_order_relaxed);  // (the motion pass's background)
+    const VkClearDepthStencilValue value{depth,stencil};
+    if(!framegen&&hold_clear(s,first,num)) {  // (the next pass into all of it starts with this clear)
+        end_encoder();
+        s->pendingClear=2;s->pendingAspects=aspects;s->pendingValue.depthStencil=value;
+        mark_gpu_written(s);return;
+    }
+    record_depth_clear(s,aspects,value,first,num);
+    if(framegen)reproj::depth_cleared(s);
+}
+static void record_depth_clear(Surface* s,VkImageAspectFlags aspects,const VkClearDepthStencilValue& value,uint32_t first,uint32_t num) {
     end_encoder();wait_before_layer_clear(s);
     transition_image(s,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_ACCESS_TRANSFER_WRITE_BIT);
-    if(aspects&VK_IMAGE_ASPECT_DEPTH_BIT)std::atomic_ref<float>(s->clearedDepth).store(depth,std::memory_order_relaxed);  // (the motion pass's background)
-    VkClearDepthStencilValue value{depth,stencil};VkImageSubresourceRange range{aspects,0,1,s->baseLayer+first,num};
+    VkImageSubresourceRange range{aspects,0,1,s->baseLayer+first,num};
     record::vkCmdClearDepthStencilImage(command_buffer(),s->image,s->layout,&value,1,&range);mark_gpu_written(s);
-    if(framegen)reproj::depth_cleared(s);
 }
 // ---------------------------------------------------------------- write-back to guest memory
 // Render results stay on the GPU, except where the game reads them with the CPU: render targets and

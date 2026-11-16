@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <mutex>
 #include <thread>
 #include <string>
@@ -41,17 +42,19 @@
 #include "vr/vr_laser.h"
 #include "present.h"
 #include "vr_upscale.h"
+#include "vr_cas.h"
 #include "vr_sgsr2.h"
 #include "vr_fsr1.h"
 #include "motion_pass.h"
 #include "vr_framesynth.h"
+#include "vr_genframe.h"
 #include "fov_diag.h"
 #include "vr/vr_framesynth.h"
 #include "ngx_vk.h"
 #include "vr/vr_upscale.h"
 #include <unordered_map>
-namespace gx2 { void lock_vsync_to_display(int64_t period); void delay_vsync_grid(int64_t ns); }  // (gx2_core.cpp)
-namespace vr::game { bool menu_open(); bool name_entry_open(); }  // (vr_game.cpp: the VR menu, the new save's name)
+namespace gx2 { void lock_vsync_to_display(int64_t period); void delay_vsync_grid(int64_t ns); uint64_t swaps_executed(); }  // (gx2_core.cpp)
+namespace vr::game { bool menu_open(); bool name_entry_open(); bool hands_layer_view(bool force); }  // (vr_game.cpp: the VR menu, the new save's name, first-person play)
 #endif
 
 namespace gfxvk::vrvk {
@@ -70,6 +73,8 @@ void frame_end() {}
 bool eyes_pending() { return false; }
 int64_t headset_frame_due() { return 0; }
 void headset_frame() {}
+void planned_repeats() {}
+bool hands_layer_wanted() { return false; }
 void shutdown() {}
 int smoke(int) { return 0; }
 #else
@@ -80,6 +85,13 @@ VkInstance g_instance = VK_NULL_HANDLE;
 VkPhysicalDevice g_physical = VK_NULL_HANDLE;
 bool g_frame = false, g_shouldRender = false, g_recorded = false;
 uint32_t g_frameViews = 0;
+bool g_handsRecorded = false;  // (docs/VR_HANDS_LAYER_PLAN.md step 3) this frame's hands-layer images written
+// (2026-11-14, the Tower of the Gods run: blinking, rainbow hands) both eyes' halves written: the layer may be shown. An
+// eye's pass that failed left its half of the shared image as it was (an older frame's, or never written: noise of
+// every colour), and the layer was sent with it. Now the images are still released but the layer is not shown
+bool g_handsShow = false;
+// (diagnostics, every 10 s while the layer is on) frames whose hands went into the layer's image but were not shown, and why
+struct HandsMiss { uint32_t frames = 0, oneEye = 0, passFailed = 0, noImage = 0, noDepth = 0; } g_handsMiss;
 // (the eyepiece's black, eye_part) the field the game's camera and the UI layer's quad cover, and each eye's own field
 // its picture covers (each eye drawn with its own projection): the eyepiece is a layout, in the UI layer
 vr::Fov g_drawnFov, g_eyeFov[2];
@@ -133,14 +145,315 @@ std::chrono::steady_clock::time_point g_boostUntil{};
 // the last frame the headset was given (frame_end): headset_frame shows it again while the game has no new one
 struct Shown {
     bool valid = false, drawn = false, wrist = false, laser = false, ui = false;
+    bool hands = false;  // (docs/VR_HANDS_LAYER_PLAN.md) the hands layer's images released with it: shown again unturned
     vr::xr::Views views;
     vr::xr::Quad panel, wheel, uiQuad;  // (uiQuad: the game's UI layer, docs/VR_EYE_PROJECTION.md; shown again with the eyes)
     vr::xr::SubQuad wristQuads[vr::kWristPanels], laserQuads[2];
+    float turnRate = 0;  // (turn smoothing) the view's turn rate when it went out (vr::view_turn_rate), radians a second
+    vr::Vec3 velocity;   // (movement smoothing) the view's velocity when it went out (vr::view_velocity), tracking metres a second
+    vr::Vec3 pivot;          // (generated frames) the stick turn's pivot when it went out (vr::turn_pivot), tracking metres
+    float pivotLimit = 0;    // (and the head's sideways offset from it held within this)
+    bool havePivot = false;
+    // the refresh it was actually given for (its xrWaitFrame's predicted display time). Its views were located for a
+    // later moment (views.time: the game predicts its camera about a refresh past the frame's own refresh): the frames
+    // made after it are moved on from this one, so each frame, real or made, is the same time ahead of its own refresh
+    XrTime shownAt = 0;
 } g_shown;
+// the time a frame made after the last real one is moved on by: from the real frame's own refresh to this frame's
+// (2026-11-12, a headset run with generated frames: measured from the real frame's views.time they came out 0.8 ms after
+// it, turned 0.02 degrees while the stick turned 1.5 a frame: the first made frame repeated the real one and the next
+// jumped, "x3 worse" than without them)
+// (callers clamp it to -3 .. 6 refreshes: 0 .. 3 before. A real frame drawn for a moment 22 ms or more before the
+// refresh it landed on (a headset sequence capture, after a hitch) put both its generated frames past 3 refreshes: both
+// clamped to the same moment, the second stood still and the next real frame jumped two refreshes' turn at once)
+double since_shown(XrTime displayTime) {
+    // (2026-11-12) from the moment the real frame was drawn for (its views' time), not the refresh it landed on: a
+    // headset run had a third of the real frames land a refresh before or after the one they were drawn for (their
+    // lead's spread 6.5 ms, up to 22 ms either way), and the frames made from them carried the error on
+    const XrTime base = g_shown.views.valid && g_shown.views.time ? g_shown.views.time : g_shown.shownAt;
+    return double(displayTime - base) * 1e-9;
+}
+XrTime g_lastSubmittedDisplay = 0;  // (the display time of the last frame given to the headset, real or generated)
+// (diagnostics, 2026-11-12, "[vr] repeated frames' timing (10 s)") Turn smoothing's frames, plain (re-sent, show_again)
+// and with the near field held (drawn, show_generated): how long each took from its frame begun to its frame ended, and
+// how many landed more than one refresh after the frame before them (the refresh between shown twice). A headset run
+// had the held ones look worse than the plain ones with the far view's pixels identical
+struct RepeatTiming {
+    uint64_t n = 0, late = 0;
+    double sumMs = 0, maxMs = 0;
+    void add(double ms, bool wasLate) { ++n, late += wasLate, sumMs += ms, maxMs = std::max(maxMs, ms); }
+};
+RepeatTiming g_rtPlain, g_rtHeld;
+std::chrono::steady_clock::time_point g_rtSince = std::chrono::steady_clock::now();
+bool repeat_late(XrTime shown) {
+    const XrDuration period = vr::session().refresh_period();
+    const bool late = g_lastSubmittedDisplay && period > 0 && double(shown - g_lastSubmittedDisplay) > 1.5 * double(period);
+    return late;
+}
+void repeat_timing_log() {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_rtSince < std::chrono::seconds(10)) return;
+    if (g_rtPlain.n || g_rtHeld.n) {
+        auto line = [](const RepeatTiming& t) {
+            char b[160];
+            std::snprintf(b, sizeof b, "%llu, %.2f ms each on average (%.2f at most), %llu a refresh late",
+                          (unsigned long long)t.n, t.n ? t.sumMs / double(t.n) : 0.0, t.maxMs, (unsigned long long)t.late);
+            return std::string(b);
+        };
+        LOG("[vr] repeated frames' timing (10 s): plain %s; near field held %s", line(g_rtPlain).c_str(), line(g_rtHeld).c_str());
+    }
+    g_rtPlain = g_rtHeld = RepeatTiming{};
+    g_rtSince = now;
+}
+// (diagnostics, every 10 s: "[vr] frame evenness (10 s)") check 1: the view's turn from one refresh to the next over every
+// frame shown, real or generated (the heading each was drawn at, a generated one's plus the turn drawn into it), while
+// it turns: smooth is the same step every refresh; check 2: how far ahead of its own refresh each real frame was drawn
+// (its views' time less its refresh's)
+struct Evenness {
+    bool have = false;
+    float lastYaw = 0;
+    XrTime lastAt = 0;
+    uint64_t steps = 0, realSteps = 0, genSteps = 0;
+    double sum = 0, sumSq = 0, lo = 1e9, hi = -1e9, realSum = 0, genSum = 0;
+    uint64_t leads = 0;
+    double leadSum = 0, leadSq = 0, leadLo = 1e9, leadHi = -1e9;
+    // (2026-11-12) the steady stick: each refresh's turn as shown against the stick's rate times a refresh, while the rate
+    // holds (within 2 %, over 10 degrees a second): smooth is 1.00 every refresh. Off is a refresh's step 25 % or more
+    // from it (a frame shown at another moment than it was drawn for)
+    float lastRate = 0;
+    uint64_t steady = 0, steadyOff = 0, steadyBack = 0;
+    double steadySum = 0, steadySq = 0;
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+} g_even;
+void note_shown(float yaw, XrTime at, bool generated, float rate) {
+    const XrDuration period = vr::session().refresh_period();
+    if (g_even.have && period > 0 && at > g_even.lastAt) {
+        const double refreshes = std::max(1.0, std::round(double(at - g_even.lastAt) / double(period)));
+        const double step = std::remainder(double(yaw - g_even.lastYaw), 2.0 * 3.14159265358979) * 57.29578 / refreshes;
+        const double expect = double(rate) * 57.29578 * double(period) * 1e-9;
+        if (std::fabs(rate) > 10.0f / 57.29578f && std::fabs(rate - g_even.lastRate) <= 0.02f * std::fabs(rate)) {
+            const double ratio = step / expect;
+            if (std::fabs(ratio) < 5.0) {
+                ++g_even.steady;
+                g_even.steadySum += ratio, g_even.steadySq += ratio * ratio;
+                if (std::fabs(ratio - 1.0) >= 0.25) ++g_even.steadyOff;
+                if (ratio < 0) ++g_even.steadyBack;
+            }
+        }
+        if (std::fabs(step) > 0.05 && std::fabs(step) < 20.0) {  // (turning; a snap or a cut left out)
+            const double a = std::fabs(step);
+            ++g_even.steps;
+            g_even.sum += a, g_even.sumSq += a * a, g_even.lo = std::min(g_even.lo, a), g_even.hi = std::max(g_even.hi, a);
+            if (generated) ++g_even.genSteps, g_even.genSum += a;
+            else ++g_even.realSteps, g_even.realSum += a;
+        }
+    }
+    g_even.have = true;
+    g_even.lastYaw = yaw;
+    g_even.lastAt = at;
+    g_even.lastRate = rate;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_even.since >= std::chrono::seconds(10)) {
+        if (g_even.steps || g_even.leads) {
+            const double n = double(std::max<uint64_t>(g_even.steps, 1)), mean = g_even.sum / n;
+            const double sd = std::sqrt(std::max(0.0, g_even.sumSq / n - mean * mean));
+            const double ln = double(std::max<uint64_t>(g_even.leads, 1)), lm = g_even.leadSum / ln;
+            const double lsd = std::sqrt(std::max(0.0, g_even.leadSq / ln - lm * lm));
+            LOG("[vr] frame evenness (10 s): turn per refresh %.2f degrees on average, spread %.2f (%.0f%%), %.2f to %.2f, over "
+                "%llu refreshes; real frames' steps %.2f, generated frames' %.2f; real frames drawn %.1f ms ahead of their "
+                "refresh on average (spread %.1f, %.1f to %.1f, %llu frames)",
+                mean, sd, mean > 0 ? 100.0 * sd / mean : 0.0, g_even.steps ? g_even.lo : 0.0, g_even.steps ? g_even.hi : 0.0,
+                (unsigned long long)g_even.steps, g_even.realSteps ? g_even.realSum / double(g_even.realSteps) : 0.0,
+                g_even.genSteps ? g_even.genSum / double(g_even.genSteps) : 0.0, lm, lsd, g_even.leads ? g_even.leadLo : 0.0,
+                g_even.leads ? g_even.leadHi : 0.0, (unsigned long long)g_even.leads);
+            if (g_even.steady) {
+                const double sn = double(g_even.steady), sm = g_even.steadySum / sn;
+                const double ssd = std::sqrt(std::max(0.0, g_even.steadySq / sn - sm * sm));
+                LOG("[vr] steady stick turn (10 s): each refresh's turn %.2f of the stick's on average, spread %.0f%%, over %llu "
+                    "refreshes; %llu (%.0f%%) off by a quarter or more, %llu stepping back (smooth: 1.00, 0%%, none off)", sm,
+                    100.0 * ssd, (unsigned long long)g_even.steady, (unsigned long long)g_even.steadyOff,
+                    100.0 * double(g_even.steadyOff) / sn, (unsigned long long)g_even.steadyBack);
+            }
+        }
+        const bool have = g_even.have;
+        const float lastYaw = g_even.lastYaw, lastRate = g_even.lastRate;
+        const XrTime lastAt = g_even.lastAt;
+        g_even = Evenness{};
+        g_even.have = have, g_even.lastYaw = lastYaw, g_even.lastAt = lastAt, g_even.lastRate = lastRate;
+    }
+}
 // the game's own frames (frame_end, not headset_frame): when the last one went out, and the recent interval between
 // them (ns, a running average), so that headset_frame waits for a real stall rather than the next frame
 std::chrono::steady_clock::time_point g_lastGameFrame{};
 double g_gameFrameInterval = 0;
+// (Turn smoothing) the refreshes after each game frame it fills: Capped 45 and Steady 30 by the setting (the headset's
+// rate over the game's: 1 at 45 fps on 90 Hz, 2 at 30); Auto Mode by the game's measured pace (asked for, 2026-11-12:
+// "in auto mode ... only have it work when fps dips low"): 0 while the game keeps up with the headset (a real 90: nothing
+// runs, nothing is added), 1 at 45, 2 at 30. Capped 90 and Unlocked: 0
+// (Auto Mode's flicker hold, asked for 2026-11-14: steady hands went on and off 10 times in seconds while the game
+// dipped just under 90 and recovered) Auto Mode's "below the headset's rate" held: on at once, off only after the game
+// has kept up for kAutoLowHold. Decided once a game frame (frame_end, render thread); steady hands follows it
+// (hands_layer_wanted). Smooth Camera while Turning's own frames follow the game's real pace (low_rate_repeats), so they
+// never take a refresh a real frame needs
+constexpr auto kAutoLowHold = std::chrono::seconds(1);
+std::atomic<bool> g_autoLowHeld{false};
+std::chrono::steady_clock::time_point g_autoLowOkSince{};
+int low_rate_repeats(double hz, int fps);
+std::chrono::steady_clock::time_point g_autoLowSettleUntil{};
+void update_auto_low_hold(double hz, std::chrono::steady_clock::time_point now) {
+    // (2026-11-14: the VR menu pauses the game, its slow frames read as a low rate, and steady hands went on while Auto
+    // was being picked there, a headset run's log) the menu's frames and the first second after it closes are not judged:
+    // the decision stays as it was (the frames' measured pace takes that long to settle again)
+    if (vr::game::menu_open()) {
+        g_autoLowSettleUntil = now + std::chrono::seconds(1);
+        return;
+    }
+    if (now < g_autoLowSettleUntil) return;
+    const bool low = vr::config().frameRate == vr::FrameRate::Auto && low_rate_repeats(hz, 0) > 0;
+    const bool was = g_autoLowHeld.load(std::memory_order_relaxed);
+    if (low) {
+        g_autoLowOkSince = {};
+        if (!was) g_autoLowHeld.store(true, std::memory_order_relaxed);
+        return;
+    }
+    if (!was) return;
+    if (g_autoLowOkSince == std::chrono::steady_clock::time_point{}) g_autoLowOkSince = now;
+    else if (now - g_autoLowOkSince >= kAutoLowHold) {
+        g_autoLowHeld.store(false, std::memory_order_relaxed);
+        g_autoLowOkSince = {};
+    }
+}
+// (2026-11-14, asked for: "for auto mode we can use refresh filling as the solution") Auto Mode with the runtime's frame
+// synthesis: while frames carry motion vectors the game is paced at half the refresh rate (45 at 90 Hz) and the runtime
+// makes one frame between two. When the game cannot hold that (more than 2.5 refreshes a frame: under 36 fps at 90 Hz),
+// one synthesized frame cannot fill the gap, so frame synthesis is held (vr_framesynth::set_held, frame_begin) and refresh
+// filling (planned_repeats) gives those refreshes the last frame again, as at Steady 30. Held after 1 s slow; used again
+// after 5 s at 2.2 refreshes a frame or less (41 fps at 90 Hz). Held again within 10 s of being used again,
+// the next wait doubles (up to 60 s): the motion pass, paused while held, costs time again when used, and must not make
+// it flip back and forth. The VR menu (the game paused) and the second after it are not judged. Decided after each game
+// frame (frame_end, render thread). Only where the session has frame synthesis swapchains (a Quest, the Steam Frame):
+// PC VR never does, so nothing changes there
+std::atomic<bool> g_autoSynthHeld{false};
+void update_auto_synth_hold(double hz, bool synthesisSwapchains, std::chrono::steady_clock::time_point now) {
+    using Clock = std::chrono::steady_clock;
+    static Clock::time_point slowSince{}, okSince{}, settleUntil{}, usedAgainAt{};
+    static double releaseSecs = 5.0;
+    static uint64_t holds = 0;
+    const bool applies = vr::config().frameRate == vr::FrameRate::Auto && synthesisSwapchains && hz > 0;
+    const bool held = g_autoSynthHeld.load(std::memory_order_relaxed);
+    if (!applies) {
+        if (held) {
+            g_autoSynthHeld.store(false, std::memory_order_relaxed);
+            LOG("[vr] Auto Mode frame synthesis hold: off (the frame rate is no longer Auto Mode)");
+        }
+        slowSince = okSince = {};
+        return;
+    }
+    if (vr::game::menu_open()) {
+        settleUntil = now + std::chrono::seconds(1);
+        slowSince = okSince = {};
+        return;
+    }
+    if (now < settleUntil || !(g_gameFrameInterval > 0)) return;
+    const double perFrame = g_gameFrameInterval * hz * 1e-9;  // refreshes a game frame
+    const double fps = 1e9 / g_gameFrameInterval;
+    if (!held) {
+        if (perFrame <= 2.5) {
+            slowSince = {};
+            return;
+        }
+        if (slowSince == Clock::time_point{}) slowSince = now;
+        if (now - slowSince < std::chrono::seconds(1)) return;
+        releaseSecs = usedAgainAt != Clock::time_point{} && now - usedAgainAt < std::chrono::seconds(10)
+                          ? std::min(releaseSecs * 2.0, 60.0)
+                          : 5.0;
+        g_autoSynthHeld.store(true, std::memory_order_relaxed);
+        slowSince = okSince = {};
+        ++holds;
+        LOG("[vr] Auto Mode frame synthesis hold: on (the game at %.1f fps, under half the %.0f Hz refresh rate, for 1 s; "
+            "the refreshes between its frames filled instead; used again after %.0f s at %.0f fps or more; %llu holds since "
+            "the start)",
+            fps, hz, releaseSecs, hz / 2.2, (unsigned long long)holds);
+        return;
+    }
+    if (perFrame > 2.2) {
+        okSince = {};
+        return;
+    }
+    if (okSince == Clock::time_point{}) okSince = now;
+    if (now - okSince < std::chrono::duration<double>(releaseSecs)) return;
+    g_autoSynthHeld.store(false, std::memory_order_relaxed);
+    okSince = {};
+    usedAgainAt = now;
+    LOG("[vr] Auto Mode frame synthesis hold: off (the game at %.1f fps for %.0f s: frame synthesis used again, the game "
+        "paced at half the refresh rate)",
+        fps, releaseSecs);
+}
+// (diagnostics, asked for 2026-11-14: after switching to Capped 90 the game stayed near 47 fps for 10-20 s once) a
+// frame rate change: how long from the VR menu closing (or the change, if it was not open) until the game draws at its
+// new rate (95 % of it, held 0.5 s), with the game's steps a second and the hands layer meanwhile; or not reached in 30 s
+struct RateSwitch {
+    int mode = -1;
+    bool pending = false;
+    double target = 0;
+    std::chrono::steady_clock::time_point from{}, okSince{};
+    uint64_t stepsFrom = 0;
+    int handsFrames = 0, frames = 0;
+} g_rateSwitch;
+void note_rate_switch(double hz, std::chrono::steady_clock::time_point now) {
+    auto& r = g_rateSwitch;
+    const vr::FrameRate mode = vr::config().frameRate;
+    if (r.mode != int(mode)) {
+        const bool first = r.mode < 0;
+        r = {};
+        r.mode = int(mode);
+        if (first || hz <= 0) return;
+        r.target = mode == vr::FrameRate::Full || mode == vr::FrameRate::Auto ? hz
+                 : mode == vr::FrameRate::Half ? hz / 2
+                 : mode == vr::FrameRate::Original ? 30.0 : 0.0;
+        r.pending = r.target > 0;
+        r.from = now;
+        r.stepsFrom = interp::logic_steps();
+        return;
+    }
+    if (!r.pending) return;
+    if (vr::game::menu_open()) {  // (measured from the menu's closing: the game is paused while it is open)
+        r.from = now;
+        r.stepsFrom = interp::logic_steps();
+        r.okSince = {};
+        r.handsFrames = r.frames = 0;
+        return;
+    }
+    ++r.frames;
+    if (g_autoLowHeld.load(std::memory_order_relaxed) || hands_layer_drawn(0)) ++r.handsFrames;
+    const double fps = g_gameFrameInterval > 0 ? 1e9 / g_gameFrameInterval : 0;
+    const double secs = std::chrono::duration<double>(now - r.from).count();
+    const auto steps = [&] { return secs > 0 ? double(interp::logic_steps() - r.stepsFrom) / secs : 0.0; };
+    if (fps >= 0.95 * r.target) {
+        if (r.okSince == std::chrono::steady_clock::time_point{}) r.okSince = now;
+        else if (now - r.okSince >= std::chrono::milliseconds(500)) {
+            const double took = std::chrono::duration<double>(r.okSince - r.from).count();
+            LOG("[vr] frame rate switch: %.0f fps reached %.2f s after the menu closed (game %.1f steps/s meanwhile, the "
+                "hands layer on in %d of %d frames)", r.target, took, steps(), r.handsFrames, r.frames);
+            r.pending = false;
+        }
+    } else {
+        r.okSince = {};
+        if (secs >= 30) {
+            LOG("[vr] frame rate switch: %.0f fps not reached in 30 s (at %.1f fps; game %.1f steps/s, the hands layer on in "
+                "%d of %d frames)", r.target, fps, steps(), r.handsFrames, r.frames);
+            r.pending = false;
+        }
+    }
+}
+int low_rate_repeats(double hz, int fps) {
+    const vr::FrameRate mode = vr::config().frameRate;
+    if (mode == vr::FrameRate::Half || mode == vr::FrameRate::Original)
+        return hz > 0 && fps > 0 ? std::clamp(int(std::lround(hz / double(fps))) - 1, 0, 3) : 0;
+    if (mode == vr::FrameRate::Auto && hz > 0 && g_gameFrameInterval > 0)
+        return std::clamp(int(std::lround(g_gameFrameInterval * hz * 1e-9)) - 1, 0, 3);
+    return 0;
+}
 // diagnostics (every 10 s): frames, how long xrWaitFrame waited, frames with the game camera's views
 struct Stats {
     std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
@@ -201,6 +514,8 @@ bool on() {
 struct Job {
     vr::xr::Views views;
     bool drawn = false, eyes = false, panel = false, wheel = false, wrist = false, laser = false, ui = false;
+    bool hands = false;  // (docs/VR_HANDS_LAYER_PLAN.md step 3) the hands layer's images written this frame
+    bool handsShow = false;  // (g_handsShow) and both halves written: the layer shown
     vr::xr::Quad panelQuad, wheelQuad, uiQuad;
     vr::xr::SubQuad wristQuads[vr::kWristPanels], laserQuads[2];
 };
@@ -229,14 +544,54 @@ void end(const Job& j, float& queueMs, float& releaseMs, float& submitMs) {
     if (j.wrist) xs().release(vr::xr::Session::kWrist);
     if (j.laser) xs().release(vr::xr::Session::kLaser);
     if (j.ui) xs().release(vr::xr::Session::kUi);
+    if (j.hands) {
+        xs().release(vr::xr::Session::kHands);
+        if (!vr::xr::hands_shared()) xs().release(vr::xr::Session::kHands + 1);
+    }
     const auto released = std::chrono::steady_clock::now();
     vr::xr::Quad panel = j.panelQuad, wheel = j.wheelQuad, ui = j.uiQuad;
     xs().end_frame(j.views, j.drawn, &panel, &wheel, j.wrist ? j.wristQuads : nullptr, j.wrist ? vr::kWristPanels : 0,
-                   j.laser ? j.laserQuads : nullptr, j.laser ? 2 : 0, j.ui ? &ui : nullptr);
+                   j.laser ? j.laserQuads : nullptr, j.laser ? 2 : 0, j.ui ? &ui : nullptr,
+                   j.hands && j.handsShow ? &j.views : nullptr);
     const auto done = std::chrono::steady_clock::now();
     queueMs = ms(queueStart, submitStart);
     releaseMs = ms(submitStart, released);
     submitMs = ms(submitStart, done);
+}
+
+// (docs/VR_STREAMING_AUDIT.md, finding 12; log only) the runtime's frame smoothing: VDXR reports its frame period as two
+// refreshes while Virtual Desktop's Synchronous Spacewarp runs (any runtime that asks for frames more than a refresh
+// apart reads the same). Logged when it starts and stops (the first 30 changes of a session) and every 10 s with any,
+// so a log shows whether head jitter or uneven turns line up with it. On this thread, after the frame's end: nothing on
+// the render thread, no lock (two atomics the frame's xrWaitFrame set)
+void note_runtime_smoothing() {
+    const XrDuration period = xs().predicted_period(), refresh = xs().refresh_period();
+    if (period <= 0 || refresh <= 0) return;
+    const double ratio = double(period) / double(refresh);
+    const bool on = ratio > 1.5;
+    static bool was = false;
+    static int changes = 0;
+    static uint64_t frames = 0, onFrames = 0, switches = 0;
+    static auto since = std::chrono::steady_clock::now();
+    ++frames;
+    onFrames += on;
+    if (on != was) {
+        ++switches;
+        if (++changes <= 30)
+            LOG("[vr] the runtime's frame smoothing: %s", on
+                ? "on (it asks for frames %.0f refreshes apart: Virtual Desktop's Synchronous Spacewarp, or the runtime's own)"
+                : "off (frames a refresh apart again)", ratio);
+        was = on;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(10)) {
+        if (onFrames || switches)
+            LOG("[vr] the runtime's frame smoothing (10 s): on in %llu of %llu frames (%.0f%%), switched %llu times",
+                (unsigned long long)onFrames, (unsigned long long)frames, 100.0 * double(onFrames) / double(frames),
+                (unsigned long long)switches);
+        frames = onFrames = switches = 0;
+        since = now;
+    }
 }
 
 void loop() {
@@ -257,6 +612,7 @@ void loop() {
         float q = 0, r = 0, s = 0;
         xs().declare_thread(vr::xr::Session::XrThread::RenderWorker);  // (Android: it calls xrEndFrame; once per session)
         end(j, q, r, s);
+        note_runtime_smoothing();  // (log only; the queue's lock released)
         {
             std::lock_guard<std::mutex> l(g_mutex);
             g_queueMs = q, g_releaseMs = r, g_submitMs = s;
@@ -396,6 +752,40 @@ void request_refresh_rate(const vr::Config& c) {
         return;
     }
     xs().request_refresh_rate(c.refreshRate);
+}
+// (2026-11-13) the rate asked for, checked against the one the headset runs: a Quest 3S's runtime accepted 90 Hz and
+// stayed at 72 (no change event; the frame rate then capped at half of 72). While they differ, every 2 s the rate is
+// asked for again, 10 times at most per choice; logged when it takes, or when it never did
+void verify_refresh_rate() {
+    static float verifying = 0;
+    static int tries = 0;
+    static std::chrono::steady_clock::time_point last;
+    if (!(g_refreshAsked > 0) || !xs().refresh_rate_choosable()) return;
+    if (verifying != g_refreshAsked) verifying = g_refreshAsked, tries = 0, last = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(2)) return;
+    last = now;
+    const float actual = xs().refresh_rate();
+    if (std::fabs(actual - g_refreshAsked) < 0.6f) {
+        if (tries > 0) {
+            LOG("[vr] the headset now runs at %.0f Hz, as chosen (after asking %d more time%s)", double(actual), tries,
+                tries == 1 ? "" : "s");
+            tries = -1;  // (done for this choice)
+        }
+        return;
+    }
+    if (tries < 0 || tries >= 10) {
+        if (tries == 10) {
+            LOG("[vr] the headset still runs at %.0f Hz although %.0f Hz was asked for 11 times: its own setting (Settings > "
+                "Display, or Battery Saver) may hold it there", double(actual), double(g_refreshAsked));
+            tries = 11;
+        }
+        return;
+    }
+    ++tries;
+    LOG("[vr] the headset runs at %.0f Hz, not the %.0f Hz chosen: asked again (%d of 10)", double(actual),
+        double(g_refreshAsked), tries);
+    xs().request_refresh_rate(g_refreshAsked);
 }
 
 // the session runs: the headset's refresh rate, and frame interpolation for it
@@ -699,9 +1089,11 @@ void stop(const std::string& why) {
         vkDeviceWaitIdle(R.device);
         destroy_panel_views();
         vr_upscale::forget_views();
+        vr_cas::forget_views();
         vr_sgsr2::forget();
         vr_fsr1::forget();
         vr_framesynth::forget_views();
+        vr_genframe::forget_views();
         vr_framesynth::set_active(false);
     }
     xs().shutdown();
@@ -781,8 +1173,12 @@ void device_ready() {
         return;
     }
     {
-        const uint32_t w = std::max(64u, uint32_t(std::lround(float(xs().recommended_width()) * headsetRes)));
-        const uint32_t h = std::max(64u, uint32_t(std::lround(float(xs().recommended_height()) * headsetRes)));
+        // (docs/VR_EYE_PROJECTION.md "Field of view") a narrower field (vr.fieldOfView) draws a picture smaller by as
+        // much: the same pixels per degree
+        vr::latch_fov_scale();
+        const float fovScale = vr::fov_scale();
+        const uint32_t w = std::max(64u, uint32_t(std::lround(float(xs().recommended_width()) * headsetRes * fovScale)));
+        const uint32_t h = std::max(64u, uint32_t(std::lround(float(xs().recommended_height()) * headsetRes * fovScale)));
         vr::set_picture_size(w, h);
         LOG("[vr] headset resolution %.0f%% of the runtime's %ux%u: eye pictures %ux%u%s", double(headsetRes * 100),
             xs().recommended_width(), xs().recommended_height(), w, h,
@@ -812,6 +1208,8 @@ void frame_begin() {
     xs().declare_thread(vr::xr::Session::XrThread::RenderMain);  // (Android: once per session; QUEST3_PERFORMANCE_AUDIT.md)
     const auto waitStart = std::chrono::steady_clock::now();
     g_frame = xs().begin_frame(g_shouldRender);
+    // (the camera's base: display_time; with the swap being executed now, render::swap from OP_SWAP: executed + 1)
+    if (g_frame) vr::set_real_frame_display(int64_t(xs().predicted_display_time()), gx2::swaps_executed() + 1);
     g_times.begun = std::chrono::steady_clock::now();
     const double waited = std::chrono::duration<double, std::milli>(g_times.begun - waitStart).count();
     g_stats.waitMs += waited;
@@ -837,13 +1235,36 @@ void frame_begin() {
         }();
         // frame synthesis (docs/VR_FRAME_SYNTHESIS.md): the runtime makes every other frame, and paces the game at half
         // the refresh rate itself; the game draws at half the rate to match (a test rate still wins)
-        const bool synthesis = xs().has_synthesis_swapchains();
-        vr_framesynth::set_active(synthesis || xs().depth_submission());
+        // (2026-11-13) held while the frame rate chosen is under half the refresh rate: Capped 30 at a refresh that 30
+        // divides (90, 120 Hz; at 72 and 80 Hz Capped 30 is already drawn at half, 36 and 40). The runtime synthesizes only
+        // at half the refresh rate, which raised a chosen 30 to 45 (vr_framesynth::set_held)
+        {
+            const double hz = xs().refresh_rate();
+            const double thirds = hz / 30.0;
+            const bool thirtyFits = hz > 61.0 && std::fabs(thirds - std::round(thirds)) < 0.02;
+            // (and Auto Mode while the game runs under half the refresh rate: update_auto_synth_hold, after each game frame)
+            const bool steady30 = c.frameRate == vr::FrameRate::Original && thirtyFits;
+            const bool autoSlow = c.frameRate == vr::FrameRate::Auto && g_autoSynthHeld.load(std::memory_order_relaxed);
+            vr_framesynth::set_held(xs().has_synthesis_swapchains() && (steady30 || autoSlow),
+                                    steady30 ? "the frame rate chosen is under half the refresh rate (Capped 30 at 90 or 120 Hz)"
+                                    : autoSlow ? "Auto Mode, the game under half the refresh rate (below 36 fps at 90 Hz) for 1 s"
+                                               : "the frame rate is half the refresh rate or more");
+        }
+        const bool synthesis = xs().has_synthesis_swapchains() && !vr_framesynth::held();
+        // (and for the generated frames and Head movement smoothing: each eye's depth found each frame, vr_framesynth::last_depth)
+        // (and Turn smoothing: its frames hold the near field by the scene's depth, show_generated(true))
+        // (only in Capped 45 and Steady 30, where it runs: nothing added in Capped 90, Auto or Unlocked)
+        const bool lowRate = c.frameRate == vr::FrameRate::Half || c.frameRate == vr::FrameRate::Original ||
+                             (c.frameRate == vr::FrameRate::Auto && low_rate_repeats(xs().refresh_rate(), 0) > 0);
+        vr_framesynth::set_active(synthesis || xs().depth_submission() || vr::config().headSmoothing ||
+                                  (vr::config().turnSmoothing && lowRate && std::getenv("WWHD_VR_TURN_NEAR_HOLD") &&
+                                   *std::getenv("WWHD_VR_TURN_NEAR_HOLD") == '1'));
         // (only while frames carry the motion vectors: menus and loading screens have none, and keep vr.frameRate)
         interp::set_vr_frame_mode(testRate >= 0 ? testRate
                                   : synthesis && vr_framesynth::carrying() ? int(vr::FrameRate::Half)
                                                                            : int(c.frameRate));  // (from the next logic step)
         if (g_started) request_refresh_rate(c);       // (vr.refreshRate changed in the game's settings)
+        if (g_started) verify_refresh_rate();          // (the headset's own rate, until it is the one chosen)
     }
     // the headset's eyes for the frames drawn from now on: the field of view the game's camera and culling
     // take (aspect.cpp) and each eye's sideways offset (stereo::XR), in game units
@@ -918,7 +1339,21 @@ bool ensure_swapchain(int index, uint32_t width, uint32_t height, Ensure&& ensur
     const auto& sc = xs().swapchain(index);
     const bool made = sc.handle && (index == vr::xr::Session::kUi || (sc.width == width && sc.height == height));
     if (made) return ensure();
+    // (2026-11-12) a swapchain made again at another size (the GamePad panel: 2562x1440 for the GamePad screen,
+    // 1600x900 for the VR menu) destroys its images: first the last frame's end (the end-frame thread's xrEndFrame
+    // names them), then everything the GPU was given (earlier frames drew into them), then the cached views of the old
+    // images (a new image may come back with an old one's handle). Destroyed while still in use, a PC player's RTX 4090
+    // lost its device as the menu opened a second after it closed (DEVICE_LOST, two crash logs, 2026-11-12)
+    const bool remade = sc.handle && sc.acquired == UINT32_MAX;
+    if (remade) end_thread::wait();
     std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+    if (remade && R.device) {
+        const auto uploadQueueLock = texture_pack_queue_lock();
+        vkDeviceWaitIdle(R.device);
+        if (index == vr::xr::Session::kPanel) destroy_panel_views();
+        LOG("[vr] swapchain %d made again at %ux%u (was %ux%u): the old images idle first", index, width, height,
+            sc.width, sc.height);
+    }
     return ensure();
 }
 
@@ -992,6 +1427,113 @@ void update_dynamic_resolution() {
     vr::dynres_vr::status_why().store(choice.why, std::memory_order_relaxed);
 }
 
+// (diagnostics, WWHD_VR_SEQ_CAPTURE=1, 2026-11-12: "is right and left eyes in sync?") nine refreshes in a row while the
+// stick turns (a real frame, its generated frames, the next real frames...), both eyes, as submitted: a band of rows
+// of each headset image (no wait: copied in the frame's own commands) and the pose each was submitted with, its
+// display time and field of view. Written to captures/genseq/ (seqN_fK_eE.png, seqN.csv) when the nine are in. Three
+// sequences at most, 4 s apart, turning faster than 15 degrees a second
+struct SeqEntry {
+    Buffer buf{};
+    bool have = false;
+    int kind = 0;  // 0 real, 1 generated
+    XrTime at = 0;
+    vr::Quat pose;
+    vr::Vec3 pos;
+    float l = 0, r = 0, u = 0, d = 0, rate = 0;
+    double planned = 0;  // the heading this refresh was meant to show (degrees: the game's heading plus the turn drawn or submitted)
+    double gapMs = 0;    // (real) its display time less the moment it was drawn for; (generated) its time after that moment
+};
+struct SeqCapture {
+    int seqs = 0, frame = -1;  // the sequence's next frame (-1: none running)
+    static constexpr int kFrames = 9;
+    SeqEntry e[kFrames][2];
+    uint32_t width = 0, height = 0, y0 = 0, rows = 0;
+    std::chrono::steady_clock::time_point last{};
+} g_seq;
+bool seq_capture_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("WWHD_VR_SEQ_CAPTURE");
+        return e && *e == '1';
+    }();
+    return on;
+}
+// the band copied for frame `f`, eye `eye`, from the acquired image `img` (in COLOR_ATTACHMENT_OPTIMAL)
+void seq_copy(VkCommandBuffer cmd, int f, int eye, VkImage img) {
+    SeqEntry& s = g_seq.e[f][eye];
+    const auto& sc = xs().swapchain(eye);
+    if (!g_seq.rows) {
+        g_seq.width = sc.width, g_seq.height = sc.height;
+        static const bool lower = [] {
+            const char* e = std::getenv("WWHD_VR_SEQ_BAND");
+            return e && !std::strcmp(e, "lower");
+        }();
+        // (WWHD_VR_SEQ_BAND=lower: the lower part of the view, where the body, hands, sword and shield are)
+        const float from = lower ? 0.55f : 0.25f, part = lower ? 0.35f : 0.25f;
+        g_seq.y0 = uint32_t(sc.height * from), g_seq.rows = std::min<uint32_t>(sc.height - g_seq.y0, uint32_t(sc.height * part));
+    }
+    if (sc.width != g_seq.width || sc.height != g_seq.height) return;
+    s.buf = create_readback_buffer(VkDeviceSize(g_seq.width) * g_seq.rows * 4);
+    if (!s.buf.buffer || !s.buf.mapped) return;
+    vr_genframe::copy_rows(cmd, img, g_seq.width, g_seq.y0, g_seq.rows, s.buf.buffer);
+    derive_dependency(s.buf.use, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    transition_buffer(s.buf, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+    s.have = true;
+}
+void seq_note(int f, int eye, int kind, XrTime at, const vr::Pose& pose, const vr::Fov& fov, float rate, double planned = 0,
+              double gapMs = 0) {
+    SeqEntry& s = g_seq.e[f][eye];
+    s.planned = planned, s.gapMs = gapMs;
+    s.kind = kind, s.at = at, s.pose = pose.orientation, s.pos = pose.position, s.rate = rate;
+    s.l = std::tan(fov.left), s.r = std::tan(fov.right), s.u = std::tan(fov.up), s.d = std::tan(fov.down);
+}
+// the nine are in: the GPU waited for once, the bands and the table written
+void seq_finish() {
+    flush();
+    char dir[] = "captures/genseq";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    char path[256];
+    std::snprintf(path, sizeof path, "%s/seq%d.csv", dir, g_seq.seqs);
+    FILE* csv = std::fopen(path, "w");
+    if (csv)
+        std::fprintf(csv, "frame,eye,kind,display_ms,qx,qy,qz,qw,px,py,pz,tan_left,tan_right,tan_up,tan_down,turn_rate_deg_s,width,height,band_y0,band_rows,planned_heading_deg,gap_ms\n");
+    const XrTime t0 = g_seq.e[0][0].at;
+    const bool bgra = xs().swapchain(0).format == VK_FORMAT_B8G8R8A8_SRGB || xs().swapchain(0).format == VK_FORMAT_B8G8R8A8_UNORM;
+    for (int f = 0; f < SeqCapture::kFrames; ++f)
+        for (int eye = 0; eye < 2; ++eye) {
+            SeqEntry& s = g_seq.e[f][eye];
+            if (!s.have) continue;
+            const size_t n = size_t(g_seq.width) * g_seq.rows;
+            std::vector<uint8_t> rgba(n * 4);
+            const auto* raw = static_cast<const uint8_t*>(s.buf.mapped);
+            for (size_t i = 0; i < n; ++i) {
+                rgba[i * 4 + 0] = bgra ? raw[i * 4 + 2] : raw[i * 4 + 0];
+                rgba[i * 4 + 1] = raw[i * 4 + 1];
+                rgba[i * 4 + 2] = bgra ? raw[i * 4 + 0] : raw[i * 4 + 2];
+                rgba[i * 4 + 3] = 255;
+            }
+            defer_buffer(s.buf);
+            s.buf = {};
+            char png[256];
+            std::snprintf(png, sizeof png, "%s/seq%d_f%d_e%d.png", dir, g_seq.seqs, f, eye);
+            std::thread([path = std::string(png), w = g_seq.width, h = g_seq.rows, px = std::move(rgba)] {
+                try {
+                    write_rgba_png(path, w, h, px);
+                } catch (...) {
+                }
+            }).detach();
+            if (csv)
+                std::fprintf(csv, "%d,%d,%s,%.3f,%.7f,%.7f,%.7f,%.7f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.5f,%.3f,%u,%u,%u,%u,%.4f,%.3f\n", f, eye,
+                             s.kind ? "gen" : "real", double(s.at - t0) * 1e-6, double(s.pose.x), double(s.pose.y),
+                             double(s.pose.z), double(s.pose.w), double(s.pos.x), double(s.pos.y), double(s.pos.z), double(s.l),
+                             double(s.r), double(s.u), double(s.d), double(s.rate) * 57.29578, g_seq.width, g_seq.height,
+                             g_seq.y0, g_seq.rows, s.planned, s.gapMs);
+            s.have = false;
+        }
+    if (csv) std::fclose(csv);
+    LOG("[vr] refresh sequence capture %d written (%s)", g_seq.seqs, path);
+    g_seq.frame = -1;
+}
 void record_eyes(VkCommandBuffer cmd) {
     if (!g_frame || !g_shouldRender || stereo::frame.mode != stereo::XR) return;
     update_dynamic_resolution();
@@ -1030,7 +1572,7 @@ void record_eyes(VkCommandBuffer cmd) {
         char line[200];
         std::snprintf(line, sizeof line, "%s (eye picture %ux%u, headset image %ux%u, sharpness %.2f)", choice.why,
                       unsigned(width), unsigned(shown.height ? shown.height : scan->extent.height), sc.width, sc.height,
-                      double(c.upscaleSharpness));
+                      double(choice.cas ? c.casSharpness : c.upscaleSharpness));
         if (last != line) {
             last = line;
             LOG("[vr] upscaling: %s", line);
@@ -1040,10 +1582,11 @@ void record_eyes(VkCommandBuffer cmd) {
         // the motion pass only while something uses it (motion_pass::set_needed): SGSR2 in use, the runtime's frame
         // synthesis (its swapchains: motion vectors each frame), or DLSS
         if (motion_pass::on())
-            motion_pass::set_needed(choice.sgsr2 || xs().has_synthesis_swapchains() || motion_pass::dlss_runs());
-        struct Upscale { bool sgsr1, sgsr2, fsr1, superResolution; float sharpness, fsrSharpness; };
-        return Upscale{choice.sgsr1, choice.sgsr2, choice.fsr1, choice.superResolution, c.upscaleSharpness,
-                       c.fsrSharpness};
+            motion_pass::set_needed(choice.sgsr2 || (xs().has_synthesis_swapchains() && !vr_framesynth::held()) ||
+                                    motion_pass::dlss_runs());
+        struct Upscale { bool sgsr1, sgsr2, fsr1, cas, superResolution; float sharpness, fsrSharpness, casSharpness; bool casFxaa; };
+        return Upscale{choice.sgsr1, choice.sgsr2, choice.fsr1, choice.cas, choice.superResolution, c.upscaleSharpness,
+                       c.fsrSharpness, c.casSharpness, c.casFxaa};
     }();
     float eyepieceW = 0, eyepieceH = 0;
     const bool eyepiece = vr::eyepiece(eyepieceW, eyepieceH);
@@ -1072,6 +1615,11 @@ void record_eyes(VkCommandBuffer cmd) {
         if (upscale.fsr1 && !eyepiece &&
             vr_fsr1::draw(cmd, eye, *scan, {shown.width, shown.height}, targets[eye], VkFormat(sc.format),
                           {sc.width, sc.height}, upscale.fsrSharpness))
+            continue;
+        if (upscale.cas && !eyepiece &&
+            vr_cas::draw(cmd, *scan, {shown.width, shown.height}, targets[eye], VkFormat(sc.format),
+                         {sc.width, sc.height}, upscale.casSharpness, vr::fov_scale() < 1.0f ? 0.06f : 0.0f,
+                         upscale.casFxaa))
             continue;
         if (upscale.sgsr1 && !eyepiece &&
             vr_upscale::draw(cmd, *scan, {shown.width, shown.height}, targets[eye], VkFormat(sc.format),
@@ -1169,6 +1717,280 @@ void record_eyes(VkCommandBuffer cmd) {
                                      0, 0, nullptr, 0, nullptr, 1, &b);
     }
     g_recorded = true;
+    // (docs/VR_HANDS_LAYER_PLAN.md step 3) each eye's hands image into its hands-layer image (the eyes' size: their parts
+    // and crops line up), sent over the eyes' layer with the frame
+    g_handsRecorded = false;
+    g_handsShow = false;
+    {  // (diagnostics) this frame's hands images, and whether they go out (HandsMiss)
+        Surface *d0 = hands_layer_drawn(0), *d1 = hands_layer_drawn(1);
+        if (d0 || d1) {
+            ++g_handsMiss.frames;
+            if (!d0 || !d1) ++g_handsMiss.oneEye;
+        }
+        static auto last = std::chrono::steady_clock::now();
+        if (const auto now = std::chrono::steady_clock::now(); now - last > std::chrono::seconds(10)) {
+            last = now;
+            if (g_handsMiss.frames)
+                LOG("[vr hands] (10 s) frames with his hands in their layer %u: left out with one eye's only %u, an eye's "
+                    "pass failed %u, no layer image %u; drawn without his depth %u",
+                    g_handsMiss.frames, g_handsMiss.oneEye, g_handsMiss.passFailed, g_handsMiss.noImage, g_handsMiss.noDepth);
+            g_handsMiss = {};
+        }
+    }
+    // (diagnostics, 2026-11-14: releasing the hands images took ~3 ms on SteamVR) WWHD_VR_HANDS_SWAPCHAIN=skip: never
+    // acquired nor released (nothing sent); =norecord: acquired and released, nothing written into them (run it with
+    // WWHD_VR_HANDS_SUBMIT=none)
+    static const int swapchainTest = [] {
+        const char* e = std::getenv("WWHD_VR_HANDS_SWAPCHAIN");
+        const int m = e && !std::strcmp(e, "skip") ? 1 : e && !std::strcmp(e, "norecord") ? 2 : 0;
+        if (m) LOG("[vr hands] WWHD_VR_HANDS_SWAPCHAIN=%s", e);
+        return m;
+    }();
+    if (Surface *h0 = hands_layer_drawn(0), *h1 = hands_layer_drawn(1);
+        swapchainTest != 1 && h0 && h1 && xs().ensure_hands(xs().swapchain(0).width, xs().swapchain(0).height)) {
+        const bool shared = vr::xr::hands_shared();
+        xs().set_hands_premultiplied(vr_genframe::hands_coverage_from_depth());
+        VkImage hi[2] = {xs().acquire(vr::xr::Session::kHands), VK_NULL_HANDLE};
+        if (hi[0]) hi[1] = shared ? hi[0] : xs().acquire(vr::xr::Session::kHands + 1);
+        if (hi[0] && hi[1]) {
+            Surface* hs[2] = {h0, h1};
+            bool written = true;
+            end_encoder();
+            for (int eye = 0; eye < 2 && swapchainTest != 2; ++eye) {
+                const auto& hsc = xs().swapchain(vr::xr::Session::kHands + (shared ? 0 : eye));
+                const uint32_t partW = shared ? hsc.width / 2 : hsc.width, partX = shared ? uint32_t(eye) * partW : 0;
+                // (the edges filled with the hands' own colour: a compositor filtering the layer's edge then blends that,
+                // not the empty pixels' black, which showed as a black outline round his hands in a headset run)
+                // (and his pixels behind what the world drew after him left out: the game's depth test, as without the
+                // layer; "Link's sword clips through objects", 2026-11-13)
+                Surface *linkDepth = nullptr, *worldDepth = nullptr;
+                if (!hands_layer_depths(eye, linkDepth, worldDepth)) ++g_handsMiss.noDepth;
+                // (any size: the pass samples his image across its part; a standalone headset's pictures are smaller than
+                // its images, upscaled into them: with the sizes required equal the shared image was left unwritten there)
+                if (vr_genframe::dilate(cmd, *hs[eye], hi[eye], VkFormat(hsc.format), partW, hsc.height, linkDepth, worldDepth,
+                                        partX))
+                    continue;
+                if (shared) {  // (the blit below writes a whole image: not for the shared one; its half left unwritten)
+                    written = false;
+                    continue;
+                }
+                transition_image(hs[eye], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_ACCESS_TRANSFER_READ_BIT);
+                VkImageMemoryBarrier hb{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                hb.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                hb.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                hb.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                hb.srcQueueFamilyIndex = hb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                hb.image = hi[eye];
+                hb.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                record::vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                             0, 0, nullptr, 0, nullptr, 1, &hb);
+                VkImageBlit blit{};
+                blit.srcSubresource = blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                blit.srcOffsets[1] = {int32_t(hs[eye]->extent.width), int32_t(hs[eye]->extent.height), 1};
+                blit.dstOffsets[1] = {int32_t(hsc.width), int32_t(hsc.height), 1};
+                record::vkCmdBlitImage(cmd, hs[eye]->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, hi[eye],
+                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+                hb.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                hb.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                hb.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                hb.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+                record::vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                             0, 0, nullptr, 0, nullptr, 1, &hb);
+            }
+            g_handsRecorded = true;
+            g_handsShow = written || swapchainTest == 2;
+            if (!written) ++g_handsMiss.passFailed;
+        } else {
+            ++g_handsMiss.noImage;
+            if (hi[0]) xs().release(vr::xr::Session::kHands);
+        }
+    }
+    // (docs/VR_HANDS_LAYER_PLAN.md, diagnostics: WWHD_VR_HANDS_ALPHA=1) once, 20 s into first-person play, the left eye's
+    // hands image with its alpha (its coverage: how the headset blends its edge over the world) and the eye's picture,
+    // as captures/hands/alpha_hands.png and alpha_picture.png (one hitch)
+    {
+        static const bool alphaDump = [] { const char* e = std::getenv("WWHD_VR_HANDS_ALPHA"); return e && *e == '1'; }();
+        static bool done = false;
+        static std::chrono::steady_clock::time_point firstSeen{};
+        Surface* h = alphaDump && !done ? hands_layer_drawn(0) : nullptr;
+        if (h && h->image) {
+            const auto now = std::chrono::steady_clock::now();
+            if (firstSeen.time_since_epoch().count() == 0) firstSeen = now;
+            if (now - firstSeen > std::chrono::seconds(20)) {
+                done = true;
+                const uint32_t w = h->extent.width, hh = h->extent.height;
+                Buffer buf = create_readback_buffer(VkDeviceSize(w) * hh * 4);
+                if (buf.mapped) {
+                    transition_image(h, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_ACCESS_TRANSFER_READ_BIT);
+                    VkBufferImageCopy region{};
+                    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, h->baseLayer, 1};
+                    region.imageExtent = {w, hh, 1};
+                    record::vkCmdCopyImageToBuffer(command_buffer(), h->image, h->layout, buf.buffer, 1, &region);
+                    derive_dependency(buf.use, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                    transition_buffer(buf, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_HOST_READ_BIT);
+                    flush();
+                    std::vector<uint8_t> px(static_cast<const uint8_t*>(buf.mapped),
+                                            static_cast<const uint8_t*>(buf.mapped) + size_t(w) * hh * 4);
+                    std::error_code ec;
+                    std::filesystem::create_directories("captures/hands", ec);
+                    try {
+                        write_rgba_png("captures/hands/alpha_hands.png", w, hh, px);
+                        if (eyes[0]->scan) {
+                            auto pic = read_surface_rgba(*eyes[0]->scan, true);
+                            write_rgba_png("captures/hands/alpha_picture.png", eyes[0]->scan->extent.width,
+                                           eyes[0]->scan->extent.height, pic);
+                        }
+                    } catch (...) {
+                    }
+                    LOG("[vr hands] the hands image with its alpha written (captures/hands/alpha_hands.png)");
+                }
+                defer_buffer(buf);
+            }
+        }
+    }
+    // (diagnostics, 2026-11-14: "transition still show 2 black cut outs instead of 1") the frames a picture transition
+    // drew: each eye's picture and the UI layer's image as PNGs in captures/transition/, 0.25 s apart, 6 in a session
+    // (each waits for the GPU: a hitch, during a transition)
+    // (2026-11-14: the first version saved its 6 at the transition's first frame, all black: each save's hitch was longer
+    // than the 0.25 s between them) A sequence from a transition's first frame: both eyes' pictures and the UI layer's
+    // image (half size) at frames +0 .. +180 of it (counted in frames, so the saves' hitches do not bunch them), 3
+    // sequences a session. The trace's lines in between are numbered by the picture they lead to (draw.cpp)
+    {
+        static constexpr int kAt[] = {0, 5, 10, 20, 30, 45, 60, 90, 120, 180};
+        static constexpr int kShots = int(sizeof kAt / sizeof kAt[0]);
+        static int seqs = 0, seqFrame = -1, shot = 0;
+        // (2026-11-14, in the headset: the saves' hitches left the game too slow to play) only on a test start,
+        // WWHD_VR_TRANSITION_CAPTURE=1; never in play (a video of the headset is the way to see a transition)
+        static const bool on = [] { const char* e = std::getenv("WWHD_VR_TRANSITION_CAPTURE"); return e && *e == '1'; }();
+        const bool drawn = stereo::transitionDrawn.exchange(false) && on;
+        if (drawn && seqFrame < 0 && seqs < 3) {
+            ++seqs, seqFrame = 0, shot = 0;
+            stereo::transitionShot.store(seqs * 100 + 1);
+            stereo::transitionTraceGen.fetch_add(1);
+            LOG("[vr] transition capture %d begins (captures/transition/s%d_*.png)", seqs, seqs);
+        }
+        if (seqFrame >= 0) {
+            if (shot < kShots && seqFrame == kAt[shot]) {
+                std::error_code ec;
+                std::filesystem::create_directories("captures/transition", ec);
+                auto save = [&](Surface* sf, const char* what) {
+                    if (!sf || !sf->image) return;
+                    try {
+                        const auto px = read_surface_rgba(*sf, true);
+                        const uint32_t w = sf->extent.width, h = sf->extent.height, ow = w / 2, oh = h / 2;
+                        if (px.size() < size_t(w) * h * 4 || !ow || !oh) return;
+                        std::vector<uint8_t> out(size_t(ow) * oh * 4);
+                        for (uint32_t y = 0; y < oh; ++y)
+                            for (uint32_t x = 0; x < ow; ++x)
+                                for (int ch = 0; ch < 4; ++ch) {
+                                    const size_t a = ((size_t(y) * 2) * w + x * 2) * 4 + ch, b = a + size_t(w) * 4;
+                                    out[(size_t(y) * ow + x) * 4 + ch] = uint8_t((px[a] + px[a + 4] + px[b] + px[b + 4]) / 4);
+                                }
+                        char path[160];
+                        std::snprintf(path, sizeof path, "captures/transition/s%d_f%03d_%s.png", seqs, kAt[shot], what);
+                        write_rgba_png(path, ow, oh, out);
+                    } catch (...) {
+                    }
+                };
+                save(eyes[0]->scan.get(), "eye0");
+                save(eyes[1]->scan.get(), "eye1");
+                save(ui_layer_drawn_last(), "ui");
+                LOG("[vr] transition capture %d: picture %d at frame +%d written (s%d_f%03d_eye0/eye1/ui.png)", seqs,
+                    shot + 1, kAt[shot], seqs, kAt[shot]);
+                ++shot;
+                stereo::transitionShot.store(seqs * 100 + shot + 1);  // (the next picture's draws, draw.cpp's trace)
+                stereo::transitionTraceGen.fetch_add(1);
+            }
+            stereo::transitionTrace.store(shot < kShots ? 2 : 0);  // (traced until the last picture)
+            if (shot >= kShots) seqFrame = -1;
+            else ++seqFrame;
+        }
+    }
+    // (docs/VR_HANDS_LAYER_PLAN.md step 2, diagnostics: WWHD_VR_HANDS_DUMP=1) each eye's picture and hands image as PNGs
+    // in captures/hands/, every 3 s, 12 times (each waits for the GPU: a hitch)
+    {
+        static const bool dump = [] { const char* e = std::getenv("WWHD_VR_HANDS_DUMP"); return e && *e == '1'; }();
+        static int dumps = 0;
+        static auto last = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        // (every 6 s while Link's hands image is drawn (gameplay, first person), 30 times: the whole session, not its
+        // first minute of loading)
+        if (dump && dumps < 30 && now - last > std::chrono::seconds(6) && hands_layer_drawn(0)) {
+            last = now;
+            ++dumps;
+            std::error_code ec;
+            std::filesystem::create_directories("captures/hands", ec);
+            for (int eye = 0; eye < 1; ++eye) {  // (the left eye: enough to see what is drawn)
+                auto save = [&](Surface* sf, const char* what) {
+                    if (!sf || !sf->image) return;
+                    try {
+                        auto px = read_surface_rgba(*sf, true);
+                        char path[160];
+                        std::snprintf(path, sizeof path, "captures/hands/dump%d_e%d_%s.png", dumps, eye, what);
+                        write_rgba_png(path, sf->extent.width, sf->extent.height, px);
+                    } catch (...) {
+                    }
+                };
+                save(eyes[eye]->scan.get(), "picture");
+                save(hands_layer_drawn(eye), "hands");
+            }
+            LOG("[vr hands] dump %d written (captures/hands/)", dumps);
+        }
+    }
+    // (diagnostics, the steady hands test, WWHD_VR_HANDS_AB) the left eye's picture (a quarter of its size) every 3 s in
+    // first-person play, 120 times, named by the test's phase; the hands image too when drawn (each waits for the GPU)
+    if (vr::hands_ab_mode() >= 0) {
+        static int abDumps = 0;
+        static auto abLast = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (abDumps < 120 && now - abLast > std::chrono::seconds(3) && vr::game::hands_layer_view(true)) {
+            abLast = now;
+            ++abDumps;
+            const int mode = vr::hands_ab_mode();
+            std::error_code ec;
+            std::filesystem::create_directories("captures/handstest", ec);
+            auto save = [&](Surface* sf, const char* what) {
+                if (!sf || !sf->image) return;
+                try {
+                    const auto px = read_surface_rgba(*sf, true);
+                    const uint32_t w = sf->extent.width, h = sf->extent.height, k = 4, ow = w / k, oh = h / k;
+                    if (px.size() < size_t(w) * h * 4 || !ow || !oh) return;
+                    std::vector<uint8_t> out(size_t(ow) * oh * 4);
+                    for (uint32_t y = 0; y < oh; ++y)
+                        for (uint32_t x = 0; x < ow; ++x)
+                            for (int ch = 0; ch < 4; ++ch) {
+                                uint32_t sum = 0;
+                                for (uint32_t dy = 0; dy < k; ++dy)
+                                    for (uint32_t dx = 0; dx < k; ++dx)
+                                        sum += px[((size_t(y) * k + dy) * w + x * k + dx) * 4 + ch];
+                                out[(size_t(y) * ow + x) * 4 + ch] = uint8_t(sum / (k * k));
+                            }
+                    char path[160];
+                    std::snprintf(path, sizeof path, "captures/handstest/d%03d_phase%d_%s.png", abDumps, mode, what);
+                    write_rgba_png(path, ow, oh, out);
+                } catch (...) {
+                }
+            };
+            save(eyes[0]->scan.get(), "picture");
+            save(hands_layer_drawn(0), "hands");
+            LOG("[vr hands test] picture %d (phase %d) written to captures/handstest/", abDumps, mode);
+        }
+    }
+    // (the refresh sequence capture) a real frame: a sequence begun here while the stick turns, or its next frame
+    if (seq_capture_on()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (g_seq.frame < 0 && g_seq.seqs < 10 && std::fabs(vr::view_turn_rate()) > 15.0f / 57.29578f &&
+            vr::config().turnSmoothing && now - g_seq.last > std::chrono::seconds(3)) {
+            ++g_seq.seqs, g_seq.frame = 0, g_seq.last = now;
+            LOG("[vr] refresh sequence capture %d begins: %s view%s, the stick turn rate %.1f degrees a second", g_seq.seqs,
+                vr::game::third_person_view() ? "third person" : "first person", vr::game::boat_view() ? " (the boat's)" : "",
+                double(vr::view_turn_rate()) * 57.29578);
+        }
+        if (g_seq.frame >= 0 && g_seq.frame < SeqCapture::kFrames)
+            for (int eye = 0; eye < 2; ++eye) seq_copy(cmd, g_seq.frame, eye, targets[eye]);
+    }
     // each eye's motion vectors and depth for the runtime (docs/VR_FRAME_SYNTHESIS.md), when it takes them
     if (vr_framesynth::active()) vr_framesynth::record(cmd);
     // (docs/VR_EYE_PROJECTION.md) the game's UI layer's picture into its quad's image (each eye with its own projection)
@@ -1219,9 +2041,20 @@ void record_eyes(VkCommandBuffer cmd) {
     // the GamePad picture into the panel's image (or, while the VR menu is open, the settings: docs/VR_MENU.md)
     g_panelRecorded = false;
     Surface* drc = R.drc.scan ? R.drc.scan.get() : nullptr;
+    // (2026-11-12, a PC log: a frame of 23 to 31 ms each time the VR menu opened or closed) one panel image for the
+    // GamePad screen and the VR menu: made at the larger of their sizes and never smaller than it was, each picture
+    // drawn into its top left part (g_panel.pixelWidth/Height, the quad's image rect). Made again at another size each
+    // switch, the swapchain's old images had to wait for the whole GPU first (ensure_swapchain). Only a larger picture
+    // than any before makes it again (at most once or twice a session)
+    const auto panelImage = [](uint32_t w, uint32_t h) -> VkImage {
+        const auto& sc = xs().swapchain(vr::xr::Session::kPanel);
+        const uint32_t pw = std::max({sc.width, w, kMenuPanelWidth}), ph = std::max({sc.height, h, kMenuPanelHeight});
+        if (!ensure_swapchain(vr::xr::Session::kPanel, pw, ph, [&] { return xs().ensure_panel(pw, ph); })) return VK_NULL_HANDLE;
+        g_panel.pixelWidth = w, g_panel.pixelHeight = h;
+        return xs().acquire(vr::xr::Session::kPanel);
+    };
     if (g_panelShown && g_panelMenu) {
-        VkImage panel = ensure_swapchain(vr::xr::Session::kPanel, kMenuPanelWidth, kMenuPanelHeight,
-                                        [] { return xs().ensure_panel(kMenuPanelWidth, kMenuPanelHeight); }) ? xs().acquire(vr::xr::Session::kPanel) : VK_NULL_HANDLE;
+        VkImage panel = panelImage(kMenuPanelWidth, kMenuPanelHeight);
         if (panel) {
             const auto& sc = xs().swapchain(vr::xr::Session::kPanel);
             VkImageView& view = g_panelViews[panel];
@@ -1234,7 +2067,7 @@ void record_eyes(VkCommandBuffer cmd) {
                 if (vkCreateImageView(R.device, &vi, nullptr, &view) != VK_SUCCESS) view = VK_NULL_HANDLE;
             }
             VkImageLayout layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;  // (acquired images are, and are again at release)
-            if (view && compose_overlay_into(panel, view, layout, {sc.width, sc.height}, VkFormat(sc.format))) g_panelRecorded = true;
+            if (view && compose_overlay_into(panel, view, layout, {kMenuPanelWidth, kMenuPanelHeight}, VkFormat(sc.format))) g_panelRecorded = true;
             else {
                 // nothing drawn (the overlay's first frame): the image still goes back cleared, in its layout
                 VkClearColorValue black{};
@@ -1262,9 +2095,8 @@ void record_eyes(VkCommandBuffer cmd) {
     } else if (g_panelShown && drc && drc->image) {
         const VkExtent3D shown = scan_picture_extent(R.drc);
         const uint32_t w = shown.width ? shown.width : drc->extent.width, h = shown.height ? shown.height : drc->extent.height;
-        VkImage panel = ensure_swapchain(vr::xr::Session::kPanel, w, h, [&] { return xs().ensure_panel(w, h); }) ? xs().acquire(vr::xr::Session::kPanel) : VK_NULL_HANDLE;
+        VkImage panel = panelImage(w, h);
         if (panel) {
-            const auto& sc = xs().swapchain(vr::xr::Session::kPanel);
             transition_image(drc, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
             b.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
@@ -1279,7 +2111,7 @@ void record_eyes(VkCommandBuffer cmd) {
             blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
             blit.srcOffsets[1] = {int32_t(w), int32_t(h), 1};
             blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            blit.dstOffsets[1] = {int32_t(sc.width), int32_t(sc.height), 1};
+            blit.dstOffsets[1] = {int32_t(w), int32_t(h), 1};  // (its part of the panel's image: g_panel.pixelWidth)
             record::vkCmdBlitImage(cmd, drc->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, panel,
                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
             b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1351,9 +2183,15 @@ bool skip_desktop_gamepad() {
 }
 
 bool skip_window_tv() {
-#ifdef __ANDROID__
+#if defined(__ANDROID__)
     // (a PC keeps its desktop window: a mirror for the room, captures and streams)
     return stereo::frame.mode == stereo::XR && vr::active();
+#elif defined(WWHD_STEAM_FRAME_NATIVE) || (defined(__linux__) && defined(__aarch64__))
+    // (Steam Frame - Native, 2026-11-14, the user's choice: the window is not seen in the headset either, and composing
+    // its picture cost the Quest's GPU more pixels than both eyes; swap() records the eyes, as on a PC whose window had
+    // no image ready). WWHD_VR_DESKTOP_WINDOW=1 keeps presenting it
+    static const bool keep = [] { const char* e = std::getenv("WWHD_VR_DESKTOP_WINDOW"); return e && *e == '1'; }();
+    return !keep && stereo::frame.mode == stereo::XR && vr::active();
 #else
     return false;
 #endif
@@ -1399,11 +2237,53 @@ void frame_end() {
     // (the eyes' pictures at their own size: the part of each image written, record_eyes)
     if (g_recorded)
         for (int e = 0; e < 2; ++e) v.eye[e].rectWidth = g_eyeRect[e][0], v.eye[e].rectHeight = g_eyeRect[e][1];
+    // (2026-11-12) the real frame turned to the refresh it lands on: drawn for its views' time, it is shown at this frame's
+    // predicted display time, a refresh before or after in a third of the frames of a headset run at Steady 30 (the
+    // view stepped back or stood still for a refresh during a stick turn: the doubling). The stick's turn over the gap is
+    // submitted in its pose (an image drawn at heading h0 shown at h0 + w dt: submitted turned by -w dt about the head,
+    // as frames shown again, show_again); the runtime turns it as it does for the head. Capped 45 and Steady 30 with
+    // Generated frames or Turn smoothing on (vr.frameRate half or original); WWHD_VR_TIME_CORRECT=0 off
+    float correctedTurn = 0;
+    vr::xr::Views submitted = v;
+    {
+        static const bool timeCorrect = [] {
+            const char* e = std::getenv("WWHD_VR_TIME_CORRECT");
+            return !(e && *e == '0');
+        }();
+        const vr::FrameRate mode = vr::config().frameRate;
+        const float rate = vr::view_turn_rate_for(v.time);
+        const bool lowRate = mode == vr::FrameRate::Half || mode == vr::FrameRate::Original ||
+                             (mode == vr::FrameRate::Auto && low_rate_repeats(xs().refresh_rate(), 0) > 0);
+        if (timeCorrect && views && v.valid && v.time && lowRate &&
+            vr::config().turnSmoothing && std::fabs(rate) > 0.05f) {
+            const double gap = double(xs().predicted_display_time() - v.time) * 1e-9;
+            if (std::fabs(gap) < 0.05) {
+                correctedTurn = float(double(rate) * gap);
+                const vr::Quat r = vr::yaw_quat(-correctedTurn);
+                const vr::Vec3 pivot = submitted.head.position;
+                submitted.head.orientation = vr::normalize(r * submitted.head.orientation);
+                for (auto& e : submitted.eye) {
+                    e.pose.position = pivot + vr::rotate(r, e.pose.position - pivot);
+                    e.pose.orientation = vr::normalize(r * e.pose.orientation);
+                }
+            }
+        }
+    }
+    if (seq_capture_on() && g_seq.frame >= 0 && g_seq.frame < SeqCapture::kFrames && g_seq.e[g_seq.frame][0].have) {
+        for (int eye = 0; eye < 2; ++eye)
+            seq_note(g_seq.frame, eye, 0, xs().predicted_display_time(), submitted.eye[eye].pose, submitted.eye[eye].fov,
+                     vr::view_turn_rate_for(v.time), (double(v.heading) + double(correctedTurn)) * 57.29578,
+                     double(xs().predicted_display_time() - v.time) * 1e-6);
+        if (++g_seq.frame == SeqCapture::kFrames) seq_finish();
+    }
     end_thread::Job job;
-    job.views = v;
+    job.views = submitted;
     job.drawn = views;
     job.eyes = g_recorded;
     job.panel = g_panelRecorded, job.wheel = g_wheelRecorded, job.wrist = g_wristRecorded, job.laser = g_laserRecorded;
+    job.hands = g_handsRecorded && g_recorded && views;
+    job.handsShow = g_handsShow;
+    g_handsRecorded = g_handsShow = false;
     job.panelQuad = panel, job.wheelQuad = wheel;
     // the UI layer's quad: head-locked, kUiDistance ahead, the size the symmetric field covers there
     // (behind the GamePad panel while it is shown: nearer, the game's UI looked in front of the panel drawn over it)
@@ -1432,11 +2312,25 @@ void frame_end() {
     g_shown.valid = true;
     g_shown.views = v;
     g_shown.drawn = views;
+    g_shown.turnRate = views ? vr::view_turn_rate_for(v.time) : 0.0f;  // (set for this frame, else none)
+    g_shown.shownAt = xs().predicted_display_time();
+    if (views && v.hasHeading) {
+        note_shown(v.heading + correctedTurn, g_shown.shownAt, false, g_shown.turnRate);  // (as shown: corrected)
+        const double lead = double(v.time - g_shown.shownAt) * 1e-6;  // ms
+        if (std::fabs(lead) < 200.0) {
+            ++g_even.leads;
+            g_even.leadSum += lead, g_even.leadSq += lead * lead;
+            g_even.leadLo = std::min(g_even.leadLo, lead), g_even.leadHi = std::max(g_even.leadHi, lead);
+        }
+    }
+    g_shown.velocity = views ? vr::view_velocity() : vr::Vec3{};
+    g_shown.havePivot = views && vr::turn_pivot(g_shown.pivot, g_shown.pivotLimit);
     g_shown.panel = panel;
     g_shown.wheel = wheel;
     g_shown.wrist = g_wristRecorded;
     g_shown.laser = g_laserRecorded;
     g_shown.ui = job.ui;
+    g_shown.hands = job.hands && job.handsShow;
     g_shown.uiQuad = job.uiQuad;
     for (int i = 0; i < vr::kWristPanels; ++i) g_shown.wristQuads[i] = g_wrist[i];
     for (int i = 0; i < 2; ++i) g_shown.laserQuads[i] = g_laser[i];
@@ -1450,10 +2344,11 @@ void frame_end() {
         if (t.lastEnd.time_since_epoch().count())
             t.interval.push_back(float(std::chrono::duration<double, std::milli>(now - t.lastEnd).count()));
         const XrTime shown = xs().predicted_display_time();
-        const XrDuration period = xs().predicted_period();
+        const XrDuration period = xs().refresh_period();
         if (t.lastDisplay && period > 0) t.display.push_back(float(double(shown - t.lastDisplay) / double(period)));
         if (views) note_display(shown, t.lastDisplay);
         t.lastDisplay = shown;
+        g_lastSubmittedDisplay = shown;
         if (gameTime >= 0 && t.lastGame >= 0 && gameTime >= t.lastGame && gameTime - t.lastGame < 4)
             t.game.push_back(float(gameTime - t.lastGame));
         t.lastGame = gameTime;
@@ -1465,6 +2360,13 @@ void frame_end() {
             g_gameFrameInterval = g_gameFrameInterval > 0 ? g_gameFrameInterval * 0.9 + gap * 0.1 : gap;
     }
     g_lastGameFrame = now;
+    {
+        const bool was = g_autoLowHeld.load(std::memory_order_relaxed);
+        update_auto_low_hold(xs().refresh_rate(), now);
+        update_auto_synth_hold(xs().refresh_rate(), xs().has_synthesis_swapchains(), now);
+        note_rate_switch(xs().refresh_rate(), now);
+        (void)was;
+    }
     if (now >= g_boostUntil) xs().cpu_boost(false);  // (headset_frame's Boost over: a no-op when not boosted)
     log_stats();
 }
@@ -1484,36 +2386,657 @@ void frame_end() {
 // and the next real frame waited a period more, and during a stick turn the old frame showed the world at the last
 // turn's angle: the world jerked and swam with head and stick turns (reported in the headset). At 60 fps on a 90 Hz
 // headset the frames are 1.5 periods apart, and some went the same way
+// Turn smoothing (vr.turnSmoothing; docs/FRAME_INTERPOLATION_IMPLEMENTATION.md, change 3, stage 1), planned: at a frame
+// rate under the headset's (Steady 30, 45 fps: each game frame shown for two or three refreshes) and while the view turns
+// (vr::view_turn_rate over kTurnMin), each game frame is followed at once by the frames for the refreshes before the next
+// one, the same images turned by the view's turn since they were drawn (planned_repeats, right after frame_end in the
+// swap). The headset turns every frame for the head itself; the stick's turn it cannot see, so between the game's frames
+// the view held still and jumped, and the eyes, following the turn, saw each frame two or three times: the ghosting
+// (asked for, 2026-11-12: "why is it smooth when we physically turn our head and not when we move the stick?").
+// (The first version, the same day, slipped frames in whenever the render thread was idle: they took the slots the
+// game's frames wanted and delayed them, 147 missed refreshes in 10 s of turning at 45 fps. Planned right after the game
+// frame, each takes the next refresh before the next game frame asks for one: xrWaitFrame paces them in order.)
+constexpr float kTurnMin = 0.05f;  // radians a second (about 3 degrees): slower turns are not shown again
+// metres a second (movement smoothing): slower movement is not shown again (0.1 before: a headset run standing still
+// measured 0.11, the head's and the animation's noise, and showed 292 frames again every 10 s for nothing)
+constexpr float kMoveMin = 0.5f;
+bool turning_now() { return std::fabs(g_shown.turnRate) > kTurnMin && vr::config().turnSmoothing; }
+bool moving_now() { return vr::length(g_shown.velocity) > kMoveMin && vr::config().movementSmoothing; }
 int64_t headset_frame_due() {
     if (!g_started || g_frame || !g_shown.valid || !xs().running()) return 0;
-    const XrDuration period = xs().predicted_period();
+    const XrDuration period = xs().refresh_period();
     if (period <= 0 || g_times.lastEnd.time_since_epoch().count() == 0) return 0;
     const int64_t wait = std::max<int64_t>(3 * int64_t(period), int64_t(2.0 * g_gameFrameInterval));
     const auto due = g_times.lastEnd + std::chrono::nanoseconds(wait);
     return std::chrono::duration_cast<std::chrono::nanoseconds>(due.time_since_epoch()).count();
 }
+// the last frame shown again: an OpenXR frame of the same images (their last released ones); `motion`: turned (and moved,
+// movement smoothing) on by the view's own turn since they were drawn. False: not shown (the queue busy, the session not
+// running, no frame begun)
+// (docs/VR_STREAMING.md, "Turn smoothing on a streamed headset") on a streamed headset with Streaming optimal (Virtual
+// Desktop over Wi-Fi), the runtime's predicted display times move with the network (up to 155 ms apart in a Quest 3
+// log): a turned frame's angle taken from them came out uneven, a step too far or too short, and the eyes saw the
+// stick-turn ghosting again (reported over VD, 2026-11-13). There each turned frame is turned by whole refreshes from
+// the game frame (step 1, 2 ...), the game's own clock; a wired headset keeps the display times.
+// WWHD_VR_TURN_STEP_CLOCK=1 or 0 decides for a test start
+bool turn_step_clock() {
+    static const int forced = [] {
+        const char* e = std::getenv("WWHD_VR_TURN_STEP_CLOCK");
+        return e && *e == '1' ? 1 : e && *e == '0' ? 0 : -1;
+    }();
+    const bool on = forced >= 0 ? forced == 1 : (xs().streamed() && vr::config().streamingOptimal);
+    static int logged = -1;
+    if (int(on) != logged) {
+        logged = int(on);
+        LOG("[vr] turn smoothing's frames turned by %s", on ? "whole refreshes from the game frame (a streamed headset, "
+                                                              "Streaming optimal: its display times move with the network)"
+                                                            : "the headset's display times");
+    }
+    return on;
+}
+bool show_again(bool motion, int step = 0) {
+    end_thread::wait();  // (the last frame's end first: its images released, its xrEndFrame called)
+    std::unique_lock<std::mutex> queueLock(graphics_queue_mutex(), std::try_to_lock);
+    if (!queueLock) return false;
+    xs().poll_events();
+    if (!xs().running()) return false;
+    bool shouldRender = false;
+    if (!xs().begin_frame(shouldRender)) return false;
+    const auto rtBegun = std::chrono::steady_clock::now();
+    const XrTime rtShown = xs().predicted_display_time();
+    const bool rtLate = repeat_late(rtShown);
+    // (the views turned by the view's turn since they were drawn: about the head, by the turn rate times the time from
+    // their display time to this frame's. The runtime shows an image as seen from the pose it is submitted with; the view's
+    // heading in the game being the mapping's heading plus the head's tracked yaw, an image drawn at heading h0 shown at
+    // h0 + w dt is the same as one submitted turned by -w dt in the tracking space)
+    vr::xr::Views views = g_shown.views;
+    if (motion) {
+        const XrDuration period = xs().refresh_period();
+        const double dt = step > 0 && period > 0 && turn_step_clock()
+                              ? double(step) * double(period) * 1e-9
+                              : std::clamp(since_shown(xs().predicted_display_time()), -3.0 * double(period) * 1e-9,
+                                           6.0 * double(period) * 1e-9);
+        const float turn = turning_now() ? float(-double(g_shown.turnRate) * dt) : 0.0f;
+        const vr::Quat r = vr::yaw_quat(turn);
+        const vr::Vec3 pivot = views.head.position;
+        // (movement smoothing) and moved back by the view's movement since: an image drawn with the view at p0, shown with
+        // it at p0 + v dt, is the same as one submitted from where the head was less v dt in the tracking space; the
+        // runtime moves it by the depth sent with it (reuse_last_depth)
+        const vr::Vec3 shift = moving_now() ? g_shown.velocity * float(-dt) : vr::Vec3{};
+        views.head.orientation = vr::normalize(r * views.head.orientation);
+        views.head.position = pivot + shift;
+        for (auto& e : views.eye) {
+            e.pose.position = pivot + vr::rotate(r, e.pose.position - pivot) + shift;
+            e.pose.orientation = vr::normalize(r * e.pose.orientation);
+        }
+        if (moving_now()) xs().reuse_last_depth();
+    }
+    // (the game's UI layer too: its last released image, as the eyes'. Left out, the HUD, text and menus of the per-eye
+    // projection's UI layer blinked off for every frame shown again: loads, shader waits)
+    vr::xr::Quad panel = g_shown.panel, wheel = g_shown.wheel, ui = g_shown.uiQuad;
+    // (docs/VR_HANDS_LAYER_PLAN.md step 4) the hands layer at the views the frame was drawn with, not turned: the eyes'
+    // layer turns with the stick, the hands stay where they were (Link's hands follow the controllers, not the turn)
+    xs().end_frame(views, g_shown.drawn, &panel, &wheel, g_shown.wrist ? g_shown.wristQuads : nullptr,
+                   g_shown.wrist ? vr::kWristPanels : 0, g_shown.laser ? g_shown.laserQuads : nullptr, g_shown.laser ? 2 : 0,
+                   g_shown.ui ? &ui : nullptr, g_shown.hands ? &g_shown.views : nullptr);
+    if (motion) {
+        g_rtPlain.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rtBegun).count(), rtLate);
+        g_lastSubmittedDisplay = rtShown;
+        repeat_timing_log();
+    }
+    g_times.lastEnd = std::chrono::steady_clock::now();
+    return true;
+}
 void headset_frame() {
     const int64_t due = headset_frame_due();
     const auto now = std::chrono::steady_clock::now();
     if (!due || std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count() < due) return;
-    end_thread::wait();  // (the last frame's end, long done: 3 display periods have passed)
-    std::unique_lock<std::mutex> queueLock(graphics_queue_mutex(), std::try_to_lock);
-    if (!queueLock) return;
-    xs().poll_events();
-    if (!xs().running()) return;
-    bool shouldRender = false;
-    if (!xs().begin_frame(shouldRender)) return;
-    // (the game's UI layer too: its last released image, as the eyes'. Left out, the HUD, text and menus of the per-eye
-    // projection's UI layer blinked off for every frame shown again: loads, shader waits)
-    vr::xr::Quad panel = g_shown.panel, wheel = g_shown.wheel, ui = g_shown.uiQuad;
-    xs().end_frame(g_shown.views, g_shown.drawn, &panel, &wheel, g_shown.wrist ? g_shown.wristQuads : nullptr,
-                   g_shown.wrist ? vr::kWristPanels : 0, g_shown.laser ? g_shown.laserQuads : nullptr, g_shown.laser ? 2 : 0,
-                   g_shown.ui ? &ui : nullptr);
+    if (!show_again(false)) return;
     ++g_stats.keptAlive;
-    g_times.lastEnd = std::chrono::steady_clock::now();
     // (standalone: the CPU at Boost while the game is stalled, Sustained High again 2 s after the last stall: frame_end)
     g_boostUntil = g_times.lastEnd + std::chrono::seconds(2);
     xs().cpu_boost(true);
+}
+// A generated frame (docs/FRAME_INTERPOLATION_IMPLEMENTATION.md; the "Generated frames" setting itself was removed,
+// 2026-11-13: "it doesn't work anyway"; used by Head movement smoothing and Turn smoothing's near-field hold): one of the
+// refreshes planned_repeats fills, a frame drawn on the GPU from the last real one (vr_genframe): both eyes' pictures
+// reprojected by their scene depth (vr_framesynth::last_depth) to the head where the runtime predicts it for this
+// refresh and the view's own turn and movement since (an image drawn at heading h0 seen at h0 + w dt, from p0 + v dt:
+// the camera turned by w dt about the head and moved by v dt in the tracking space), submitted at the head's own pose.
+// The sequence is the headset's test loop's (smoke): the frame begun, the eyes located, both images acquired, drawn,
+// submitted, then released and the frame ended under the queue's lock. -1: no frame begun (nothing to generate from: the
+// caller shows the last one again turned instead); 0: begun but shown as the last one (a draw failed); 1: generated
+constexpr float kGenMoveMin = 0.3f;
+// (diagnostics, every 10 s with any generated frame: "[vr] generated frames (10 s)") what each generated frame was moved
+// by and where it landed: its time after the real frame it was made from, the turn and the movement drawn into it, and
+// its refresh against the frame before it (one refresh after it: on its slot; more: a refresh was missed; less: two
+// frames for one refresh)
+struct GenStats {
+    uint64_t frames = 0, onSlot = 0, late = 0, early = 0;
+    float nearM = 0, farM = 0;           // (check 5) the last frame's planes in metres
+    double fovAspect = 0, picAspect = 0;  // (check 6) the left eye's field of view (tangents) and its picture, width over height
+    double dtSum = 0, dtMax = 0, turnSum = 0, turnMax = 0, moveSum = 0, moveMax = 0;
+    uint64_t headFrames = 0;            // (head movement) frames warped by the head's own movement only
+    double headSum = 0, headMax = 0;    // the eyes' movement since the real frame, mm
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+} g_gen;  // metres a second: slower movement (with no turn) is not worth a generated frame
+// (diagnostics, WWHD_VR_GENFRAME_CAPTURE=1, 2026-11-12, asked for: "add the capture") the left eye of a stick turn, as
+// the headset gets it: the real frame, the generated frames after it, the next real frame, as PNGs in
+// captures/genframe/ (set N: a_real, b_gen1, c_gen2, d_next_real) with a text of what each was drawn with. A set while
+// turning faster than 15 degrees a second, every 4 s, 4 sets at most. Each image waits for the GPU (a hitch)
+struct GenCapture {
+    bool on = false;
+    int sets = 0;
+    int inSet = -1;    // the set being taken (-1: none)
+    int gens = 0;      // its generated frames so far
+    bool wantNext = false;
+    std::chrono::steady_clock::time_point last{};
+    std::string notes;
+} g_cap;
+std::string capture_dir() {
+    std::string d = "captures/genframe";
+    std::error_code ec;
+    std::filesystem::create_directories(d, ec);
+    return d;
+}
+void capture_write(std::string path, uint32_t w, uint32_t h, std::vector<uint8_t> rgba) {
+    std::thread([path = std::move(path), w, h, rgba = std::move(rgba)] {
+        try {
+            write_rgba_png(path, w, h, rgba);
+        } catch (...) {
+        }
+    }).detach();
+}
+// the real left-eye picture as drawn (its shown part), display-encoded
+void capture_real(const char* name) {
+    Screen& eye = R.tv;
+    if (!eye.scan || !eye.scan->image) return;
+    end_thread::wait();  // (the last frame's end first: its images released)
+    Surface& scan = *eye.scan;
+    std::vector<uint8_t> full;
+    try {
+        full = read_surface_rgba(scan, true);
+    } catch (...) {
+        return;
+    }
+    const VkExtent3D shown = scan_picture_extent(eye);
+    const uint32_t fw = scan.extent.width, sw = shown.width ? std::min(shown.width, fw) : fw;
+    const uint32_t sh = shown.height ? std::min(shown.height, scan.extent.height) : scan.extent.height;
+    std::vector<uint8_t> crop(size_t(sw) * sh * 4);
+    for (uint32_t y = 0; y < sh; ++y) std::memcpy(&crop[size_t(y) * sw * 4], &full[size_t(y) * fw * 4], size_t(sw) * 4);
+    char path[256];
+    std::snprintf(path, sizeof path, "%s/set%d_%s.png", capture_dir().c_str(), g_cap.inSet, name);
+    capture_write(path, sw, sh, std::move(crop));
+    char line[256];
+    std::snprintf(line, sizeof line, "%s: the real picture, %ux%u (the eye's drawn part)\n", name, sw, sh);
+    g_cap.notes += line;
+}
+void capture_notes() {
+    char path[256];
+    std::snprintf(path, sizeof path, "%s/set%d.txt", capture_dir().c_str(), g_cap.inSet);
+    if (FILE* f = std::fopen(path, "w")) {
+        std::fputs(g_cap.notes.c_str(), f);
+        std::fclose(f);
+    }
+    LOG("[vr] generated frames: capture set %d written (%s)", g_cap.inSet, path);
+}
+// Head movement smoothing (vr.headSmoothing, 2026-11-13, asked for: "make b with head movements", its own setting under
+// Streaming optimal): the head moves the eyes a few centimetres as you look around, and the runtime's reprojection of a
+// repeated refresh corrects only the head's turn, so near things (the arms, the sword, close walls) stepped back and forth
+// at the game's rate (players at 45 and 36 fps, wired and streamed; a real 90 was clean). Each refresh between the game's
+// frames with no stick turn and no movement of the view gets the last frame warped by the eyes' movement alone
+// (show_generated headMode). Separate from Generated frames (off: "didn't work for us")
+bool head_smoothing_wanted() {
+    return vr::config().headSmoothing && g_shown.drawn && g_shown.views.valid && !turning_now() && !moving_now();
+}
+// turnOnly (Turn smoothing, 2026-11-12, asked for: "for turn smoothing lets fix the body or near field objects"): the
+// frame is Turn smoothing's turned copy (the stick's turn in the submitted pose, the far world left to the runtime, as
+// show_again), with only the near field (the body, hands, sword, shield) warped to stay where it was; no walk
+int show_generated(bool turnOnly, bool headMode = false) {
+    Screen* eyes[2] = {&R.tv, &stereoRight};
+    // (Head movement smoothing, 2026-11-13) the frame warped by the eyes' movement since it was drawn only (the parallax the
+    // runtime cannot add), its turn left to the runtime: submitted with the real frame's orientations at the eyes' positions
+    // now. The runtime then turns it to the head as it does every frame
+    const bool headOnly = headMode && !turnOnly;
+    Surface* depth[2] = {};
+    uint32_t slice[2] = {};
+    float projA[2] = {}, projB[2] = {};
+    bool halfZ[2] = {};
+    for (int e = 0; e < 2; ++e) {
+        if (!eyes[e]->scan || !eyes[e]->scan->image) return -1;
+        if (!vr_framesynth::last_depth(e, depth[e], slice[e], projA[e], projB[e], halfZ[e])) return -1;
+    }
+    const float scale = vr::world_scale();
+    if (!(scale > 0) || !vr_genframe::prepare(VkFormat(xs().swapchain(0).format)) ||
+        !vr_genframe::prepare(VkFormat(xs().swapchain(1).format)))
+        return -1;
+    end_thread::wait();  // (the last frame's end first: its images released, its xrEndFrame called)
+    xs().poll_events();
+    if (!xs().running()) return -1;
+    bool shouldRender = false;
+    if (!xs().begin_frame(shouldRender)) return -1;
+    const auto rtBegun = std::chrono::steady_clock::now();
+    const bool rtLate = repeat_late(xs().predicted_display_time());
+    vr::xr::Views out = g_shown.views;
+    bool drawn = false;
+    vr::xr::Views located;
+    if (shouldRender && xs().locate_views(xs().predicted_display_time(), located)) {
+        float eyeX[2];
+        const vr::xr::Views q = vr::as_rendered(located, eyeX);
+        const XrDuration period = xs().refresh_period();
+        const double dt = std::clamp(since_shown(xs().predicted_display_time()), -3.0 * double(period) * 1e-9, 6.0 * double(period) * 1e-9);
+        // (check 3, WWHD_VR_GENFRAME_TURN_SCALE=x: the turn drawn into generated frames times x, so its direction shows: at 3
+        // they jump ahead in the turn's direction when it is right, back against it when it is wrong)
+        static const double turnScale = [] {
+            const char* e = std::getenv("WWHD_VR_GENFRAME_TURN_SCALE");
+            const double v = e ? std::atof(e) : 1.0;
+            return v > 0 && v < 10 ? v : 1.0;
+        }();
+        const vr::Quat turn = vr::yaw_quat(float(double(g_shown.turnRate) * dt * turnScale));
+        if (g_shown.views.hasHeading)
+            note_shown(float(double(g_shown.views.heading) + double(g_shown.turnRate) * dt * turnScale), xs().predicted_display_time(),
+                       true, g_shown.turnRate);
+        const vr::Vec3 move = !turnOnly && vr::length(g_shown.velocity) > kGenMoveMin ? g_shown.velocity * float(dt) : vr::Vec3{};
+        {
+            const XrTime shownAt = xs().predicted_display_time();
+            const double turnDeg = std::fabs(double(g_shown.turnRate) * dt) * 57.29578, moveCm = double(vr::length(move)) * 100.0;
+            ++g_gen.frames;
+            g_gen.dtSum += dt * 1000.0, g_gen.dtMax = std::max(g_gen.dtMax, dt * 1000.0);
+            g_gen.turnSum += turnDeg, g_gen.turnMax = std::max(g_gen.turnMax, turnDeg);
+            g_gen.moveSum += moveCm, g_gen.moveMax = std::max(g_gen.moveMax, moveCm);
+            if (g_lastSubmittedDisplay && period > 0) {
+                const double gap = double(shownAt - g_lastSubmittedDisplay) / double(period);
+                if (gap > 1.5) ++g_gen.late;
+                else if (gap < 0.5) ++g_gen.early;
+                else ++g_gen.onSlot;
+            }
+            g_lastSubmittedDisplay = shownAt;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - g_gen.since >= std::chrono::seconds(10)) {
+                const double n = double(std::max<uint64_t>(g_gen.frames, 1));
+                LOG("[vr] generated frames (10 s): %llu; %.1f ms after their real frame on average (%.1f at most); turned %.2f "
+                    "degrees on average (%.2f at most), moved %.1f cm (%.1f at most); refreshes: %llu on their slot, %llu a "
+                    "refresh late, %llu sharing one; depth planes %.3f to %.0f m; field of view %.3f wide for 1 high, the "
+                    "picture %.3f (%s); %llu by the head's movement only (the eyes moved %.1f mm on average, %.1f at most)",
+                    (unsigned long long)g_gen.frames, g_gen.dtSum / n, g_gen.dtMax,
+                    g_gen.turnSum / n, g_gen.turnMax, g_gen.moveSum / n, g_gen.moveMax, (unsigned long long)g_gen.onSlot,
+                    (unsigned long long)g_gen.late, (unsigned long long)g_gen.early, double(g_gen.nearM), double(g_gen.farM),
+                    g_gen.fovAspect, g_gen.picAspect,
+                    "the eye's own field of view; its pixels need not be square", (unsigned long long)g_gen.headFrames,
+                    g_gen.headFrames ? g_gen.headSum / double(g_gen.headFrames) : 0.0, g_gen.headMax);
+                g_gen = GenStats{};
+            }
+        }
+        VkImage img[2] = {xs().acquire(0), VK_NULL_HANDLE};
+        if (img[0]) img[1] = xs().acquire(1);
+        if (img[0] && img[1]) {
+            auto cmd = command_buffer();
+            end_encoder();
+            bool both = true;
+            // (2026-11-12, "pose" mode, the default: asked for after a headset run showed Turn smoothing's turned copies
+            // right for far objects, the body shaking) the stick's turn submitted in the pose, as Turn smoothing's copies
+            // (show_again): the real frame's views turned by -w dt about the head, the runtime turning the picture for it
+            // as it does for the head. The far world is not warped (left to the runtime: the method seen working); only
+            // the near field (the body, hands, sword, shield) is warped, to the submitted pose with it held in the
+            // tracking space, so the runtime's turn leaves it where it was. WWHD_VR_GENFRAME_MODE=warp: the warp turns the
+            // world as before (submitted at the head's pose)
+            static const bool poseModeSetting = [] {
+                const char* m = std::getenv("WWHD_VR_GENFRAME_MODE");
+                const bool pose = !(m && !std::strcmp(m, "warp"));
+                LOG("[vr] generated frames: %s", pose ? "the stick's turn in the submitted pose (as Turn smoothing), the near "
+                                                        "field held (WWHD_VR_GENFRAME_MODE=warp: the world warped)"
+                                                      : "the world warped by the stick's turn, submitted at the head's pose");
+                return pose;
+            }();
+            const bool poseMode = poseModeSetting || turnOnly;
+            vr::xr::Views turned = g_shown.views;  // (pose mode) the views submitted: the real frame's, turned
+            if (poseMode) {
+                const vr::Quat r = vr::yaw_quat(float(-double(g_shown.turnRate) * dt * turnScale));
+                const vr::Vec3 pivot = turned.head.position;
+                turned.head.orientation = vr::normalize(r * turned.head.orientation);
+                for (auto& ev : turned.eye) {
+                    ev.pose.position = pivot + vr::rotate(r, ev.pose.position - pivot);
+                    ev.pose.orientation = vr::normalize(r * ev.pose.orientation);
+                }
+            }
+            for (int e = 0; e < 2; ++e) {
+                const vr::Pose& s = g_shown.views.eye[e].pose;  // the real eye camera
+                if (headOnly) {
+                    // the target camera: the real one's orientation at the eye's position now (in the real camera's space)
+                    const vr::Vec3 o = vr::rotate(vr::conjugate(s.orientation), q.eye[e].pose.position - s.position);
+                    const vr::Fov& f = g_shown.views.eye[e].fov;
+                    vr_genframe::Warp w{};
+                    w.axisX[0] = 1, w.axisY[1] = 1, w.axisZ[2] = 1;
+                    w.origin[0] = o.x, w.origin[1] = o.y, w.origin[2] = o.z;
+                    w.nearRotation[3] = 1;  // (the near field warped as the world: the same camera)
+                    w.nearOrigin[0] = o.x, w.nearOrigin[1] = o.y, w.nearOrigin[2] = o.z;
+                    w.nearMetres = 0;
+                    w.tanLeft = std::tan(f.left), w.tanRight = std::tan(f.right), w.tanUp = std::tan(f.up), w.tanDown = std::tan(f.down);
+                    w.projA = projA[e], w.projB = projB[e] / scale, w.halfZ = halfZ[e];
+                    if (e == 0) {
+                        const double mm = double(vr::length(q.eye[e].pose.position - s.position)) * 1000.0;
+                        ++g_gen.headFrames;
+                        g_gen.headSum += mm, g_gen.headMax = std::max(g_gen.headMax, mm);
+                    }
+                    Surface* scan = eyes[e]->scan.get();
+                    const VkExtent3D shown = scan_picture_extent(*eyes[e]);
+                    const auto& sc = xs().swapchain(e);
+                    both = both && vr_genframe::draw(cmd, *scan, shown.width ? shown.width : scan->extent.width,
+                                                      shown.height ? shown.height : scan->extent.height, *depth[e], slice[e],
+                                                      w, img[e], VkFormat(sc.format), sc.width, sc.height);
+                    out.eye[e].pose.orientation = s.orientation;
+                    out.eye[e].pose.position = q.eye[e].pose.position;
+                    out.eye[e].rectWidth = out.eye[e].rectHeight = 0;  // (the whole image written)
+                    continue;
+                }
+                const vr::Quat tOrient = vr::normalize(turn * q.eye[e].pose.orientation);
+                // (2026-11-12) turned about the game's own pivot: the head's offset from the room-scale origin (held within
+                // the limit sideways) swings with the turn, as the game turns the mapping about that origin; about the head,
+                // standing a metre from the origin put every generated frame up to 4 cm off sideways during a stick turn
+                vr::Vec3 headT = q.head.position;
+                if (g_shown.havePivot) {
+                    vr::Vec3 off = q.head.position - g_shown.pivot;
+                    off.y = 0;
+                    const float h = vr::length(off), lim = g_shown.pivotLimit;
+                    if (lim >= 0 && h > lim && h > 0) off = off * (lim / h);
+                    headT = q.head.position + vr::rotate(turn, off) - off;
+                }
+                const vr::Vec3 tPos = headT + vr::rotate(turn, q.eye[e].pose.position - q.head.position) + move;
+                const vr::Quat rel = poseMode ? vr::Quat{} : vr::normalize(vr::conjugate(s.orientation) * tOrient);
+                const vr::Vec3 ax = vr::rotate(rel, {1, 0, 0}), ay = vr::rotate(rel, {0, 1, 0}), az = vr::rotate(rel, {0, 0, 1});
+                // (pose mode: the world only moved by the walk, in the real camera's space; its turn is the pose's)
+                const vr::Vec3 o = poseMode ? vr::rotate(vr::conjugate(s.orientation), move)
+                                            : vr::rotate(vr::conjugate(s.orientation), tPos - s.position);
+                const vr::Fov& f = g_shown.views.eye[e].fov;
+                vr_genframe::Warp w{};
+                w.axisX[0] = ax.x, w.axisX[1] = ax.y, w.axisX[2] = ax.z;
+                w.axisY[0] = ay.x, w.axisY[1] = ay.y, w.axisY[2] = ay.z;
+                w.axisZ[0] = az.x, w.axisZ[1] = az.y, w.axisZ[2] = az.z;
+                w.origin[0] = o.x, w.origin[1] = o.y, w.origin[2] = o.z;
+                // (the near field: the hands, sword and shield move with you) its camera: the eye where the head is now,
+                // without the stick's turn or the walk (WWHD_VR_GENFRAME_NEAR=metres, default 1; 0: off)
+                {
+                    static const float nearMetres = [] {
+                        const char* e = std::getenv("WWHD_VR_GENFRAME_NEAR");
+                        const float m = e ? float(std::atof(e)) : 1.0f;
+                        const float r = std::isfinite(m) ? std::clamp(m, 0.0f, 3.0f) : 1.0f;
+                        LOG("[vr] generated frames: the near field (within %.2f m: hands, sword, shield) moves with the head only%s",
+                            double(r), r > 0 ? "" : " (off: warped as the world)");
+                        return r;
+                    }();
+                    // (pose mode: to the submitted, turned pose, the near field held in the tracking space; else to the head
+                    // where it is now)
+                    const vr::Pose& nt = poseMode ? turned.eye[e].pose : q.eye[e].pose;
+                    const vr::Quat nr = vr::normalize(vr::conjugate(s.orientation) * nt.orientation);
+                    const vr::Vec3 no = vr::rotate(vr::conjugate(s.orientation), nt.position - s.position);
+                    w.nearRotation[0] = nr.x, w.nearRotation[1] = nr.y, w.nearRotation[2] = nr.z, w.nearRotation[3] = nr.w;
+                    w.nearOrigin[0] = no.x, w.nearOrigin[1] = no.y, w.nearOrigin[2] = no.z;
+                    w.nearMetres = nearMetres;
+                    if (poseMode && nearMetres > 0) w.nearMetres = -nearMetres;  // (the world still: vr_genframe worldStill)
+                }
+                w.tanLeft = std::tan(f.left), w.tanRight = std::tan(f.right), w.tanUp = std::tan(f.up), w.tanDown = std::tan(f.down);
+                // (the views' field of view: the one each eye's projection is built from, as_rendered. Not the camera
+                // matrix noted for depth (vr_framesynth last_tangents): that is the game's own, before the eye's frustum
+                // (stereo_projection.h project_eye), and a headset run with it read 1.386 wide for 1 high against the
+                // eye's 1.049, symmetric: every generated frame turned by about three quarters of the turn, 2026-11-12.
+                // The picture's pixels need not be square, so its width over height is no check of this)
+                w.projA = projA[e], w.projB = projB[e] / scale, w.halfZ = halfZ[e];
+                // (checks 5 and 6, logged with the generated frames' line) the planes in metres and the field of view
+                // against the picture's shape
+                if (e == 0) {
+                    const float a = projA[e], b = projB[e] / scale;
+                    g_gen.nearM = halfZ[e] ? b / a : b / (a - 1.0f);
+                    g_gen.farM = a == -1.0f ? INFINITY : b / (a + 1.0f);
+                    const VkExtent3D sh = scan_picture_extent(*eyes[e]);
+                    const double pw = sh.width ? sh.width : eyes[e]->scan->extent.width, ph = sh.height ? sh.height : eyes[e]->scan->extent.height;
+                    g_gen.fovAspect = (w.tanRight - w.tanLeft) / std::max(1e-6f, w.tanUp - w.tanDown);
+                    g_gen.picAspect = ph > 0 ? pw / ph : 0;
+                }
+                Surface* scan = eyes[e]->scan.get();
+                const VkExtent3D shown = scan_picture_extent(*eyes[e]);
+                const auto& sc = xs().swapchain(e);
+                both = both && vr_genframe::draw(cmd, *scan, shown.width ? shown.width : scan->extent.width,
+                                                  shown.height ? shown.height : scan->extent.height, *depth[e], slice[e], w,
+                                                  img[e], VkFormat(sc.format), sc.width, sc.height);
+                // (submitted at the head's own pose: the view's turn and move are drawn in; pose mode: the turned views)
+                out.eye[e].pose = poseMode ? turned.eye[e].pose : q.eye[e].pose;
+                out.eye[e].rectWidth = out.eye[e].rectHeight = 0;  // (the whole image written)
+            }
+            out.head = headOnly ? vr::Pose{g_shown.views.head.orientation, q.head.position} : poseMode ? turned.head : q.head;
+            if (both && seq_capture_on() && g_seq.frame >= 0 && g_seq.frame < SeqCapture::kFrames) {
+                for (int e = 0; e < 2; ++e) {
+                    seq_copy(cmd, g_seq.frame, e, img[e]);
+                    seq_note(g_seq.frame, e, 1, xs().predicted_display_time(), out.eye[e].pose, out.eye[e].fov, g_shown.turnRate,
+                             (double(g_shown.views.heading) + double(g_shown.turnRate) * dt * turnScale) * 57.29578, dt * 1000.0);
+                }
+                if (++g_seq.frame == SeqCapture::kFrames) seq_finish();
+            }
+            if (both && g_cap.inSet >= 0 && !g_cap.wantNext) {
+                std::vector<uint8_t> rgba;
+                const auto& sc = xs().swapchain(0);
+                if (vr_genframe::read_target(img[0], VkFormat(sc.format), sc.width, sc.height, rgba)) {
+                    ++g_cap.gens;
+                    char path[256], line[512];
+                    std::snprintf(path, sizeof path, "%s/set%d_%c_gen%d.png", capture_dir().c_str(), g_cap.inSet,
+                                  char('a' + g_cap.gens), g_cap.gens);
+                    capture_write(path, sc.width, sc.height, std::move(rgba));
+                    const vr::Fov& f = g_shown.views.eye[0].fov;
+                    std::snprintf(line, sizeof line,
+                                  "gen%d: %ux%u, %.1f ms after the real frame, turned %.3f degrees (rate %.1f deg/s), moved %.1f "
+                                  "cm; field of view tangents left %.3f right %.3f up %.3f down %.3f\n",
+                                  g_cap.gens, sc.width, sc.height, dt * 1000.0, double(g_shown.turnRate) * dt * 57.29578,
+                                  double(g_shown.turnRate) * 57.29578, double(vr::length(move)) * 100.0, std::tan(f.left),
+                                  std::tan(f.right), std::tan(f.up), std::tan(f.down));
+                    g_cap.notes += line;
+                }
+            }
+            flush_async();
+            drawn = both;
+        }
+        std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+        if (img[0]) xs().release(0);
+        if (img[1]) xs().release(1);
+        if (!drawn) out = g_shown.views;  // (a draw failed: the images hold what they held; the old frame's views)
+    }
+    // (Head movement smoothing with Depth for Virtual Desktop, 2026-11-13, asked for: "fix it so they work together") the
+    // real frame's depth sent with its warped frames too, as movement smoothing's repeats (its depth swapchains' last
+    // released images): VDXR places the layers by depth, and depth on every other refresh only (the real frames) could
+    // flicker what it places by it. Drawn a few millimetres from where the warped frame is shown: close enough
+    if (headOnly && drawn) xs().reuse_last_depth();
+    {
+        vr::xr::Quad panel = g_shown.panel, wheel = g_shown.wheel, ui = g_shown.uiQuad;
+        std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+        xs().end_frame(out, drawn || g_shown.drawn, &panel, &wheel, g_shown.wrist ? g_shown.wristQuads : nullptr,
+                       g_shown.wrist ? vr::kWristPanels : 0, g_shown.laser ? g_shown.laserQuads : nullptr,
+                       g_shown.laser ? 2 : 0, g_shown.ui ? &ui : nullptr, g_shown.hands ? &g_shown.views : nullptr);
+    }
+    if (turnOnly) {
+        g_rtHeld.add(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rtBegun).count(), rtLate);
+        repeat_timing_log();
+    }
+    g_times.lastEnd = std::chrono::steady_clock::now();
+    return drawn ? 1 : 0;
+}
+bool hands_layer_wanted() {
+    // (a test start's WWHD_VR_FRAME_RATE wins, as for the game's pacing: a Capped 45 test run had the layer off, 2026-11-13)
+    static const int testRate = [] {
+        const char* e = std::getenv("WWHD_VR_FRAME_RATE");
+        if (!e || !*e) return -1;
+        return !std::strcmp(e, "full") ? int(vr::FrameRate::Full) : !std::strcmp(e, "half") ? int(vr::FrameRate::Half)
+             : !std::strcmp(e, "auto") ? int(vr::FrameRate::Auto) : !std::strcmp(e, "unlocked") ? int(vr::FrameRate::Unlocked) : -1;
+    }();
+    // (the setting, vr.handsLayer, with Turn smoothing; WWHD_VR_HANDS_LAYER=1 or 0 decides for a test start)
+    static const int forced = [] {
+        const char* e = std::getenv("WWHD_VR_HANDS_LAYER");
+        return e && *e == '1' ? 1 : e && *e == '0' ? 0 : -1;
+    }();
+    const vr::Config c = vr::config();
+    if (forced == 0 || (forced < 0 && !(c.handsLayer && c.turnSmoothing))) return false;
+    const vr::FrameRate mode = testRate >= 0 ? vr::FrameRate(testRate) : c.frameRate;
+    // (2026-11-14, a headset log in Auto Mode: while Auto aimed for 90 the game drew 77 fps, the in-between passes over
+    // their time, the GPU 32 % busy, and steady hands was on in 409 of its frames: on at each dip under 90 (the measured
+    // pace, update_auto_low_hold), it added Link's own image, depth and layer just when the game was short of time.
+    // Asked for, 2026-11-12: "make sure we don't use this in 90 fps modes so our fps isn't impacted") Auto Mode: on by the
+    // rate Auto has chosen, as the refresh filling is (planned_repeats): on once Auto has gone to half the headset's rate
+    // (45 at 90 Hz), off while it aims for the full rate
+    if (mode == vr::FrameRate::Auto) {
+        const double hz = xs().refresh_rate();
+        const int fps = interp::mode() == 1 ? interp::output_fps() : 0;
+        return g_started && hz > 0 && fps > 0 && double(fps) * 1.5 <= hz;
+    }
+    return g_started && (mode == vr::FrameRate::Half || mode == vr::FrameRate::Original);
+}
+// (the log: refreshes filled with the last frame again, not turned or moved, per 10 s)
+uint64_t& plain_fills() { static uint64_t n = 0; return n; }
+void planned_repeats() {
+    if (!g_started || !g_shown.valid || !g_shown.drawn || !g_shown.views.valid || !xs().running()) return;
+    // only in the low frame-rate modes (Capped 45, Steady 30: vr.frameRate half or original), never in Capped 90,
+    // Unlocked or Auto (asked for, 2026-11-12: "make sure we don't use this in 90 fps modes so our fps isn't impacted")
+    // (and Auto Mode while the game runs below the headset's rate: low_rate_repeats)
+    const double hz = xs().refresh_rate();
+    const int fps = interp::mode() == 1 ? interp::output_fps() : 30;
+    // (2026-11-14, a headset log in Auto Mode: the game held at 22.4-22.5 fps with interpolation aiming for 45 and 90, "3 a
+    // frame" filled, the GPU 5-11 % busy) In Auto Mode the count was the game's measured frame time (low_rate_repeats):
+    // each fill takes a refresh the render thread waits for, so 3 fills let the game start a frame only every 4th refresh,
+    // which measured as slow again: a trap from any slow patch (a stage loading). Now Auto Mode fills as Capped does, by
+    // the rate Auto has chosen (its interpolation's output: 90 none, 45 one a frame), never more than that gap. The
+    // measured pace still decides Auto's "below the headset's rate" (update_auto_low_hold, steady hands)
+    const int repeats = vr::config().frameRate == vr::FrameRate::Auto
+                            ? (hz > 0 && fps > 0 ? std::clamp(int(std::lround(hz / double(fps))) - 1, 0, 3) : 0)
+                            : low_rate_repeats(hz, fps);
+    if (repeats <= 0) return;
+    // (docs/VR_MOVING_OBJECTS_PLAN.md, "Separate small fix", 2026-11-14) not while the runtime's frame synthesis makes the
+    // in-between frames: the frame just shown carried both eyes' motion vectors (a Quest at 72 Hz, Capped 30 drawn at 36;
+    // Capped 45 at 90 Hz). Frames sent here carry none and would take the refreshes the runtime synthesizes, against its
+    // half-rate pacing. Depth only (PC SteamVR) never carries: its fills go on. Steady 30 at 90 or 120 Hz holds frame
+    // synthesis (vr_framesynth::set_held, with vr.frameSynthesis auto or on: the chosen 30 is kept, never raised to 45),
+    // so its frames carry nothing and its fills go on. The log: the first decision and each change, with the reason
+    {
+        static int paused = -1;
+        static uint64_t pausedFrames = 0, filledFrames = 0;
+        const bool synth = vr_framesynth::carrying();
+        if (int(synth) != paused) {
+            paused = int(synth);
+            LOG("[vr] refresh filling: %s (%.0f Hz, %d refreshes filled a game frame; since the start: %llu game frames "
+                "paused, %llu with fills on)",
+                synth ? "paused (the runtime's frame synthesis makes the in-between frames)"
+                : vr_framesynth::held() ? "on (frame synthesis held: the game under half the refresh rate, Steady 30 or "
+                                          "Auto Mode running slow; not raised to 45)"
+                                        : "on (no frame synthesis)",
+                hz, repeats, (unsigned long long)pausedFrames, (unsigned long long)filledFrames);
+        }
+        ++(synth ? pausedFrames : filledFrames);
+        if (synth) return;
+    }
+    const bool headSmooth = head_smoothing_wanted();
+    {
+        static const bool capture = [] {
+            const char* e = std::getenv("WWHD_VR_GENFRAME_CAPTURE");
+            return e && *e == '1';
+        }();
+        g_cap.on = capture;
+        if (g_cap.on && g_cap.wantNext) {  // (the set's last picture: the next real frame)
+            capture_real("d_next_real");
+            capture_notes();
+            g_cap.inSet = -1, g_cap.wantNext = false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (g_cap.on && turning_now() && g_cap.inSet < 0 && g_cap.sets < 4 && std::fabs(g_shown.turnRate) > 15.0f / 57.29578f &&
+            now - g_cap.last > std::chrono::seconds(4)) {
+            g_cap.inSet = ++g_cap.sets, g_cap.gens = 0, g_cap.last = now;
+            char line[256];
+            std::snprintf(line, sizeof line, "set %d: the stick turning at %.1f degrees a second (heading +: left)\n",
+                          g_cap.inSet, double(g_shown.turnRate) * 57.29578);
+            g_cap.notes = line;
+            capture_real("a_real");
+        }
+    }
+    // (2026-11-14, in the headset at Steady 30: "screen looks very jittery and jumpy when i move around or look around") Not
+    // turning or moving, the refreshes between the game's frames were left empty: the headset got 30 frames a second, and
+    // SteamVR's Motion Smoothing filled them (on in 96-98% of frames, switching on and off 8-11 times every 10 s in that
+    // run's log; the owner: "motion smoothing in steamvr is always worse for me and any tester that uses it"). Now every
+    // refresh gets a frame: the last game frame again at the views it was drawn with (show_again: nothing drawn or copied,
+    // the runtime turns it to the head as it does every frame), so the runtime never sees a slow app.
+    // WWHD_VR_FILL_REFRESHES=0 leaves them empty as before (a test start)
+    static const bool fill = [] {
+        const char* e = std::getenv("WWHD_VR_FILL_REFRESHES");
+        const bool on = !(e && *e == '0');
+        LOG("[vr] the refreshes between the game's frames at 30/45 fps: %s", on ? "each given the last frame again (the "
+            "runtime's Motion Smoothing not needed; WWHD_VR_FILL_REFRESHES=0: left empty)" : "left empty (WWHD_VR_FILL_REFRESHES=0)");
+        return on;
+    }();
+    if (!(headSmooth || turning_now() || moving_now() || fill)) {
+        if (g_cap.inSet >= 0 && !g_cap.wantNext) g_cap.inSet = -1;  // (the turn stopped before its frames)
+        return;
+    }
+    const bool motion = turning_now() || moving_now();
+    int shown = 0;
+    static uint64_t generated = 0, generationFailed = 0;
+    static float maxTurn = 0, maxMove = 0;
+    static uint64_t& g_plainFills = plain_fills();
+    maxTurn = std::max(maxTurn, std::fabs(g_shown.turnRate));
+    maxMove = std::max(maxMove, vr::length(g_shown.velocity));
+    for (int i = 0; i < repeats; ++i) {
+        if (headSmooth) {  // (Head movement smoothing: the eyes' movement since the real frame, warped by its depth)
+            const int g = show_generated(false, true);
+            if (g == 1) {
+                ++generated;
+                ++shown;
+                continue;
+            }
+            if (g == 0) {
+                ++generationFailed;
+                ++shown;
+                continue;
+            }
+        }
+        // (Turn smoothing: the turned copy with the near field held, by the scene's depth; WWHD_VR_TURN_NEAR_HOLD=0: the
+        // plain turned copy, the body turning with the world)
+        static const bool nearHold = [] {
+            const char* e = std::getenv("WWHD_VR_TURN_NEAR_HOLD");
+            // (off by default since a headset run the same day: "everything is worse now, we made the far view not work";
+            // WWHD_VR_TURN_NEAR_HOLD=1 tries it)
+            const bool on = e && *e == '1';
+            LOG("[vr] turn smoothing: %s", on ? "the body, hands, sword and shield held in its frames (WWHD_VR_TURN_NEAR_HOLD=0: "
+                                                "turned with the world)" : "the whole picture turned (the near field not held)");
+            return on;
+        }();
+        if (nearHold && turning_now()) {
+            const int g = show_generated(true);
+            if (g == 1) {
+                ++generated;
+                ++shown;
+                continue;
+            }
+            if (g == 0) {
+                ++generationFailed;
+                ++shown;
+                continue;
+            }
+        }
+        if (!show_again(motion, i + 1)) break;
+        ++shown;
+        if (!motion && !headSmooth) ++g_plainFills;
+    }
+    if (g_cap.inSet >= 0 && !g_cap.wantNext) g_cap.wantNext = true;
+    // (the log: frames shown again turned, every 10 s with any)
+    static uint64_t turned = 0, frames = 0;
+    static auto since = std::chrono::steady_clock::now();
+    turned += uint64_t(shown);
+    frames += 1;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(10)) {
+        LOG("[vr] turn smoothing (10 s): %llu frames between %llu game frames (%d a frame; %llu generated, %llu generations "
+            "failed, the rest turned copies, %llu of them plain fills with no turn or movement; the view turning at %.0f "
+            "degrees/s at most, moving at %.2f m/s at most)",
+            (unsigned long long)turned, (unsigned long long)frames, repeats, (unsigned long long)generated,
+            (unsigned long long)generationFailed, (unsigned long long)g_plainFills, double(maxTurn) * 57.29578, double(maxMove));
+        turned = frames = 0;
+        g_plainFills = 0;
+        generated = generationFailed = 0;
+        maxTurn = maxMove = 0;
+        since = now;
+    }
 }
 
 void shutdown() {

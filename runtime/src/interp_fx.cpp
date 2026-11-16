@@ -1725,7 +1725,15 @@ void trail_draw(Cpu* c, void (*orig)(Cpu*), uint32_t count, std::initializer_lis
 }  // namespace
 extern "C" void f_024142F0_orig(Cpu*);
 extern "C" void f_020CDF78_orig(Cpu*);
-extern "C" void hook_024142F0(Cpu* c) { trail_draw(c, f_024142F0_orig, 0x9C, {0xBC, 0x38C}); }
+#ifdef WWHD_VR
+namespace vr::game { bool sword_trail_hidden(); }
+#endif
+extern "C" void hook_024142F0(Cpu* c) {
+#ifdef WWHD_VR
+    if (vr::game::sword_trail_hidden()) return;  // (VR first person: the vertical slash's trail not drawn)
+#endif
+    trail_draw(c, f_024142F0_orig, 0x9C, {0xBC, 0x38C});
+}
 extern "C" void hook_020CDF78(Cpu* c) { trail_draw(c, f_020CDF78_orig, 0x98, {0xA8, 0x378, 0x648, 0x918}); }
 
 // The hookshot's chain (daHookshot_shape_draw 021768B0, from daHookshot_c::draw, every pass) is

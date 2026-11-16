@@ -95,6 +95,8 @@ struct Surface {
  // the overlap that last used it on the atlas's thread, and that last changed it on the render thread
  // (atlas_overlap.h, stage 2.6b)
  uint64_t atlasUse=0, sceneChange=0;
+ // (docs/VR_HANDS_LAYER_PLAN.md, Link's span) the span that used or changed it on the scene's thread (atlas_overlap.h hands_mark)
+ uint64_t handsUse=0, handsChange=0;
  uint64_t bPreRead=0;  // (docs/VR_SCENE_THREADS.md, "S6: B's reads deferred") the span whose start it is made readable at
  uint64_t frontUse=0, frontRenderUse=0, frontRenderChange=0;  // (docs/VR_SCENE_THREADS.md, S7) the overlap's marks
  const char* sceneChangeWhat=nullptr;  // (diagnostics) the render thread's last change of it in an overlap
@@ -125,6 +127,12 @@ struct Surface {
  // (docs/VR_DLSS.md, "Background motion") the value its depth was last cleared to (NaN: never; any thread records it
  // in order with its draws, read with std::atomic_ref): the motion pass's background draws are pinned to it
  float clearedDepth=__builtin_nanf("");
+ // (2026-11-11, mobile GPU paths: surfaces.cpp fold_clears_on) a whole-surface clear held back: the next pass that
+ // draws into all of it starts with loadOp CLEAR (no clear of its own, no load of the cleared image from memory on a
+ // tiled GPU); any other use records it first (flush_pending_clear, from transition_image). 0 none, 1 colour, 2 depth
+ uint8_t pendingClear=0;
+ VkImageAspectFlags pendingAspects=0;
+ VkClearValue pendingValue{};
 };
 struct SurfaceDesc { uint32_t addr=0,mipAddr=0,width=0,height=0,slices=1,pitch=0,mips=1,format=0,dim=1,tileMode=0,swizzle=0; bool isDepth=false;
                      gfx::SizeRequest sizeRequest; /* from the drawing pass (Surface::sizeClaim) */ };
@@ -257,6 +265,12 @@ struct Renderer {
  VkDriverId driverID=VkDriverId(0);  // (VkPhysicalDeviceDriverProperties; 0: unknown) e.g. Mesa Turnip vs Qualcomm's
  bool multiviewIndexing=false;  // (stage M4) the arrays a multiview shader indexes by gl_ViewIndex can be
  uint32_t maxMultiviewViews=0;
+ // (2026-11-11, foveation.cpp) VK_KHR_fragment_shading_rate by attachment, for the eye-sized two-eye passes: the map's
+ // texel (pixels a side, 16 or the nearest the device allows) and whether 4x4 blocks can be shaded (else 2x2 at most).
+ // (Not VK_EXT_fragment_density_map: on Quest that puts the driver in its tiled mode, AstroQuest's README: slower.)
+ bool fsr=false;
+ uint32_t fsrTexel=0;
+ bool fsr4x4=false;
  bool renderPasses=false;
  const char* renderingReason="not initialized";
  bool portabilitySubset=false,imageViewSwizzle=true,imageViewReinterpretation=true;
@@ -471,6 +485,13 @@ GpuScopeToken gpu_begin_feedback_scope(const Surface&);
 void gpu_end_feedback_scope(GpuScopeToken);
 bool narrow_barriers();
 void transition_buffer(Buffer&, VkPipelineStageFlags, VkAccessFlags);
+// (surfaces.cpp) held whole-surface clears: on, record one now (before any other use), and the pass begin's scope in which
+// its own switch to an attachment layout leaves a held clear for it to fold (draw.cpp)
+bool fold_clears_on();
+void flush_pending_clear(Surface*);
+struct FoldClearScope { FoldClearScope(); ~FoldClearScope(); FoldClearScope(const FoldClearScope&)=delete; };
+bool folding_clears_here();
+void note_clear_folded();
 void transition_image(Surface*,VkImageLayout,VkPipelineStageFlags stage=VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VkAccessFlags access=VK_ACCESS_MEMORY_READ_BIT|VK_ACCESS_MEMORY_WRITE_BIT);
 void forget_texture_views(int site = 1);
 void service_captures();

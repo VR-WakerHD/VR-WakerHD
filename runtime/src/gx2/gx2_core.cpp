@@ -10,6 +10,7 @@
 #include "../mods/fast_forward.h"
 #include "../mods/mod_actor_shadow_proof.h"
 #include "../per_thread.h"
+#include "../interp.h"
 #include "../platform/host.h"
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -597,6 +598,8 @@ static std::atomic<uint64_t> g_swaps_executed{0};  // swaps the render thread ha
 static int64_t steady_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+static void perf_split_log();
+static std::atomic<uint64_t> g_split_sync_ns{0}, g_split_sync_n{0}, g_split_exec_ns{0}, g_split_exec_max_ns{0};
 static void render_thread_main() {
     host::set_thread_name("GX2 render");
     // the game thread waits at its swap for depth-peek answers: wake this thread's command wait so it
@@ -677,10 +680,15 @@ static void render_thread_main() {
             g_q_work.swap(g_q_pending);
         }
         {
+            const auto t0 = std::chrono::steady_clock::now();
             std::lock_guard<std::recursive_mutex> lk(g_exec_mutex);
             render::with_autorelease_pool([] { execute(g_q_work.data(), (uint32)g_q_work.size()); });
+            const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+            g_split_exec_ns.fetch_add(ns, std::memory_order_relaxed);
+            if (ns > g_split_exec_max_ns.load(std::memory_order_relaxed)) g_split_exec_max_ns.store(ns, std::memory_order_relaxed);
         }
         g_q_work.clear();
+        perf_split_log();
     }
 }
 
@@ -704,7 +712,7 @@ static bool guarded(uint32 op, const uint32* p, uint32 n) {
     case OP_NOP: case OP_SET_REGS: case OP_COPY_TO_SCAN: case OP_EXPAND_COLOR: case OP_EXPAND_DEPTH: case OP_FLUSH:
     case OP_SWAP: case OP_SETUP_CONTEXT: case OP_FENCE: case OP_SET_PROJ_REGS: case OP_LAYOUT_ROOT:
     case OP_LAYOUT_CONTENT: case OP_CLOUDS_BEGIN: case OP_CLOUDS_END: case OP_SET_CONTEXT: case OP_INVALIDATE:
-    case OP_WEATHER_QUADS:
+    case OP_WEATHER_QUADS: case OP_VR_HANDS: case OP_VR_SKY:
         return false;
     case OP_DRAW_DONE: return n && p[0];  // (a full GPU wait reads linear targets back: save states)
     default: return true;
@@ -760,6 +768,26 @@ static void sync_stat(int site, std::chrono::steady_clock::duration waited) {
     memset(count, 0, sizeof count); memset(ns, 0, sizeof ns);
     t0 = now;
 }
+// (diagnostics, 2026-11-14: "In-between passes over their time": which thread is late) the game thread's time waiting
+// for the render thread here, and the render thread's time executing the queue (render_thread_main), summed always (a
+// clock read per wait and per batch) and logged with the passes every 10 s (perf_split_log)
+static void perf_split_log() {  // (render thread, after a batch)
+    static auto since = std::chrono::steady_clock::now();
+    static uint64_t passes0 = ::interp::pass_count();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since < std::chrono::seconds(10)) return;
+    since = now;
+    const uint64_t passes = ::interp::pass_count(), n = passes > passes0 ? passes - passes0 : 0;
+    passes0 = passes;
+    const double syncMs = g_split_sync_ns.exchange(0) / 1e6, execMs = g_split_exec_ns.exchange(0) / 1e6;
+    const uint64_t waits = g_split_sync_n.exchange(0);
+    const double execMax = g_split_exec_max_ns.exchange(0) / 1e6;
+    if (!n) return;
+    LOG("[perf split] (10 s) %llu passes: the game thread waited for the render thread %.2f ms a pass (%llu waits); the "
+        "render thread executed %.2f ms a pass (its longest batch %.2f ms; this includes the headset's frame wait and the "
+        "refresh fills, logged in [vr] timing)", (unsigned long long)n, syncMs / double(n), (unsigned long long)waits,
+        execMs / double(n), execMax);
+}
 static void render_sync(int site = kSyncShutdown) {
     if (!g_render_thread) return;
     const auto started = std::chrono::steady_clock::now();
@@ -768,6 +796,9 @@ static void render_sync(int site = kSyncShutdown) {
         std::chrono::steady_clock::time_point t;
         ~Done() {
             const auto waited = std::chrono::steady_clock::now() - t;
+            g_split_sync_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+                                      std::memory_order_relaxed);
+            g_split_sync_n.fetch_add(1, std::memory_order_relaxed);
             sync_stat(site, waited);
             if (rprof::enabled())
                 rprof::add_sync(site == kSyncDrawDone ? rprof::kSyncDrawDone : site == kSyncCopySurface ? rprof::kSyncCopySurface
@@ -1593,6 +1624,67 @@ static void index_run_flush() {
         g_irunFrame0 = frame;
     }
 }
+// ---- (VR fork, docs/VR_HANDS_LAYER_PLAN.md step 1) Link's draw lists, bracketed by OP_VR_HANDS: the draws inside
+// counted ("[vr hands] (10 s)"); WWHD_VR_HANDS_SKIP=1 leaves them out (a check of what the lists hold: what vanishes)
+static int g_handsDepth = 0;
+static bool g_layoutFullGx = false;  // (OP_LAYOUT_CONTENT 4th word: a whole-screen picture, OP_SET_PROJ_REGS)
+static uint64_t g_handsDraws = 0, g_handsLists[4] = {}, g_handsSwapsSeen = 0;
+extern "C" void wwhd_vr_hands_exec_depth(int depth);  // (draw.cpp hands_layer: the render thread draws them)
+// (2026-11-14, the Tower of the Gods' black figurehead and rope at 30/45 fps) the rest of Link's lists (the boat's
+// figurehead and rope, drawn before his own packets, j3d_draw_guard draw_link_list): OP_VR_HANDS 0x10 | list begins,
+// 0x10 ends. Not his (not into the hands image) but drawn in order, one by one, as his are (hands_layer::dispatch_inside):
+// a headset test run with phases had them, and his own, solid black whenever his split lists went through the batched
+// runs and the second drawing thread (4 of 6 pictures), clean with the one-by-one handling
+static int g_handsOrderDepth = 0;
+static uint64_t g_handsOrderDraws = 0;  // (diagnostics: draws inside the rest of his lists' in-order bracket)
+static void vr_hands_marker(uint32_t which) {
+    if (which & 0x10) {
+        if (which & 0xF) ++g_handsOrderDepth;
+        else if (g_handsOrderDepth) --g_handsOrderDepth;
+        // (a part on the scene's thread: the second drawing thread does not start in one with them, as with his)
+        const uint32_t w[1] = {uint32_t(g_handsDepth)};
+        if (!render::hand_draw_state(render::kStateHands, w, 1)) wwhd_vr_hands_exec_depth(g_handsDepth);
+        return;
+    }
+    const int was = g_handsDepth;
+    if (which) {
+        ++g_handsDepth;
+        if (which < 4) ++g_handsLists[which];
+    } else if (g_handsDepth) {
+        --g_handsDepth;
+    }
+    // (2026-11-13: no join any more, "never more work on the render thread") the depth goes to whichever thread draws
+    // the draws around it: the scene's thread while a part runs (in order with them), else the render thread
+    if (g_handsDepth != was) {
+        const uint32_t w[1] = {uint32_t(g_handsDepth)};
+        if (!render::hand_draw_state(render::kStateHands, w, 1)) wwhd_vr_hands_exec_depth(g_handsDepth);
+    }
+    static auto since = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - since >= std::chrono::seconds(10)) {
+        LOG("[vr hands] (10 s): Link's opaque list drawn %llu times, the other %llu, his P0 list %llu; %llu draws inside them; "
+            "%llu draws of the rest of his lists in order (the boat's fix)",
+            (unsigned long long)g_handsLists[1], (unsigned long long)g_handsLists[2], (unsigned long long)g_handsLists[3],
+            (unsigned long long)g_handsDraws, (unsigned long long)g_handsOrderDraws);
+        g_handsOrderDraws = 0;
+        g_handsDraws = g_handsLists[1] = g_handsLists[2] = g_handsLists[3] = 0;
+        since = now;
+    }
+}
+// (the renderer, draw.cpp hands_layer: a draw inside Link's lists now)
+extern "C" bool wwhd_vr_hands_bracket_active() { return g_handsDepth > 0 || g_handsOrderDepth > 0; }
+// (his own packets only, not the rest of his lists: his span on the scene's thread takes only these)
+extern "C" bool wwhd_vr_hands_own_bracket_active() { return g_handsDepth > 0; }
+// true: the draw is left out (WWHD_VR_HANDS_SKIP=1 inside Link's lists)
+static bool vr_hands_draw() {
+    if (!g_handsDepth) {
+        if (g_handsOrderDepth) ++g_handsOrderDraws;
+        return false;
+    }
+    ++g_handsDraws;
+    static const bool skip = [] { const char* e = getenv("WWHD_VR_HANDS_SKIP"); return e && *e == '1'; }();
+    return skip;
+}
 // ---- weather quads (VR fork, weather_quads.cpp; docs/VR_PERFORMANCE.md, "Weather quads"): between OP_WEATHER_QUADS
 // 1 and 0 (the weather packets' draw functions), consecutive draws with the same arguments (a small indexed strip or
 // triangle list, one instance, base vertex 0) join a run while the only registers written between them are attribute
@@ -2060,8 +2152,14 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         if (g_regStats && n) reg_stats_note(p[0], p + 1, n - 1);
         apply_regs(p[0], p + 1, n - 1);
         break;
-    case OP_DRAW: if (!test_skip_batchable()) held_or_draw(op, p, n); break;
-    case OP_DRAW_INDEXED: if (!test_skip_batchable()) held_or_draw(op, p, n); break;
+    case OP_DRAW:
+        if (vr_hands_draw()) break;
+        if (!test_skip_batchable()) held_or_draw(op, p, n);
+        break;
+    case OP_DRAW_INDEXED:
+        if (vr_hands_draw()) break;
+        if (!test_skip_batchable()) held_or_draw(op, p, n);
+        break;
     case OP_CLEAR_COLOR: {
         const uint32* q = p + kColorBufferWords;
         float rgba[4] = {bitsf(q[0]), bitsf(q[1]), bitsf(q[2]), bitsf(q[3])};
@@ -2145,9 +2243,16 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
             if (stereo::ui_layer_on()) stereo::ui_layer_factors(aspect::game(), kx, ky);
 #ifdef WWHD_VR
             // VR menu scenes: the layouts drawn smaller around the centre, as if farther away (vr::layout_scale)
-            const float vrScale = vr::layout_scale();
-            kx /= vrScale;
-            ky /= vrScale;
+            // (2026-11-14) not a whole-screen picture (a picture transition's frozen frame): it covers the whole image,
+            // cropped at its long sides; shrunk to the cutscene text's third it was a small window in opaque black
+            if (g_layoutFullGx && stereo::ui_layer_on()) {
+                const float m = std::max(kx, ky);
+                if (m > 0) kx /= m, ky /= m;
+            } else {
+                const float vrScale = vr::layout_scale();
+                kx /= vrScale;
+                ky /= vrScale;
+            }
 #endif
             for (int i = 0; i < 4; i++) {  // rows x and y: the 16:9 layout space centred in the wider picture
                 v[i] = fbits(bitsf(v[i]) / kx);
@@ -2156,9 +2261,9 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
 #ifdef WWHD_VR
             // VR conversations and cutscenes: the text moved up or down (y += dy * w: a shift in the picture), and
             // across (x += dx * w) while a conversation's text is held in the world in first person
-            if (const float dy = vr::layout_offset_y(); dy != 0.0f)
+            if (const float dy = g_layoutFullGx ? 0.0f : vr::layout_offset_y(); dy != 0.0f)
                 for (int i = 0; i < 4; i++) v[4 + i] = fbits(bitsf(v[4 + i]) + dy * bitsf(v[12 + i]));
-            if (const float dx = vr::layout_offset_x(); dx != 0.0f)
+            if (const float dx = g_layoutFullGx ? 0.0f : vr::layout_offset_x(); dx != 0.0f)
                 for (int i = 0; i < 4; i++) v[i] = fbits(bitsf(v[i]) + dx * bitsf(v[12 + i]));
 #endif
         }
@@ -2173,6 +2278,8 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         break;
     }
     case OP_LAYOUT_CONTENT:
+        // (VR fork, 2026-11-14) a whole-screen picture (4th word): its projection fills the UI layer (OP_SET_PROJ_REGS)
+        g_layoutFullGx = n >= 4 && p[3] != 0;
         // (stage S5) on the scene's thread while it records the scene; the machine's full state change stays here, and is
         // forwarded to it after the handed state, as it would follow it here
         if (render::hand_draw_state(render::kStateLayoutContent, p, n)) {
@@ -2184,6 +2291,7 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
         }
         aspect::set_content_clip(n && p[0]);
         if (n >= 2) stereo::layout_draw(p[1] != 0);
+        stereo::layoutFull = g_layoutFullGx;
         // A photo pane samples the canonical captured image. Changing that
         // policy invalidates continued texture bindings, even with identical registers.
         if (const bool photo = n >= 3 && p[2]; photo != stereo::layoutPhotograph) {
@@ -2219,6 +2327,17 @@ static void execute_op(Op op, const uint32* p, uint32 n) {
     case OP_FRAMEGEN_CAMERA:
         if (render::g_backend->framegen_camera) render::g_backend->framegen_camera(p, n);
         break;
+    case OP_VR_HANDS:
+        vr_hands_marker(n ? p[0] : 0);
+        break;
+    case OP_VR_SKY: {  // (the sky at infinity, stereo::sky_draw) to whichever thread draws the draws around it
+        static unsigned depth = 0;
+        if (n && p[0]) ++depth;
+        else if (depth) --depth;
+        const uint32_t w[1] = {depth};
+        if (!render::hand_draw_state(render::kStateSky, w, 1)) stereo::skyDepth = depth;
+        break;
+    }
     case OP_WEATHER_QUADS:  // (weather quads, weather_quads.cpp: the run held is drawn by held_before)
         if (n && p[0]) ++g_weatherDepth, ++g_wMarkers;
         else if (g_weatherDepth) --g_weatherDepth;
@@ -2300,6 +2419,8 @@ uint64_t swaps_in_flight() {
     const uint64_t issued = __atomic_load_n(&g_swap_count, __ATOMIC_RELAXED), done = g_swaps_executed.load();
     return issued > done ? issued - done : 0;
 }
+uint64_t swaps_executed() { return g_swaps_executed.load(); }
+uint64_t swaps_issued() { return __atomic_load_n(&g_swap_count, __ATOMIC_RELAXED); }
 }  // namespace gx2
 static uint32 g_swap_interval = 1;  // as set by the game (frame interpolation halves it)
 namespace interp { uint32_t effective_swap_interval(uint32_t game); uint64_t logic_steps(); uint32_t vsync_granule_ticks(); uint64_t step_ticks(uint32_t game); bool paced_step_schedule(); int64_t frame_interval_ns(); }

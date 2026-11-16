@@ -55,9 +55,13 @@
 #include "vr/vr_bindings.h"
 #include "vr/vr_config.h"
 #include "vr/vr_settings_file.h"
+#include "steamvr_binding.h"
+#include <fstream>
+#include <sstream>
 
 #ifdef _WIN32
 #include <windows.h>
+#include <tlhelp32.h>
 #else
 #include <dlfcn.h>
 #endif
@@ -281,20 +285,50 @@ bool run_game_probe(const std::string& exe, const char* flag, const std::string&
 // The headset's refresh rate from the game program (`wwhd --vr-refresh-probe`, vr/vr_probe.cpp): OpenXR tells it only
 // to a running session, which the game's own code starts. Only the game itself: the release's program starts the game.
 // true with `hz` (and `offered`) read, else `error` says why
+#ifdef __ANDROID__
+bool android_call(const char* method, const std::vector<std::string>* args);
+#endif
 bool probe_refresh_rate(const std::string& exe, float& hz, std::vector<float>& offered, int& streamed, std::string& error) {
     streamed = -1;  // (not said: an older game program)
+    std::string line;
 #ifdef __ANDROID__
-    (void)exe; (void)hz; (void)offered;
-    error = "not on Android yet: the game asks the headset for the chosen rate when it starts";
-    return false;
+    // (2026-11-12, Quest 3 / 3S: Detect Headset found the headset but never its refresh rate) the game activity, started
+    // for the probe only (VrLauncherActivity.probeRefreshRate: the launcher stays open behind it), runs the same short
+    // session as on a PC and writes its answer line to this file (vr/vr_probe.cpp), then its process ends
+    (void)exe;
+    // (absolute: the game's process starts in another folder)
+    std::error_code ec;
+    const std::string out = std::filesystem::absolute(host::config_dir() + "/vr-refresh-probe.txt", ec).string();
+    std::filesystem::remove(out, ec);
+    const std::vector<std::string> args = {"--vr-refresh-probe", "--vr-refresh-probe-out", out};
+    if (!android_call("probeRefreshRate", &args)) {
+        error = "the game could not be started to read the refresh rate";
+        return false;
+    }
+    // 40 s at most (the probe gives up after 15 s without a running session; the activity has to start first)
+    const Uint64 until = SDL_GetTicks() + 40000;
+    std::string text;
+    while (SDL_GetTicks() < until) {
+        text = read_text(out);
+        if (text.find('\n') != std::string::npos) break;
+        SDL_Delay(200);
+    }
+    const std::string prefix = "vr-refresh-probe: ";
+    const size_t at = text.rfind(prefix);
+    if (at == std::string::npos) {
+        error = "the game did not answer (put the headset on, then Detect Headset again)";
+        return false;
+    }
+    line = text.substr(at + prefix.size());
+    while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) line.pop_back();
 #else
     if (exe.empty() || !is_game_itself(exe)) {
         error = "the game program (wwhd) was not found next to the launcher, so the rate could not be read";
         return false;
     }
     // 30 s at most (it gives up after 15 s without a session)
-    std::string line;
     if (!run_game_probe(exe, "--vr-refresh-probe", "vr-refresh-probe", 30, line, error)) return false;
+#endif
     if (!line.compare(0, 6, "error=")) {
         error = line.substr(6);
         return false;
@@ -318,7 +352,6 @@ bool probe_refresh_rate(const std::string& exe, float& hz, std::vector<float>& o
     }
     if (const size_t st = line.find("streamed="); st != std::string::npos) streamed = line[st + 9] == '1' ? 1 : 0;
     return true;
-#endif
 }
 
 void* open_loader() {
@@ -976,6 +1009,133 @@ void apply_detected_refresh() {
     g_probe.refreshMessage = message;
 }
 
+#ifndef __ANDROID__
+// ---- PS VR2 Sense controllers: the game's binding set in SteamVR (steamvr_binding.h, docs/VR_CONTROLS.md)
+std::string g_psvr2Message;
+bool steamvr_running() {
+    static const char* kNames[] = {"vrserver", "vrmonitor", "vrcompositor", "vrdashboard"};
+#ifdef _WIN32
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof pe;
+    bool found = false;
+    for (BOOL more = Process32FirstW(snap, &pe); more && !found; more = Process32NextW(snap, &pe)) {
+        std::wstring n = pe.szExeFile;
+        for (auto& ch : n) ch = wchar_t(towlower(ch));
+        for (const char* k : kNames) {
+            std::wstring w(k, k + std::strlen(k));
+            if (n == w + L".exe") found = true;
+        }
+    }
+    CloseHandle(snap);
+    return found;
+#else
+    std::error_code ec;
+    for (const auto& d : std::filesystem::directory_iterator("/proc", ec)) {
+        std::ifstream f(d.path() / "comm");
+        std::string n;
+        if (f && std::getline(f, n))
+            for (const char* k : kNames)
+                if (n == k || n == std::string(k) + ".sh") return true;
+    }
+    return false;
+#endif
+}
+// Steam's config folder (where steamvr.vrsettings is), empty if not found
+std::filesystem::path steam_config_dir() {
+    std::vector<std::filesystem::path> tries;
+#ifdef _WIN32
+    wchar_t buf[1024];
+    DWORD size = sizeof buf;
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\Valve\Steam", L"SteamPath", RRF_RT_REG_SZ, nullptr, buf, &size) ==
+        ERROR_SUCCESS)
+        tries.push_back(std::filesystem::path(buf) / "config");
+    tries.push_back("C:/Program Files (x86)/Steam/config");
+#else
+    if (const char* home = std::getenv("HOME")) {
+        tries.push_back(std::filesystem::path(home) / ".local/share/Steam/config");
+        tries.push_back(std::filesystem::path(home) / ".steam/steam/config");
+    }
+#endif
+    std::error_code ec;
+    for (const auto& t : tries)
+        if (std::filesystem::exists(t / "steamvr.vrsettings", ec)) return t;
+    return {};
+}
+// writes the binding next to the game and points SteamVR at it; the message says what happened
+void set_psvr2_binding(const std::string& gameExe) {
+    namespace fs = std::filesystem;
+    if (gameExe.empty() || !fs::exists(gameExe)) {
+        g_psvr2Message = "The game was not found: choose it first (Game folder).";
+        return;
+    }
+    if (steamvr_running()) {
+        g_psvr2Message = "SteamVR is running: close SteamVR first (it writes its settings back when it exits), then press "
+                         "this again.";
+        return;
+    }
+    const fs::path config = steam_config_dir();
+    if (config.empty()) {
+        g_psvr2Message = "SteamVR's settings were not found (start SteamVR once, close it, then press this again).";
+        return;
+    }
+    const std::string key = steamvr_binding::app_key(fs::path(gameExe).filename().string());
+    const fs::path bindingDir = fs::path(gameExe).parent_path() / "steamvr";
+    const fs::path bindingFile = bindingDir / "wwhd_psvr2_sense_binding.json";
+    std::error_code ec;
+    fs::create_directories(bindingDir, ec);
+    {
+        std::ofstream f(bindingFile, std::ios::binary);
+        f << steamvr_binding::binding_file(key);
+        if (!f) {
+            g_psvr2Message = "Could not write " + bindingFile.string();
+            return;
+        }
+    }
+    const fs::path settings = config / "steamvr.vrsettings";
+    std::string text;
+    {
+        std::ifstream f(settings, std::ios::binary);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        text = ss.str();
+    }
+    std::string out, error;
+    bool changed = false;
+    if (!steamvr_binding::set_binding(text, key, steamvr_binding::file_url(fs::absolute(bindingFile).string()), out, error,
+                                      changed)) {
+        g_psvr2Message = error + ": nothing changed.";
+        return;
+    }
+    if (!changed) {
+        g_psvr2Message = "Already set: SteamVR uses the game's PS VR2 binding.";
+        return;
+    }
+    fs::copy_file(settings, config / "steamvr.vrsettings.wwhd-backup", fs::copy_options::overwrite_existing, ec);
+    {
+        std::ofstream f(settings, std::ios::binary);
+        f << out;
+        if (!f) {
+            g_psvr2Message = "Could not write SteamVR's settings (" + settings.string() + ")";
+            return;
+        }
+    }
+    g_psvr2Message = "Set: SteamVR uses the game's PS VR2 binding (Create is the menu) the next time it starts. The settings "
+                     "before are kept in steamvr.vrsettings.wwhd-backup.";
+}
+void psvr2_section() {
+    ImGui::SeparatorText("PS VR2 Sense controllers (SteamVR)");
+    if (ImGui::Button("Use the game's PS VR2 controller binding")) set_psvr2_binding(find_game(S.gameExe));
+    if (!g_psvr2Message.empty()) ImGui::TextWrapped("%s", g_psvr2Message.c_str());
+    help("SteamVR has no controller profile of its own for the PS VR2 Sense controllers and maps the game's buttons onto "
+         "them; with nothing saved for the game it leaves the menu on a button they do not have. This points SteamVR at "
+         "the game's binding (triggers L2/R2, grips L1/R1, Square/Cross and Triangle/Circle the face buttons, Create the "
+         "menu), written next to the game in steamvr\. SteamVR must be closed. SteamVR > Settings > Controllers > Manage "
+         "controller bindings changes it back.");
+}
+#endif
+
 // Detect Headset: what the last check found, and its button (General tab, on every platform)
 void headset_section() {
     {
@@ -1004,6 +1164,7 @@ void headset_section() {
          "read the refresh rate it runs at. That rate is then selected (Graphics) with the frame rate capped at it "
          "(Capped 90 FPS at 90 Hz). A found headset is not yet a running VR session: the game starts that, and says in "
          "its log ([vr] lines) and settings overlay whether it runs.");
+    psvr2_section();
 #endif
 }
 
@@ -1041,7 +1202,7 @@ void tab_general() {
         const bool there = std::filesystem::is_regular_file(std::filesystem::u8path(dir) / "code" / "cking.rpx", ec);
         ImGui::TextWrapped("Game folder: %s", dir.c_str());
         if (there) ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1), "The game's files are there.");
-        else ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "No game files there yet: extract them in the Install game tab, or "
+        else ImGui::TextColored(ImVec4(1, 0.6f, 0.4f, 1), "No game files there yet: extract them in the Extract Game tab, or "
                                                           "use the app's setup.");
     }
     ImGui::SeparatorText("Headset");
@@ -1068,7 +1229,7 @@ void tab_general() {
     std::snprintf(buf, sizeof buf, "%s", S.gameDir.c_str());
     if (ImGui::InputText("Game files (--game)", buf, sizeof buf)) S.gameDir = buf;
     help("Only for a game built from source (wwhd): the folder with code, content and meta. A release's own program knows it. "
-         "No game folder yet? The Install game tab extracts it from your disc image or Cemu archive and sets it here.");
+         "No game folder yet? The Extract Game tab extracts it from your disc image or Cemu archive and sets it here.");
     if (ImGui::Button("Open the settings folder")) {
         const std::string dir = utf8(std::filesystem::u8path(settings_path()).parent_path());
         std::error_code ec;
@@ -1177,6 +1338,16 @@ void tab_camera() {
     ImGui::Checkbox("Hide Link's arms", &c.hideArms);
     help("First person: his arms are not drawn, his hands (and whatever is in them) are. With Hide Link's body as well, "
          "only the hands are left. Also in the game: F1 > VR.");
+    ImGui::Checkbox("Free shield rotation", &c.shieldFreeRotation);
+    help("On (the default): the shield turns with your hand, rolling and twisting with the wrist. Off: it stays upright, "
+         "flush with the body, and only turns to where the controller points. Also in the game: F1 > VR.");
+    {
+        bool look = c.moveDirection == vr::MoveDirection::Head;
+        if (ImGui::Checkbox("Move where you look", &look))
+            c.moveDirection = look ? vr::MoveDirection::Head : vr::MoveDirection::LeftHand;
+        help("On (the default): pushing the left stick forward walks Link the way your head faces. Off: he walks the way "
+             "the left controller points, so you can look around while you walk. Also in the game: F1 > VR.");
+    }
     help("The field of view is always your headset's own; it is not a setting.");
     if (restore_button("camera")) {
         const vr::Config d;
@@ -1186,13 +1357,29 @@ void tab_camera() {
         c.showBody = d.showBody;
         c.hideBody = d.hideBody;
         c.hideArms = d.hideArms;
+        c.shieldFreeRotation = d.shieldFreeRotation;
+        c.moveDirection = d.moveDirection;
     }
     tab_wrist_displays(c);
     ImGui::SeparatorText("Comfort");
     choice("Turning", c.turn, {"Snap", "Smooth"});
     if (c.turn == vr::Turn::Snap) slider("Snap angle", "vr.snapDegrees", c.snapDegrees, "%.0f degrees");
     else slider("Turn speed", "vr.smoothDegreesPerSecond", c.smoothDegreesPerSecond, "%.0f degrees/s");
-    choice("Movement direction", c.moveDirection, {"Where you look", "Where the left controller points"});
+    ImGui::Checkbox("Smooth Camera while Turning", &c.turnSmoothing);
+    help("On (the default): while the view turns at 30 or 45 fps, the headset's refreshes between the game's frames show the "
+         "last one turned on, so stick turns are as smooth as head turns. Off: the view's turn steps at the frame rate. Virtual "
+         "Desktop: set its Synchronous Spacewarp off (not automatic), or it can replace these frames with its own, which don't "
+         "follow the stick. Also in the game: F1 > VR.");
+    ImGui::Checkbox("Steady hands while turning", &c.handsLayer);
+    help("On (the default): with Smooth Camera while Turning, Link's hands, sword, shield and what he holds are sent to the headset "
+         "as a layer of their own, so they stay steady while the world turns. Only at 30 and 45 fps; nothing runs at a real "
+         "90. Off: his hands turn with the world. Also in the game: F1 > VR.");
+    ImGui::Checkbox("Head movement smoothing", &c.headSmoothing);
+    help("Off by default (experimental). At 45 or 36 fps (below the headset's refresh rate), every refresh between the "
+         "game's frames gets the last frame moved by how far your eyes moved, using its depth, so near things (Link's "
+         "arms, the sword, close walls) no longer step back and forth as you look around. For any headset, wired or "
+         "streamed; it does not need Streaming optimal. Nothing at the full refresh rate. Applies at once. Also in the "
+         "game: F1 > VR.");
     slider("Movement speed", "vr.moveSpeed", c.moveSpeed, "%.2fx");
     slider("Body turns after", "vr.bodyFollowDegrees", c.bodyFollowDegrees, "%.0f degrees");
     help("Standing still in first person, Link turns to face where you look once your head has turned this far from "
@@ -1208,7 +1395,10 @@ void tab_camera() {
     if (restore_button("comfort")) {
         const vr::Config d;
         c.turn = d.turn; c.snapDegrees = d.snapDegrees; c.smoothDegreesPerSecond = d.smoothDegreesPerSecond;
-        c.moveDirection = d.moveDirection; c.moveSpeed = d.moveSpeed; c.bodyFollowDegrees = d.bodyFollowDegrees;
+        c.turnSmoothing = d.turnSmoothing;
+        c.handsLayer = d.handsLayer;
+        c.headSmoothing = d.headSmoothing;
+        c.moveSpeed = d.moveSpeed; c.bodyFollowDegrees = d.bodyFollowDegrees;
         c.spinCamera = d.spinCamera;
         c.spinSpeed = d.spinSpeed;
     }
@@ -1220,12 +1410,16 @@ void tab_controls() {
     ImGui::Checkbox("Left-handed (sword in the left hand)", &c.leftHanded);
     slider("Stick dead zone", "vr.stickDeadZone", c.stickDeadZone, "%.2f");
     ImGui::SeparatorText("Wind Waker");
+    ImGui::Checkbox("Start the song by itself (first person)", &c.batonAutoStart);
+    help("1.5 s after you raise the Wind Waker, change the beat or finish a measure, the song starts as if you had played "
+         "its first note. Off: it starts with your first note, as in the game.");
     ImGui::Checkbox("Conduct with your hands too", &c.batonHands);
     slider("Hand reach for a direction", "vr.batonHandReach", c.batonHandReach, "%.2f m");
+    slider("Song screen size", "vr.batonUiSize", c.batonUiSize, "%.2fx");
     help("While conducting, the left stick plays the notes and the right stick the beat, as on the GamePad. With "
-         "this on, the hand holding the wand (the sword hand) plays the notes and the other hand the beat, held up, "
-         "down, left or right of where it was when conducting began (a stick pushed wins over its hand). The notes "
-         "need 85 % of the reach, at the wand's tip, or a quick flick that way; the wand hand's trigger holds the middle note.");
+         "this on, the hand holding the wand (the sword hand) plays the notes with 8 cm strokes up, down, left or right "
+         "(its trigger holds the middle note), and the other hand sets the beat by where it is across your body: out, "
+         "middle or in, three bands each twice the reach wide (a stick pushed wins over its hand).");
     ImGui::SeparatorText("Buttons: which GamePad button each controller input presses");
     help("Sword hand = the right controller (left when left-handed). The game decides what a button does where (A talks, "
          "opens, picks up; ZL targets; ZR shields...).");
@@ -1326,11 +1520,12 @@ std::string auto_pick_text() {
     }
     std::string s = "Auto on this device: ";
 #if defined(__ANDROID__)
-    if (!checked) return s + "press Detect Headset (General) to see (Quest Super Resolution on a Quest, else SGSR1).";
-    s += superResolution ? "Quest Super Resolution (the runtime offers it)" : "SGSR1 (the runtime has no Quest Super Resolution)";
+    if (!checked) return s + "press Detect Headset (General) to see (CAS on a standalone headset).";
+    (void)superResolution;
+    s += "CAS (a standalone headset: the game's own sharpening, once a frame)";
 #elif defined(WWHD_STEAM_FRAME_NATIVE) || defined(__aarch64__)
     (void)superResolution;
-    s += "SGSR1 (standalone arm64 headset)";
+    s += "CAS (standalone arm64 headset: the game's own sharpening, once a frame)";
     if (!checked) return s + ". Detect Headset (General) checks frame synthesis.";
 #else
     (void)superResolution;
@@ -1349,16 +1544,17 @@ void tab_graphics_upscaling() {
         // the choices shown (DLSS is not one: docs/VR_DLSS.md; a saved "dlss" shows and runs as Auto)
         static const vr::upscale::Mode kModes[] = {vr::upscale::Mode::Auto, vr::upscale::Mode::Off,
                                                    vr::upscale::Mode::Sgsr1, vr::upscale::Mode::SuperResolution,
-                                                   vr::upscale::Mode::Sgsr2, vr::upscale::Mode::Fsr1};
+                                                   vr::upscale::Mode::Sgsr2, vr::upscale::Mode::Fsr1,
+                                                   vr::upscale::Mode::Cas};
         static const char* const kUpscalers[] = {"Auto", "Off", "SGSR1 (Snapdragon Game Super Resolution)",
                                                  "Quest Super Resolution", "SGSR2 (temporal, Snapdragon)",
-                                                 "FSR 1 (AMD FidelityFX)"};
+                                                 "FSR 1 (AMD FidelityFX)", "CAS (contrast adaptive sharpening)"};
         int u = 0;
         for (int i = 0; i < int(std::size(kModes)); ++i)
             if (kModes[i] == c.upscaler) u = i;
         if (ImGui::Combo("VR upscaling", &u, kUpscalers, int(std::size(kUpscalers)))) c.upscaler = kModes[u];
         help("How each eye's picture is scaled up to the headset's resolution. Off by default on PC VR (Windows, Linux), Auto on standalone headsets. Auto picks the best this device offers: "
-             "Quest Super Resolution on a Quest, else SGSR1 where the picture is upscaled (the Steam Frame, a PC). A choice the device does not offer falls back to the "
+             "CAS on a standalone headset (Quest, Steam Frame: the game's own sharpening, once a frame), else SGSR1 where the picture is upscaled (the Steam Frame, a PC). A choice the device does not offer falls back to the "
              "plain scaling. The game shows what is in use in F1 > VR. SGSR2 (by choice only): Qualcomm's temporal "
              "upscaler for Quest and Steam Frame: the game's motion vectors and the previous frames give more detail and "
              "steadier edges, at a higher cost; fast motion can leave trails.");
@@ -1366,6 +1562,15 @@ void tab_graphics_upscaling() {
         if (c.upscaler == vr::upscale::Mode::Sgsr1 || c.upscaler == vr::upscale::Mode::Auto) {
             ImGui::SliderFloat("SGSR1 sharpness", &c.upscaleSharpness, 1.0f, 2.0f, "%.2f");
             help("SGSR1's edge sharpening: 1 soft, 2 Qualcomm's default.");
+        }
+        if (c.upscaler == vr::upscale::Mode::Cas || c.upscaler == vr::upscale::Mode::Auto) {
+            ImGui::SliderFloat("CAS sharpness", &c.casSharpness, 0.0f, 1.0f, "%.2f");
+            ImGui::Checkbox("Edge smoothing (FXAA)", &c.casFxaa);
+            help("Smooths the stair-stepped edges of shapes before CAS sharpens the picture (sharpening is kept off the "
+                 "edges it smoothed). Costs about 0.5-1 ms of the GPU a frame. On by default on a Quest. Also in the game: "
+                 "F1 > VR.");
+            help("CAS (contrast adaptive sharpening; Auto on a Quest): 0 soft, 1 strongest, 0.5 the default. Drawn once "
+                 "a frame, cheaper than Quest Super Resolution, which the headset runs at every refresh.");
         }
         if (c.upscaler == vr::upscale::Mode::Fsr1) {
             ImGui::SliderFloat("FSR 1 sharpening (stops softer)", &c.fsrSharpness, 0.0f, 2.0f, "%.2f");
@@ -1408,6 +1613,7 @@ void tab_graphics_upscaling() {
     if (restore_button("upscaling")) {
         const vr::Config d;
         c.upscaler = d.upscaler; c.upscaleSharpness = d.upscaleSharpness; c.fsrSharpness = d.fsrSharpness;
+        c.casSharpness = d.casSharpness; c.casFxaa = d.casFxaa;
         c.frameSynthesis = d.frameSynthesis;
         c.dynamicResolution = d.dynamicResolution; c.dynresMin = d.dynresMin; c.dynresMax = d.dynresMax;
         c.dynresGpuTarget = d.dynresGpuTarget; c.dynresSettle = d.dynresSettle;
@@ -1483,15 +1689,6 @@ void tab_graphics() {
                  "decides which rates it offers; the game's settings overlay shows the rate it runs)."
                : "This runtime does not let applications choose: the headset runs at the rate set in the runtime's own "
                  "settings (SteamVR: Settings > Video). Choose that rate here (Detect Headset does).");
-    if (slider("Headset resolution", "vr.renderScale", c.renderScale, "%.2fx of the headset's size (the eye pictures)"))
-        c.renderScale = vr::snap_headset_resolution(c.renderScale);
-    for (size_t i = 0; i < std::size(vr::kHeadsetResolutionPresets); ++i) {
-        const float p = vr::kHeadsetResolutionPresets[i];
-        char label[24];
-        std::snprintf(label, sizeof label, "%.2fx##headsetres", double(p));
-        if (i) ImGui::SameLine();
-        if (ImGui::RadioButton(label, std::fabs(c.renderScale - p) < 0.001f)) c.renderScale = p;
-    }
     if (ImGui::BeginCombo("VR frame rate", vr::frame_rate_name(c.frameRate, int(c.refreshRate)).c_str())) {
         for (const auto& r : vr::frame_rate_choices(int(c.refreshRate)))
             if (ImGui::Selectable(r.name.c_str(), r.rate == c.frameRate)) c.frameRate = r.rate;
@@ -1501,6 +1698,48 @@ void tab_graphics() {
          "on a streamed headset with Streaming optimal (below), else drawn at 60. Unlocked: as many frames as the headset "
          "shows evenly and this computer draws. Auto Mode: capped at the refresh rate while its frames fit, else at half. "
          "Also in the game: F1 > VR.");
+    // (docs/VR_EYE_PROJECTION.md "Field of view", 2026-11-12) standalone headsets only: PC VR always draws the whole field
+    if (!vr::kPcVrBuild) {
+        int fov = int(std::lround(c.fieldOfView * 100.0f));
+        if (ImGui::SliderInt("Field of view", &fov, 75, 100, "%d%%")) {
+            fov = std::clamp(int(std::lround(fov / 5.0f)) * 5, 75, 100);  // (steps of 5)
+            c.fieldOfView = fov / 100.0f;
+        }
+        help("How much of the headset's view the game draws: lower draws fewer pixels at the same sharpness, for more "
+             "frames a second, with a soft dark edge round the view (the lenses' edges are blurry anyway). 85% by "
+             "default on a Quest. Applies at the game's next start.");
+    }
+    if (slider("Headset resolution", "vr.renderScale", c.renderScale, "%.2fx of the headset's size (the eye pictures)"))
+        c.renderScale = vr::snap_headset_resolution(c.renderScale);
+    for (size_t i = 0; i < std::size(vr::kHeadsetResolutionPresets); ++i) {
+        const float p = vr::kHeadsetResolutionPresets[i];
+        char label[24];
+        std::snprintf(label, sizeof label, "%.2fx##headsetres", double(p));
+        if (i) ImGui::SameLine();
+        if (ImGui::RadioButton(label, std::fabs(c.renderScale - p) < 0.001f)) c.renderScale = p;
+    }
+    {
+        static const char* const kFoveation[] = {"Off", "Low", "Medium", "High"};
+        int f = std::clamp(c.foveation, 0, 3);
+        if (ImGui::Combo("Foveated rendering", &f, kFoveation, 4)) c.foveation = f;
+        help("The edges of each eye drawn at less detail (where the lenses blur them anyway), for less GPU work: Low, Medium, High. Only on GPUs that support it (Quest); applies at once.");
+    }
+    if (vr::kPcVrBuild) {
+        // (2026-11-12) the desktop window's VR View, SteamVR's choices (vr_config.h vr.desktopView, present.cpp)
+        static const char* const kDesktopView[] = {"Left eye", "Right eye", "Both eyes", "Off",
+                                                   "Both eyes - Left dominant", "Both eyes - Right dominant"};
+        int v = std::clamp(c.desktopView, 0, 5);
+        if (ImGui::Combo("VR View (desktop window)", &v, kDesktopView, 6)) c.desktopView = v;
+        ImGui::BeginDisabled(c.desktopView == 3);
+        ImGui::Checkbox("Fill the window", &c.desktopViewFill);
+        ImGui::EndDisabled();
+        help("What the game's desktop window shows while you play in the headset, as SteamVR's VR View: the left eye, "
+             "the right eye, both eyes side by side, or nothing (Off: a black window, a little less work for the PC). "
+             "Both eyes - Left / Right dominant, as SteamVR's: one picture of both eyes' views, wider than one eye's, "
+             "the dominant eye's with the other eye's blended in. "
+             "Fill the window: the eye picture fills the window with its edges cropped, instead of the whole picture "
+             "with black bars (for recording or streaming). The headset's picture does not change.");
+    }
     ImGui::Checkbox("Streaming optimal", &c.streamingOptimal);
     ImGui::BeginDisabled(!c.streamingOptimal);
     ImGui::Checkbox("Depth for Virtual Desktop", &c.vdxrDepth);
@@ -1539,6 +1778,15 @@ void tab_graphics() {
         if (ImGui::Checkbox("Disable ambient occlusion", &noAo)) c.ambientOcclusion = !noAo;
         help("The soft dark shading under characters and objects and in corners. Off, its pass is skipped (less GPU time "
              "for each eye) and the picture looks flatter; the sun's shadows stay. Also in the game: F1 > VR.");
+        bool noFlare = !c.lensFlare;
+        if (ImGui::Checkbox("Disable lens flare", &noFlare)) c.lensFlare = !noFlare;
+        help("The sun's rays, rings and glow laid over the picture when you look near the sun: large see-through shapes "
+             "over much of both eyes. The sun itself stays. Off by default on a Quest. Also in the game: F1 > VR.");
+        int distance = int(c.drawDistance * 100.0f + 0.5f);
+        if (ImGui::SliderInt("Draw distance", &distance, 40, 100, "%d%%")) c.drawDistance = distance / 100.0f;
+        help("How far away things are drawn, as a share of the game's own distance: characters, the islands' scenery, "
+             "grass and trees farther than that are not drawn (less GPU time). 70% by default on a Quest, 100% (the "
+             "original) elsewhere. Also in the game: F1 > VR.");
     }
     ImGui::SeparatorText("Game picture (the game's own graphics settings)");
     int res = 0;
@@ -1585,7 +1833,7 @@ void tab_graphics() {
          "in General > Game first.");
     if (restore_button("graphics")) {
         const vr::Config d;
-        c.refreshRate = d.refreshRate; c.renderScale = d.renderScale; c.autoFrameRate = d.autoFrameRate; c.frameRate = d.frameRate;
+        c.refreshRate = d.refreshRate; c.renderScale = d.renderScale; c.fieldOfView = d.fieldOfView; c.autoFrameRate = d.autoFrameRate; c.frameRate = d.frameRate;
         c.streamingOptimal = d.streamingOptimal;
         c.vdxrDepth = d.vdxrDepth;
         c.desktopGamePad = d.desktopGamePad;
@@ -1593,7 +1841,7 @@ void tab_graphics() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Install game (docs/VR_LAUNCHER.md, "Install game"): a disc image (.wud, .wux) or a Cemu archive (.wua) extracted
+// Extract Game (docs/VR_LAUNCHER.md, "Extract Game"): a disc image (.wud, .wux) or a Cemu archive (.wua) extracted
 // by wwhd-extract to a folder, checked, and that folder set as the game's (vr-launcher.ini launcher.gameDir). The
 // decisions are game_install.h's, the process extract_runner.h's; this is the window.
 
@@ -2443,6 +2691,22 @@ int check(bool probe, bool dlss, bool saveToo) {
     return 0;
 }
 
+// A tab's settings in a scrolling child of the window's height less the buttons below (footer), with a scrollbar to grab,
+// the wheel (or a headset's thumbstick, where the system sends it as one) and drag scrolling: pressed on an empty spot and
+// dragged, the area follows the pointer as on a phone (a press on a control works it as before) (2026-11-11)
+void tab_body(const char* id, float footer, void (*draw)()) {
+    ImGui::BeginChild(id, ImVec2(0, -footer), ImGuiChildFlags_None, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+    draw();
+    const ImGuiIO& io = ImGui::GetIO();
+    static bool dragging = false;
+    if (ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+        dragging = ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) && !ImGui::IsAnyItemHovered();
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) dragging = false;
+    if (dragging && !ImGui::IsAnyItemActive() && io.MouseDelta.y != 0)
+        ImGui::SetScrollY(std::clamp(ImGui::GetScrollY() - io.MouseDelta.y, 0.0f, ImGui::GetScrollMaxY()));
+    ImGui::EndChild();
+}
+
 int main(int argc, char** argv) {
     bool checkMode = false, probe = false, dlss = false, saveToo = false;
     for (int i = 1; i < argc; ++i) {
@@ -2474,7 +2738,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     SDL_SetRenderVSync(renderer, 1);
-    g_window = window;  // (the Install game tab's file and folder pickers belong to it)
+    g_window = window;  // (the Extract Game tab's file and folder pickers belong to it)
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().IniFilename = nullptr;
@@ -2482,11 +2746,16 @@ int main(int argc, char** argv) {
     ImGui::StyleColorsDark();
     const float scale = SDL_GetWindowDisplayScale(window);
     ImGui::GetStyle().ScaleAllSizes(scale > 0 ? scale : 1);
+#ifdef __ANDROID__
+    // (2026-11-11) a headset's pointer: a scrollbar wide enough to grab with it (each tab scrolls: tab_body)
+    ImGui::GetStyle().ScrollbarSize = 30 * (scale > 0 ? scale : 1);
+    ImGui::GetStyle().GrabMinSize = std::max(ImGui::GetStyle().GrabMinSize, 24 * (scale > 0 ? scale : 1));
+#endif
     ImGui::GetStyle().FontScaleDpi = scale > 0 ? scale : 1;
     ImGui_ImplSDL3_InitForSDLRenderer(window, renderer);
     ImGui_ImplSDLRenderer3_Init(renderer);
     load();
-    // test aids (captures, docs/VR_LAUNCHER.md "Install game"): WWHD_LAUNCHER_TAB=install opens on that tab;
+    // test aids (captures, docs/VR_LAUNCHER.md "Extract Game"): WWHD_LAUNCHER_TAB=install opens on that tab;
     // WWHD_LAUNCHER_SOURCE / WWHD_LAUNCHER_DEST preset its file and folder (WWHD_LAUNCHER_EXTRACT=1 then extracts once
     // it is ready); WWHD_LAUNCHER_SHOT=file.bmp saves the window once the tab has nothing running (then 30 more frames)
     // and quits. With WWHD_USER_DIR for a separate settings folder
@@ -2522,15 +2791,21 @@ int main(int argc, char** argv) {
         ImGui::SetNextWindowPos(vp->WorkPos);
         ImGui::SetNextWindowSize(vp->WorkSize);
         ImGui::Begin("launcher", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings);
+        // each tab's settings in a scrolling area of its own (tab_body), the buttons below it always in view: the window
+        // itself shows no scrollbar (NoDecoration), and a headset's pointer has no wheel (2026-11-11, a Quest 3 player)
+        const float footer = ImGui::GetFrameHeightWithSpacing() + ImGui::GetTextLineHeightWithSpacing() * 2 +
+                             ImGui::GetStyle().ItemSpacing.y * 2 +
+                             (S.error.empty() ? 0 : ImGui::GetTextLineHeightWithSpacing()) +
+                             (S.problems.empty() ? 0 : ImGui::GetTextLineHeightWithSpacing() * 2);
         if (ImGui::BeginTabBar("tabs")) {
-            if (ImGui::BeginTabItem("General")) { tab_general(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("General")) { tab_body("general", footer, tab_general); ImGui::EndTabItem(); }
             const ImGuiTabItemFlags installFlags =
                 testTab && !std::strcmp(testTab, "install") && ImGui::GetFrameCount() < 3 ? ImGuiTabItemFlags_SetSelected : 0;
-            if (ImGui::BeginTabItem("Install game", nullptr, installFlags)) { tab_install(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Extract Game", nullptr, installFlags)) { tab_body("extract", footer, tab_install); ImGui::EndTabItem(); }
             if (testExtract && I.step == Install::Step::Ready) { testExtract = false; start_extract(); }
-            if (ImGui::BeginTabItem("Camera and comfort")) { tab_camera(); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Controllers")) { tab_controls(); ImGui::EndTabItem(); }
-            if (ImGui::BeginTabItem("Graphics")) { tab_graphics(); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Camera and comfort")) { tab_body("camera", footer, tab_camera); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Controllers")) { tab_body("controls", footer, tab_controls); ImGui::EndTabItem(); }
+            if (ImGui::BeginTabItem("Graphics")) { tab_body("graphics", footer, tab_graphics); ImGui::EndTabItem(); }
             ImGui::EndTabBar();
         }
         // the VR mode's credit (LICENSE-VR.md: GPL-3.0 section 7(b), shown where players see it)

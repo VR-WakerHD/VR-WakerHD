@@ -12,7 +12,7 @@ panel: [VR_PAUSE_MENU.md](VR_PAUSE_MENU.md).
 | Tab | Contents |
 |---|---|
 | General | Play VR / Play Flat; "Start in VR" (also without the launcher); the active OpenXR runtime (read from its manifest, nothing started); "Check for a headset" (starts the runtime briefly and asks for a headset); the game program and game folder; open the settings folder or this documentation |
-| Install game | extract the game from your own disc image (.wud, .wux) or Cemu archive (.wua) to a folder and set that folder as the game's (below) |
+| Extract Game | extract the game from your own disc image (.wud, .wux) or Cemu archive (.wua) to a folder and set that folder as the game's (below) |
 | Camera and comfort | the menu panel (when, placement, distance, height, size, curvature); title / file select and cutscene distance; the player camera (view at the start: first or third person, HUD position and HUD size, height offset, view forward / back, world scale (matched to Link's arms or set directly: the slider always shows the scale in use, and moving it sets it), lean limit, Link's head, hearts on the left arm: size, look angle, arm distance); comfort (turning, movement direction and speed, the view turning in spin attacks) |
 | Controllers | left-handed, stick dead zone, the button bindings, what is fixed and what is not supported yet, swing thresholds, sword and arm tracking |
 | Graphics | headset refresh rate (enabled only when the runtime lets applications choose it), headset image size, frame interpolation for VR, the game's internal resolution, FXAA, anisotropic filtering, the performance overlay, **Write a log file** (`logFile`, on by default, the same setting as F1 > Graphics: the game writes `captures/wwhd.log`; a change applies from its next start) with **Open the log folder** (the game's `captures` folder: its release's data folder when it has one, else the game program's folder), NVIDIA DLSS (mode and DLSS 5 Neural Rendering: only what the game's last check found usable is enabled; **Detect PC** runs that check now, `wwhd --dlss-probe`, with no window. DLSS 5 can be turned on when the driver offers it or when a copy of `nvngx_dlssnr.dll` of the player's own, modified or not, is next to the game: nothing here checks its signature, and the game loads NGX's core from its own folder first. [VR_DLSS.md](VR_DLSS.md)) |
@@ -45,7 +45,7 @@ have saved; the setting is kept (F1 can turn 3D on again). Only one game is star
 launcher; when it ends with an error right after starting, the launcher says so (see the game's log). No
 administrator rights are needed.
 
-## Install game
+## Extract Game
 
 For a game built from source (`wwhd`), which needs the game's files extracted to a folder. (A release's own program
 does this in its first start instead.) The steps:

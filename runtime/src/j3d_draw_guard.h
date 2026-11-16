@@ -12,6 +12,10 @@
 
 namespace j3d_draw_guard {
 
+// (VR fork, docs/VR_HANDS_LAYER_PLAN.md step 2) Link's own draw begins (true) / ends (false), daPy_Draw: the packets
+// entered meanwhile are his (body, hands, what he holds); the others in his lists (the boat, Zelda, ...) are not
+void link_draw(bool inside);
+
 // The packet whose next link closes a loop in the list from `head` (cutting that link leaves every
 // packet in the list once), or 0 when the list ends. `next(p)` reads a packet's next link; 0 ends the
 // list. Brent's cycle detection: no memory, at most a few passes over the list. `limit` bounds the

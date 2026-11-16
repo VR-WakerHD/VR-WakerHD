@@ -149,3 +149,18 @@ for the eye: both eyes drew the lit shape where the centre camera's symmetric pi
 displacement -eye * sx * p0; y' = sy * y - oy * w), taking p0 = 1 / [5].x and p5 = -1 / [5].y from the ray, and only
 where the rows' lengths agree with them (within 2%: another layout is left as it was). Seen right in the headset. The
 first 12 passes' uniforms per eye are logged (`[vulkan stereo] point light VS ...`).
+
+## Field of view (`vr.fieldOfView`, 2026-11-12)
+
+Standalone headsets can draw less of the headset's view for more frames a second (AstroQuest's FOV option, measured
+on a Quest 3). The launcher's Graphics tab: "Field of view", 75-100 % in steps of 5; **85 % on a Quest**, 100 % on
+other standalone headsets; never offered in PC VR, which always draws the whole field (`kPcVrBuild`).
+
+- Each eye's field as the runtime reports it is narrowed at the source (`openxr_session.cpp narrowed_fov`): each side's
+  tangent times the share. Everything after follows: the projections, the eye pictures' shape and the submitted field;
+  the compositor shows black past it.
+- The eye pictures are smaller by the same share (`vr_vulkan.cpp device_ready`): the same pixels per degree, about
+  share² of the pixels (85 %: 72 %). The 5-degree reprojection margin is added on top as before.
+- With CAS (a standalone headset's Auto) the picture's edge fades to black over 6 % of it along a squircle
+  (`vr_cas.cpp`, `edge`), so the view ends softly, not in a hard rectangle.
+- Latched at the session's start (`vr::latch_fov_scale`; log `[vr] field of view: N% of the headset's`).

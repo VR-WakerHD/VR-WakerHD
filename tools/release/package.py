@@ -697,6 +697,13 @@ def main():
         copy(lic, os.path.join(pkg, "LICENSE"))
     elif os.environ.get("CI"):
         sys.exit("LICENSE missing")
+    # the VR mode's license (LICENSE-VR.md: GPL-3.0-or-later with its credit term) and the GPL's text, beside the
+    # original port's MPL-2.0 LICENSE (2026-11-11: the 0.5.0 zip had only the MPL)
+    for src, dst in (("LICENSE-VR.md", "LICENSE-VR.md"), (os.path.join("LICENSES", "GPL-3.0.txt"), "LICENSE-GPL-3.0.txt")):
+        if os.path.isfile(os.path.join(ROOT, src)):
+            copy(os.path.join(ROOT, src), os.path.join(pkg, dst))
+        elif os.environ.get("CI"):
+            sys.exit(src + " missing")
     licdir = os.path.join(pkg, "third-party-licenses")
     os.makedirs(licdir)
     entries = dict(VENDORED_LICENSES)

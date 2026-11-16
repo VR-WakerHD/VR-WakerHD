@@ -47,6 +47,9 @@
         <!-- Keep the error visible when the failed SDL game process exits. -->
         <activity android:name=".TheaterErrorActivity" android:process=":theatererror"
             android:exported="false" android:excludeFromRecents="true" />
+        <!-- the game started with no game files: asks the player to extract the game disc (main.cpp, 2026-11-12) -->
+        <activity android:name=".GameMissingActivity" android:process=":gamemissing"
+            android:exported="false" android:excludeFromRecents="true" />
         <!-- the app's files folder (saves, config, mods; the game and shader caches read-only) as a root in the
              system file manager; MANAGE_DOCUMENTS: only the system file manager and picker can use it -->
         <provider android:name=".GameFilesProvider"

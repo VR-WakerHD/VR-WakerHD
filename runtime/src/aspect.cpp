@@ -48,6 +48,7 @@
 #include "guest_addr.h"
 #ifdef WWHD_VR
 #include "vr/vr.h"
+#include "vr/vr_game.h"
 #include "vr/vr_ui.h"
 #endif
 
@@ -95,13 +96,21 @@ bool play_camera(bool conducting) {
         static std::atomic<uint64_t> lastFrame{0};
         const uint32_t proc=link?ld32(link+0x65F0):0;
         const uint64_t frame=game_frame()+1;  // (0: never)
-        if(ld8(play+0x5BD1) && (proc==0x9A || proc==0x9B))lastFrame.store(frame,std::memory_order_relaxed);
+        // (VR, 2026-11-14, a headset video of the Command Melody's lesson: "the note grid shakes and blinks", and the
+        // song's playback at its end shook) the lesson's message (the notes to copy, play +0x5BB2/+0x5BB3) comes and
+        // goes while he conducts, and the metronome is off between tries and while the song plays back (TactPlay
+        // 0x9B): each time this went false, and the VR UI changed between the HUD's size and the shrunk conversation
+        // text's, with its height offset, every couple of seconds (the log: "layouts: conversation / cutscene text,
+        // drawn at 0.33" and "gameplay HUD, drawn at 1.00" in turn). Now his own conducting (TactWait 0x9A, TactPlay
+        // 0x9B) counts with the metronome on or in the conducting event (mode 3), and the message's flags do not end it
+        const bool tact=proc==0x9A || proc==0x9B;
+        if(tact && (ld8(play+0x5BD1) || ld8(play+0x5292)==3))lastFrame.store(frame,std::memory_order_relaxed);
         const uint64_t last=lastFrame.load(std::memory_order_relaxed);
         conducting=last && frame<=last+8 && (frame==last || ld8(play+0x5292)==3);
     }
     if(!*stage || !std::strncmp(stage,"sea_T",8) || !std::strncmp(stage,"Name",8) ||
        !std::strncmp(stage,"ENDumi",8) || !link || ld32(play+0x5B2C)!=link ||
-       (ld8(play+0x5292) && !conducting) || ld8(play+0x5BB2) || ld8(play+0x5BB3) ||
+       (ld8(play+0x5292) && !conducting) || (!conducting && (ld8(play+0x5BB2) || ld8(play+0x5BB3))) ||
        ld8(play+0x5140+12) || ld32(GD(0x101F36CC)) || ld8(GD(0x101EA069)))return false;
     return true;
 }
@@ -366,6 +375,24 @@ static void stereo_clipper(Cpu* c) {
         const float tanX = std::tan(float(c->f[1].ps0) * float(M_PI) / 360.0f) * float(c->f[2].ps0);
         c->f[2].ps0 *= 1.0f + eye / (nearPlane * std::max(tanX, 1e-3f));
         c->f[2].ps1 = c->f[2].ps0;
+        // (vr.drawDistance, docs/VR_PERFORMANCE.md "Draw distance") the culling's far plane at that share of the far
+        // plane the game asks for in this very call (it scales with the game's own distance changes): actors, scenery,
+        // grass and trees past it are culled. Never in front of the near plane. vr::game::draw_distance says when
+        // (the game's normal play camera only)
+        const float share = vr::game::draw_distance();
+        if (share < 1.0f) {
+            const float far = float(c->f[4].ps0);
+            const float cut = std::max(far * share, float(c->f[3].ps0));
+            if (cut < far) {
+                static float loggedFar = 0, loggedShare = 0;
+                static int logs = 0;
+                if ((far != loggedFar || share != loggedShare) && logs < 20) {
+                    ++logs, loggedFar = far, loggedShare = share;
+                    LOG("[vr] draw distance: culling to %.0f of the game's %.0f units (vr.drawDistance %.2f)", cut, far, share);
+                }
+                c->f[4].ps0 = c->f[4].ps1 = cut;
+            }
+        }
         return;
     }
 #endif

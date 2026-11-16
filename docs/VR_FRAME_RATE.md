@@ -55,9 +55,10 @@ failed detection changes nothing. Not on Android yet (the game asks for the chos
 the game program itself (`wwhd`) next to the launcher: the release's program starts the game.
 
 **Auto** (`interp_pacing.h` `auto_rate_step`): capped at the refresh rate while its frames fit, else at half: it counts
-the in-between frames drawn at the full rate of those that could be; under 95 % over 1.5 s it goes to half. From half it
-tries the full rate again after 10 s (for 2 s, after 0.5 s for the pacer's estimates) and keeps it with 98 %; a failed
-try doubles the wait, up to 40 s. (VR fork: it was 97 %, 99 %, 10 s and a minute, and sat at half in busy scenes; then
+the in-between frames drawn at the full rate of those that could be; under 90 % over 3 s it goes to half. From half it
+tries the full rate again after 20 s (for 2 s, after 0.5 s for the pacer's estimates) and keeps it with 98 %; a failed
+try doubles the wait, up to 80 s (2026-11-12: 1.5 s, 10 s and 40 s before; fewer changes of rate, each a hitch:
+docs/FRAME_INTERPOLATION_IMPLEMENTATION.md). (VR fork: it was 97 %, 99 %, 10 s and a minute, and sat at half in busy scenes; then
 85 %, 90 %, 5 s and 20 s, which in the headset sat at an uneven 60 fps too often; 2026-10-31: these, between the two.) Test runs: `WWHD_VR_FRAME_RATE=full` (or `half`, `auto`, `unlocked`) sets the frame rate for one
 start without changing the saved `vr.frameRate`. The pacer's estimates of the full rate are kept while at half and restored for
 the try. The log says each change and why.
@@ -163,6 +164,30 @@ Now the frames between are counted in the headset's refreshes per drawn frame: r
 
 Not yet seen in the headset.
 
+## The head pose counted from its own swap (2026-11-14)
+
+The prediction counts the frames still queued after the frame whose display time it starts from. That time is set
+by the render thread in `frame_begin`, inside its swap, but the swap was counted as done only when the whole swap
+returned: after the eye copies, the frame's end and Turn smoothing's frames. A camera located by the game thread in
+that window started from the new display time and still counted that swap as queued, so it was predicted one refresh
+(11 ms at 90 Hz) too far. How often depended on thread timing, so the horizon could flip from frame to frame.
+
+The headset corrects the turn of a frame (the pose sent is the pose drawn), but not the head's movement, nor Link's
+hands and items, which are drawn from controller poses predicted the same way.
+
+Now the display time is stored together with its swap (`vr::set_real_frame_display(time, swap)`, both read together
+without a lock), and `display_time` counts the swaps issued after that one (`vr_game.cpp`). Unchanged:
+- the refreshes per drawn frame (above);
+- `WWHD_VR_PREDICT_FRAMES` and `WWHD_VR_PREDICT_QUEUED_MAX`;
+- the pose sent equal to the pose drawn.
+
+**On by default** (2026-11-14, not yet run in a headset). `WWHD_VR_PREDICT_PAIRED=0` counts as before, for a
+comparison run.
+
+**Check in the headset:** the `[vr] camera pose predicted ahead` line should show fewer changes. At Capped 45 with
+Smooth Camera while Turning, `steady stick turn` and `frame evenness` must be no worse, since turn smoothing reads
+the same times. Not yet run (docs/VR_STREAMING_AUDIT.md, finding 2).
+
 ## Locked to the headset's clock
 
 The game steps and draws on a virtual 59.94 Hz vsync, as on the console. At 45 fps that put a frame every 22.244 ms,
@@ -177,3 +202,29 @@ the headset's 30.00 steps a second rather than 29.97 (0.1%). Headsets whose rate
 keep 59.94 Hz. Once the clocks are locked, the frames arrive at the same point of each refresh. If that point is near
 the deadline, `note_display` sees three or more frames land on another refresh within 2 s and moves the grid half a
 refresh later, once, at most every 5 s. The log notes each move ("frames near the headset's deadline").
+
+## Quest defaults: 72 Hz, capped at 36 fps (2026-11-11, replaced the same day: below)
+
+On a Meta Quest (`quest_headset()`) the defaults are **72 Hz** (`default_refresh_rate()`) with the frame rate **capped
+at half: 36 fps** (`FrameRate::Half`); everywhere else 90 Hz and Auto Mode, as before. Why: a player's Quest 3 at the
+old defaults (90 Hz, Auto Mode) and Headset resolution 0.70x drew 20-26 fps in play with the GPU 94-100 % busy
+(35-69 ms a frame), never reaching Auto Mode's 45; 36 fps at 72 Hz is the rate earlier Quest builds held best.
+Settings format 20 moves a Quest's saved old defaults (90 Hz with Auto Mode) to the new ones once; any other saved
+rate or frame rate stays.
+
+## Quest defaults: 90 Hz, Capped 30 FPS (2026-11-11, settings format 21)
+
+The next player's log at 72 Hz / 36 fps: 17-23 fps with the GPU 100 % busy. A frame then stays on show for three
+refreshes, then four (42, then 56 ms), and whatever moves moves in jerks ("highly jittery"). AstroQuest (a Quest 3
+port, README "Two refreshes for a frame, or three") found the same and holds its game at **30 fps on 90 Hz**: every
+frame exactly three refreshes, the same time on show as the next.
+
+- **Capped 30 FPS** (steady) (`FrameRate::Original`, saved as `steady30`; the pacer's `kVrOriginal`: the game's own 30 steps a
+  second, no in-between frames) is offered where the refresh rate is a multiple of 30 (90 Hz: three refreshes a frame;
+  120 Hz: four), not at 72 or 80 Hz (uneven there: `validate` turns it to the half cap) nor at 60 Hz (its half cap is
+  already 30).
+- **A Quest's defaults:** 90 Hz with Capped 30 FPS. 30 fps leaves 33.3 ms a frame against 36 fps's 27.8. Format 21
+  moves a Quest's saved format-20 defaults (72 Hz, Capped 36) and the older ones (90 Hz, Auto Mode) to them once.
+- Head turns stay smooth at 90 Hz: the compositor turns each frame to the head's latest pose at every refresh.
+- Below 30 fps frames still fall unevenly; the GPU savings (foveation, draw distance, the GPU's clock level,
+  docs/VR_PERFORMANCE.md) and the Headset resolution are what bring it up to 30.

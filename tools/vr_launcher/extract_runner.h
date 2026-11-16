@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
-// Runs wwhd-extract (or another program) for the launcher's "Install game" tab (game_install.h): its arguments as a
+// Runs wwhd-extract (or another program) for the launcher's "Extract Game" tab (game_install.h): its arguments as a
 // list, never through a shell, so spaces, quotes and non-ASCII letters in paths are safe (SDL turns them into the
 // platform's own argument form). A worker thread reads its output line by line (its error output goes into the same
 // stream: wwhd-extract's errors are its "error: " lines), keeps the last progress and all other lines, and the window

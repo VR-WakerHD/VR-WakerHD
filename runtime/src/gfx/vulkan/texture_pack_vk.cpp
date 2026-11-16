@@ -689,7 +689,7 @@ void destroy_unused(Surface* r) {
 // it as it frees create_surface_image's (vkDestroyImage, vkFreeMemory after the submissions that used it).
 bool make_image(Surface* r, uint32_t dxgi, VkExtent3D extent, std::string& error) {
     VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-    ci.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+    ci.flags = 0;  // (not mutable, as create_surface_image: viewed in its own format only)
     ci.imageType = VK_IMAGE_TYPE_2D;
     ci.format = r->fmt.pixel;
     ci.extent = extent;

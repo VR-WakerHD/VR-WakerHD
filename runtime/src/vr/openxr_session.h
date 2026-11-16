@@ -14,6 +14,7 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -34,6 +35,7 @@
 #include "vr_math.h"
 
 namespace vr::xr {
+bool hands_shared();  // one hands image for both eyes, side by side (WWHD_VR_HANDS_SHARED=0: one per eye)
 
 // what the render thread needs to make the Vulkan instance and device the runtime will draw with
 struct VulkanRequirements {
@@ -53,6 +55,8 @@ struct EyeView {
 struct Views {
     bool valid = false;     // orientation and position tracked
     XrTime time = 0;        // the display time they were located for
+    float heading = 0;      // (diagnostics: the frames' evenness) the view's heading in the game they were drawn at (radians)
+    bool hasHeading = false;
     EyeView eye[2];
     Pose head;              // VIEW space in the tracking space (between the eyes)
 };
@@ -81,6 +85,9 @@ struct Quad {
     // distance / curvature, its axis through the viewer's side of the panel (1: centred on the viewer)
     float curvature = 0, distance = 1;
     bool tracking = false;        // (the UI layer's quad) its pose in the tracking space, not the view's
+    // the part of the swapchain's image shown, from its top left corner, pixels; 0: the whole image (the GamePad panel:
+    // one image for the GamePad screen and the VR menu, at the larger size, each drawn into its own part)
+    uint32_t pixelWidth = 0, pixelHeight = 0;
 };
 
 // a quad showing part of its swapchain's image (the wrist HUD's panels share one picture)
@@ -142,6 +149,8 @@ public:
     static constexpr int kMotion = 6, kDepth = 8;
     // (docs/VR_EYE_PROJECTION.md) the game's UI as its own layer (each eye with its own projection): ensure_ui
     static constexpr int kUi = 10;
+    // (docs/VR_HANDS_LAYER_PLAN.md step 3) Link's hands as their own projection layer over the eyes': kHands + eye
+    static constexpr int kHands = 11;
     bool ensure_panel(uint32_t width, uint32_t height);
     bool ensure_wheel(uint32_t width, uint32_t height);
     bool ensure_wrist(uint32_t width, uint32_t height);
@@ -158,8 +167,11 @@ public:
     // (ui: the game's UI layer, a quad in the view space, head-locked, over the eyes' pictures and under the panels)
     void end_frame(const Views& views, bool draw, const Quad* panel = nullptr, const Quad* wheel = nullptr,
                    const SubQuad* wrist = nullptr, int wristCount = 0, const SubQuad* laser = nullptr, int laserCount = 0,
-                   const Quad* ui = nullptr);
+                   const Quad* ui = nullptr, const Views* hands = nullptr);
     bool ensure_ui(uint32_t width, uint32_t height);
+    // the hands layer's two swapchains (made once, the eyes' size); false: not (yet)
+    bool ensure_hands(uint32_t width, uint32_t height);
+    void set_hands_premultiplied(bool on) { hands_premultiplied_ = on; }  // (the renderer: coverage from depth)
     const Swapchain& swapchain(int index) const { return swapchains_[index]; }
     // XR_FB_display_refresh_rate (when the runtime has it): the rates offered, and a request (the runtime may
     // refuse or choose another). refresh_rate(): the runtime's rate, else the one its frame period implies
@@ -196,7 +208,13 @@ public:
     }
     void set_super_resolution(bool on) { superResolution_.store(on, std::memory_order_relaxed); }
     XrTime predicted_display_time() const { return predictedTime_.load(); }
+    // the runtime's own frame period (xrWaitFrame's predictedDisplayPeriod): may be longer than a refresh while the
+    // runtime's frame smoothing runs (VDXR reports two refreshes while Virtual Desktop's SSW is active). The game's
+    // timing in refreshes uses refresh_period(); predicted_period() is the spacing the runtime asks for
     XrDuration predicted_period() const { return predictedPeriod_.load(); }
+    // one display refresh (ns), set at each xrWaitFrame: the headset's refresh rate (XR_FB_display_refresh_rate), else
+    // the runtime's period unless it jumped to about twice the last refresh or more (docs/VR_STREAMING_AUDIT.md, finding 12)
+    XrDuration refresh_period() const { return refreshPeriod_.load(); }
 
     // ---- tracking (any thread)
     bool locate_views(XrTime time, Views& out);
@@ -241,6 +259,18 @@ public:
     // (standalone builds, when offered): Boost while the game is stalled (loads, shaders: the render thread showing its
     // last frame again), back to Sustained High (the runtime's default) after. Render thread; a no-op elsewhere
     void cpu_boost(bool on);
+    // (movement smoothing, vr_vulkan.cpp headset_frame) the next end_frame is the last frame shown again: send its depth
+    // again with it (depth alone only; frame synthesis's motion vectors are not reused)
+    void reuse_last_depth() { reuseDepth_.store(true, std::memory_order_relaxed); }
+    bool depth_only() const { return depthOnly_; }
+    // (poll_perf_metrics) the runtime's counters as last read (XR_META_performance_metrics, read once a second): the app's
+    // and the compositor's GPU time a frame (ms), the GPU's and the busiest CPU core's use (%), the app's CPU time a frame
+    // (ms); -1 where the runtime has none. valid: something read
+    struct GpuCounters {
+        bool valid = false;
+        float appGpuMs = -1, compositorGpuMs = -1, gpuBusy = -1, appCpuMs = -1, cpuWorst = -1;
+    };
+    GpuCounters gpu_counters() const;
     // the optional controller profiles' bindings (create_actions): always on Android, on PC for a Quest only
 #ifdef __ANDROID__
     bool optional_profiles() const { return true; }
@@ -249,6 +279,8 @@ public:
 #endif
 
 private:
+    bool hands_premultiplied_ = false;
+
     bool load_loader();
     bool check(XrResult r, const char* what);
     bool create_actions();
@@ -266,6 +298,10 @@ private:
     XrSpace space_ = XR_NULL_HANDLE, view_ = XR_NULL_HANDLE;
     bool stage_ = false;
     bool quest_ = false;
+    // (2026-11-13) the headset model for its own controller profile and calibration (vr.calibration.<model>.*)
+    enum class ControllerModel { Other, Quest3, Quest3S };
+    ControllerModel controllerModel_ = ControllerModel::Other;
+    void apply_controller_calibration(int hand, Pose& grip, Pose& aim) const;
     std::atomic<bool> streamed_{false};
     bool vdxrDepthOffered_ = false;  // (vr.vdxrDepth) the depth extension enabled for VDXR, used once the runtime is known  // (streamed(); detection may set it on later, read by the render thread)
     bool wired_ = false;           // a headset known to be wired by its name (never streamed by detection)
@@ -289,7 +325,7 @@ private:
     } streamDiag_;
     uint32_t uiWaitWidth_ = 0, uiWaitHeight_ = 0, uiWaitFrames_ = 0;  // (ensure_ui) the UI image's size, and frames it held  // the runtime is SteamVR (its name says so): vr.eyeCrop's Auto
     VulkanRequirements requirements_;
-    std::array<Swapchain, 11> swapchains_{};
+    std::array<Swapchain, 13> swapchains_{};
     int64_t format_ = 0;
     bool refreshRateExt_ = false, cylinderExt_ = false;
     bool layerSettingsExt_ = false;  // XR_FB_composition_layer_settings (Meta's runtime)
@@ -304,6 +340,11 @@ private:
     Submitted submitted_[2];
     SynthFrame synthFrame_;
     bool synthPending_ = false;
+    // (movement smoothing) the last frame's depth, for a frame shown again (reuse_last_depth): its images are the depth
+    // swapchains' last released ones, the ones that frame wrote
+    SynthFrame synthLast_;
+    bool synthLastValid_ = false;
+    std::atomic<bool> reuseDepth_{false};
     bool make_swapchain(Swapchain& sc, uint32_t width, uint32_t height, int64_t format, XrSwapchainUsageFlags usage,
                         const char* what);
     std::atomic<bool> superResolution_{false};
@@ -324,7 +365,28 @@ private:
     std::atomic<uint32_t> sessionBegins_{0};
     // (cpu_boost) XR_EXT_performance_settings enabled, its function, the level asked for (and the session it was for)
     bool perfSettingsExt_ = false;
+    // (docs/VR_PERFORMANCE.md, "GPU clock") XR_META_recommended_layer_resolution: asked each frame for the projection
+    // layer's recommended size (not followed: the eye pictures stay at the Headset resolution); taking part in Meta's
+    // dynamic resolution is what lets a Quest 3's GPU reach level 5, and with the manifest's CPU-for-GPU trade level 6
+    bool layerResolutionExt_ = false;
+    PFN_xrGetRecommendedLayerResolutionMETA xrGetRecommendedLayerResolutionMETA_ = nullptr;
+    uint64_t layerResolutionAsks_ = 0;
+    int32_t lastRecommendedW_ = 0, lastRecommendedH_ = 0;
     PFN_xrPerfSettingsSetPerformanceLevelEXT xrPerfSettingsSetPerformanceLevelEXT_ = nullptr;
+    // (poll_perf_metrics) XR_META_performance_metrics
+    void poll_perf_metrics();
+    bool perfMetricsExt_ = false;
+    PFN_xrEnumeratePerformanceMetricsCounterPathsMETA xrEnumeratePerformanceMetricsCounterPathsMETA_ = nullptr;
+    PFN_xrSetPerformanceMetricsStateMETA xrSetPerformanceMetricsStateMETA_ = nullptr;
+    PFN_xrQueryPerformanceMetricsCounterMETA xrQueryPerformanceMetricsCounterMETA_ = nullptr;
+    uint32_t perfMetricsSession_ = ~0u;
+    std::vector<XrPath> perfPaths_;
+    std::vector<std::string> perfNames_;
+    std::vector<double> perfSums_, perfMax_;
+    uint32_t perfReads_ = 0;
+    std::chrono::steady_clock::time_point perfLastRead_{}, perfLastLog_{};
+    mutable std::mutex perfMutex_;
+    GpuCounters perfLatest_;
     bool cpuBoost_ = false;
     uint32_t cpuBoostSession_ = 0;
     uint64_t cpuBoosts_ = 0;
@@ -334,6 +396,8 @@ private:
     std::atomic<XrSessionState> xrState_{XR_SESSION_STATE_UNKNOWN};
     std::atomic<XrTime> predictedTime_{0};
     std::atomic<XrDuration> predictedPeriod_{11'111'111};
+    std::atomic<XrDuration> refreshPeriod_{11'111'111};
+    std::atomic<float> refreshHz_{0};  // (the headset's rate read at the last xrWaitFrame; 0: not read)
     bool frameBegun_ = false;
     std::mutex trackingMutex_;  // the game thread's locate/sync against session teardown
     // each hand's last valid grip and aim poses, held through short tracking gaps (vr_tracking.h)

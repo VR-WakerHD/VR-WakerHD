@@ -127,9 +127,13 @@ public class SetupActivity extends Activity {
         if (phoneSetup && state == null) cleanJobs();  // failed or abandoned imports left by an earlier run
         // the app icon starts the game once there is one to play; the launcher's "Game setup"
         // shortcut (and an update that needs a rebuild, or a setup still running) opens this screen
+        // (VR-WakerHD, 2026-11-11) a personal VR build (the game's code in the APK, no on-device setup: !phoneSetup)
+        // always opens the VR launcher, which extracts the game itself (its Extract Game tab) when it is not there yet;
+        // the setup-based build opens it once its setup is done (readyToPlay)
+        final boolean personalVr = !phoneSetup && vrLauncherIntent() != null;
         if ((state != null && state.getBoolean("launching_game", false)) ||
                 (state == null && Intent.ACTION_MAIN.equals(getIntent().getAction()) &&
-                !getIntent().getBooleanExtra(EXTRA_SHOW_SETUP, false) && readyToPlay())) {
+                !getIntent().getBooleanExtra(EXTRA_SHOW_SETUP, false) && (personalVr || readyToPlay()))) {
             launchingGame = true;
             CrashReports.offer(this, () -> {
                 // (VR-WakerHD) the VR build: the game installed, the icon opens the VR launcher, which starts it

@@ -35,6 +35,12 @@ bool skip_window_tv();                 // the TV present (Android): a VR session
 // not needed: no session, a frame under way), and the frame itself (nothing when not due or the queue is busy)
 int64_t headset_frame_due();
 void headset_frame();
+// (turn smoothing) right after frame_end: the frames for the refreshes before the next game frame, the last one turned on
+// by the view's turn, while it turns at a frame rate under the headset's
+void planned_repeats();
+// (docs/VR_HANDS_LAYER_PLAN.md, step 5) the hands layer is wanted now: only while the game runs under the headset's rate
+// (Capped 45, Steady 30, Auto Mode when it drops); never at a real 90
+bool hands_layer_wanted();
 void shutdown();                       // renderer teardown (device idle)
 // --renderer-smoke with VR wanted (WWHD_VR=1 or --vr): `frames` frames through the whole OpenXR frame loop on
 // the headset (wait/begin, acquire, a GPU clear of each eye's image, release, a projection layer), controller

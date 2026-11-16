@@ -46,16 +46,35 @@ inline const char* view_mode_name(ViewMode m) {
 // called the third-person view (the game's camera or the boat's: Link's head shown, the game's HUD, no motion controls)
 struct ViewCycle {
     ViewMode mode = ViewMode::FirstPerson;
+    // (2026-11-12, a player's request) the boat's view a pause of sailing ended (a menu, a talk, a cutscene: Link still
+    // on the boat), taken again when sailing resumes; FirstPerson: none
+    ViewMode resumeBoat = ViewMode::FirstPerson;
     bool third_person() const { return mode != ViewMode::FirstPerson; }
-    // sailing ended (or never began) while in one of the boat's views: third person, the game's camera, at once.
-    // Returns whether the mode changed
-    bool update(bool sailing) {
+    bool resume_pending() const { return boat_view_mode(resumeBoat); }
+    // sailing ended (or never began) while in one of the boat's views: third person, the game's camera, at once; the
+    // boat's view kept for resume() while Link is still on the boat. Returns whether the mode changed
+    bool update(bool sailing, bool riding = false) {
         if (sailing || !boat_view_mode(mode)) return false;
+        resumeBoat = riding ? mode : ViewMode::FirstPerson;
         mode = ViewMode::ThirdPerson;
+        return true;
+    }
+    // sailing again after such a pause, the view still the third person it left: the boat's view it had. Off the boat
+    // meanwhile, forgotten. Returns whether the mode changed
+    bool resume(bool sailing, bool riding) {
+        if (!resume_pending()) return false;
+        if (!riding || mode != ViewMode::ThirdPerson) {
+            resumeBoat = ViewMode::FirstPerson;
+            return false;
+        }
+        if (!sailing) return false;
+        mode = resumeBoat;
+        resumeBoat = ViewMode::FirstPerson;
         return true;
     }
     // one click: the next mode (update first, so a stale boat view is never the start of a click). Returns the new mode
     ViewMode click(bool sailing) {
+        resumeBoat = ViewMode::FirstPerson;  // (the player chose: no boat view taken back)
         update(sailing);
         switch (mode) {
         case ViewMode::FirstPerson: mode = ViewMode::ThirdPerson; break;
@@ -317,7 +336,8 @@ inline SailAnchor sail_anchor(ViewMode m, const BoatGeometry& g, const SailAncho
 // the boat to the camera, faster the harder they are pulled); the right stick slides it left and right, and up on it
 // forward along the boat (past Link, towards the bow), down back towards the stern (asked for, 2026-11-06), without
 // turning it. It follows the boat's position and turn, never its pitch or roll (the horizon stays level, and a
-// camera far behind the boat does not bob with its waves). Each time it begins it starts again from its first place.
+// camera far behind the boat does not bob with its waves). Each time it is chosen it starts again from its first place;
+// taken back after a pause of sailing (the map, a menu) it keeps its zoom and slide (vr_game.cpp g_freeRoamResumed).
 // Every number is here (game units, seconds)
 struct FreeRoamOffsets {
     float back = 300.0f, up = 250.0f;  // the start: this far behind and above the boat's middle, on the deck

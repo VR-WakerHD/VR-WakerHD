@@ -173,3 +173,11 @@ there, not the action prompt either (`vr_ui.h` `State::boatView`, asked for 2026
 9. Get off the boat while in the neck view or Free Roam: third person straight away, no jump, freeze or bad view; then first person on
    land as before.
 10. Warp (Ballad of Gales), enter a cave or island stage from the boat: no boat views there, nothing stale.
+
+## Back to the boat's view after a pause (2026-11-12)
+
+A player's report: closing a menu while sailing left them in third person instead of the boat's view they had. The
+boat's views still end at once when sailing pauses (a menu, a talk, a cutscene: third person, the game's camera), but
+while Link stays on the boat the view he had is kept (`ViewCycle::resumeBoat`) and taken back as soon as sailing is
+possible again (`ViewCycle::resume`, called from `end_boat_view_unless_sailing`; log "the boat's view again: sailing
+resumed"). Forgotten when Link leaves the boat or the player clicks to another view meanwhile. Covered by `vr_test`.

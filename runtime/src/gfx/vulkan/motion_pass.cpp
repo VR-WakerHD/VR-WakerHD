@@ -163,7 +163,7 @@ bool two_layer_targets(const Surface& depth) {
         t->aspect = VK_IMAGE_ASPECT_COLOR_BIT;
         t->usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-        t->createFlags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+        t->createFlags = 0;  // (not mutable: viewed in its own format only, keeps bandwidth compression; surfaces.cpp)
         t->layout = VK_IMAGE_LAYOUT_UNDEFINED;
         t->use = {};
     }

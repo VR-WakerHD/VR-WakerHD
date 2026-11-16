@@ -16,6 +16,7 @@ VR_PERFORMANCE_ROADMAP.md
 android/app/src/main/res/values/vr.xml
 android/app/src/vr/AndroidManifest.xml
 android/app/src/vr/java/org/wwhdrecomp/wwhd/VrLauncherActivity.java
+android/app/src/main/java/org/wwhdrecomp/wwhd/GameMissingActivity.java
 android/app/src/vr/res/values/vr.xml
 docs/DLL_LOADER_ANALYSIS.md
 docs/DLSS_NR_COMPATIBILITY_ANALYSIS.md
@@ -40,6 +41,7 @@ docs/VR_EYE_PROJECTION.md
 docs/VR_EYE_THREAD.md
 docs/VR_FIRST_PERSON_CAMERA.md
 docs/VR_FIXES.md
+docs/VR_FOVEATION.md
 docs/VR_FRAME_RATE.md
 docs/VR_FRAME_SYNTHESIS.md
 docs/VR_HEAD_CONTROLLER.md
@@ -70,6 +72,9 @@ docs/VR_WIND_WAKER.md
 docs/VR_WIRELESS_AUDIT.md
 docs/VR_WRIST_HUD.md
 docs/dll-loader.md
+docs/images/controls-boat.svg
+docs/images/controls-first-person.svg
+docs/images/controls-third-person.svg
 examples/dll-loader/hello_dll.c
 plan-dlss-loader.md
 plan-dlssnr-snippet.md
@@ -93,6 +98,8 @@ runtime/src/gfx/vulkan/draw_threads.h
 runtime/src/gfx/vulkan/eye_thread.cpp
 runtime/src/gfx/vulkan/eye_thread.h
 runtime/src/gfx/vulkan/fov_diag.h
+runtime/src/gfx/vulkan/foveation.cpp
+runtime/src/gfx/vulkan/foveation.h
 runtime/src/gfx/vulkan/mobile_gpu.h
 runtime/src/gfx/vulkan/motion_glsl.cpp
 runtime/src/gfx/vulkan/motion_glsl.h
@@ -127,6 +134,8 @@ runtime/src/gfx/vulkan/vr_sgsr2.cpp
 runtime/src/gfx/vulkan/vr_sgsr2.h
 runtime/src/gfx/vulkan/vr_upscale.cpp
 runtime/src/gfx/vulkan/vr_upscale.h
+runtime/src/gfx/vulkan/vr_cas.cpp
+runtime/src/gfx/vulkan/vr_cas.h
 runtime/src/gfx/vulkan/vr_vulkan.cpp
 runtime/src/gfx/vulkan/vr_vulkan.h
 runtime/src/gx2/replay_machine.h
@@ -189,10 +198,14 @@ runtime/tools/motion_store_test.cpp
 runtime/tools/ngx_test.cpp
 runtime/tools/texture_pack_test.cpp
 runtime/tools/vr_test.cpp
+tools/docs/controller_diagrams.py
 tools/nr_snippet_proxy/build.sh
 tools/nr_snippet_proxy/nr_snippet_proxy.c
 tools/nr_snippet_proxy/nvngx.dll_wwhd_nr.dll
 tools/recomp/hooks_vr.txt
 tools/vr_launcher/extract_runner.h
 tools/vr_launcher/game_install.h
+tools/vr_launcher/steamvr_binding.h
 tools/vr_launcher/vr_launcher.cpp
+runtime/src/gfx/vulkan/vr_genframe.cpp
+runtime/src/gfx/vulkan/vr_genframe.h

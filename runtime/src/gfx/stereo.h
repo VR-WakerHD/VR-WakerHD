@@ -67,10 +67,30 @@ inline void layout_draw(bool begin) {
 }
 // (docs/VR_SCENE_THREADS.md, stage S6) the second drawing thread's own copy, taken when its span starts: the scene's
 // thread may still be applying earlier state to the shared one while it draws
-struct LayoutState { unsigned drawDepth = 0; bool photograph = false; };
+struct LayoutState { unsigned drawDepth = 0; bool photograph = false; bool sky = false; bool full = false; };
 inline thread_local const LayoutState* t_layoutOverride = nullptr;
 inline unsigned layout_draw_depth() { return t_layoutOverride ? t_layoutOverride->drawDepth : layoutDrawDepth; }
 inline bool layout_photograph() { return t_layoutOverride ? t_layoutOverride->photograph : layoutPhotograph; }
+// (VR fork, 2026-11-14, asked for: "the skybox ... looks out of place") the sky's draw lists' bracket depth (OP_VR_SKY):
+// the thread drawing them sees it as the layouts' state is seen (the second drawing thread: its copy, t_layoutOverride)
+inline unsigned skyDepth = 0;
+// (VR fork, 2026-11-14) the layout drawn now is a picture over the whole screen (a picture transition's frozen frame,
+// OP_LAYOUT_CONTENT's 4th word): in the UI layer it fills the whole image, not shrunk with the cutscene text
+// (vr::layout_scale) nor clipped to the shrunk screen
+inline bool layoutFull = false;
+inline bool layout_full() { return t_layoutOverride ? t_layoutOverride->full : layoutFull; }
+// (diagnostics, 2026-11-14: "transition still show 2 black cut outs instead of 1") a picture transition drew this frame
+// (vr_hooks.cpp snapshot_into_ui_layer): the end of the frame saves eye 0's and eye 1's pictures and the UI layer's image
+// (vr_vulkan.cpp), at most kTransitionDumps times a session
+inline std::atomic<bool> transitionDrawn{false};
+// (diagnostics, the same) set with a transition's dump: each draw of the next frames into a screen-size target logged once
+// per shader pair (draw.cpp), to name the draw that cuts the eye holes
+inline std::atomic<int> transitionTrace{0};
+// (diagnostics) the transition capture the trace's lines belong to now (vr_vulkan.cpp: a sequence's picture), and a
+// count that starts the trace's once-per-draw list again at each picture
+inline std::atomic<int> transitionShot{0};
+inline std::atomic<int> transitionTraceGen{0};
+inline bool sky_draw() { return t_layoutOverride ? t_layoutOverride->sky : skyDepth != 0; }
 inline uint32_t layoutProjectionStart = 0;
 inline std::array<uint32_t,16> layoutProjection{};
 inline void tag_layout(uint32_t start, const uint32_t* words) {
@@ -115,6 +135,10 @@ inline void latch() {
 }
 // the view-space offset of an eye (0 left, 1 right) for this frame's 3D camera
 inline float eye_offset(int eye) {
+    // (VR fork, 2026-11-14) the sky drawn at infinity: each eye sees it from the same point (the sky dome follows the
+    // camera at a few hundred metres; with the eyes' offsets it had their stereo depth at that distance, a ceiling, not
+    // the sky). A token offset of the eye's sign keeps each eye's own field of view (eye_frustum picks it by the sign)
+    if (frame.mode == XR && sky_draw()) return eye ? 1e-4f : -1e-4f;
     if (frame.mode == XR) return frame.eyeOffset[eye ? 1 : 0];
     return (eye ? 1.0f : -1.0f) * frame.depth * eyeDistanceAtUnitDepth;
 }

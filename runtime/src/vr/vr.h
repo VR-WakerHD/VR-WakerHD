@@ -28,6 +28,9 @@ void set_launch_request(int request);
 bool wanted();
 
 Config config();
+// vr.desktopView / vr.desktopViewFill (vr_config.h) for the renderer's desktop window, each frame without the settings'
+// lock: 0 left eye, 1 right eye, 2 both side by side, 3 off, 4 / 5 both left / right dominant; `fill`: the picture fills the window (cropped)
+int desktop_view(bool& fill);
 namespace game {
 // the telescope's magnification for a main-camera projection with the game's field of view (degrees): 1 outside it
 float telescope_magnification(float gameFovyDegrees);
@@ -53,6 +56,44 @@ bool hud_layout(float& inset, float& size);
 }
 // game units per real metre in use: matched to Link's arm (vr.matchLinkBody) or vr.unitsPerMetre
 float world_scale();
+// (turn smoothing) how fast the view turns, in radians a second of its heading in the game (the game heading is the
+// mapping's heading plus the head's yaw in the tracking space), as the game thread measured it at its last camera; 0 not
+// turning (or a snap, a cut). The render thread turns a frame shown again by it (vr_vulkan.cpp headset_frame)
+void set_view_turn_rate(float radiansPerSecond, int64_t forDisplayTime = 0);
+float view_turn_rate();
+// (2026-11-12) the rate only if it was set for the frame of these views (their display time): a frame drawn with the game's
+// own camera (an event, a transition, Link seen from behind) sets none, and the last first-person rate, left standing,
+// turned the frames made from it while its own picture did not turn (a captured sequence: the generated frames ran ahead
+// and the game's frames jumped back 0.5 to 2.2 degrees)
+float view_turn_rate_for(int64_t displayTime);
+// (movement smoothing) how fast the view moves through the game, as metres a second in the tracking space (the way a
+// point fixed in the game moves against the view, negated: the camera's own velocity), measured with the turn rate; 0
+// not moving (or a jump, a cut, the boat)
+void set_view_velocity(Vec3 metresPerSecond);
+// the display time of the last real frame begun (the game's own frames, vr_vulkan.cpp frame_begin), ns; 0: none yet.
+// Frames shown again or generated also wait for the runtime and move its last prediction on: the game's camera is
+// predicted from this one only (vr_game.cpp display_time)
+// `swap`: the swap that frame belongs to (gx2::swaps_executed() + 1 in frame_begin; 0: not known). The two are kept
+// together (one is never read with the other's older value): display_time counts the swaps after that one, not the
+// swaps not yet executed, which still counted this one for a moment after its display time was set (the camera
+// predicted a refresh too far: docs/VR_STREAMING_AUDIT.md, finding 2)
+void set_real_frame_display(int64_t displayTime, uint64_t swap = 0);
+// (docs/VR_HANDS_LAYER_PLAN.md) the hands layer on this frame (the renderer decides: the setting, 30/45 fps); read by
+// the game's side to mark Link's draw lists
+void set_hands_layer_on(bool on);
+bool hands_layer_on();
+// (diagnostics, 2026-11-14, the Tower of the Gods' black/teal figurehead: one run that tries steady hands' parts in turn,
+// WWHD_VR_HANDS_AB=<seconds a phase>) the phase now: -1 off; 0 steady hands as in play, 1 all of it off, 2 off but Link's
+// lists still split and bracketed, 3 on but Link drawn into the eye's picture (no hands image)
+void set_hands_ab_mode(int mode);
+int hands_ab_mode();
+int64_t real_frame_display(uint64_t* swap = nullptr);
+Vec3 view_velocity();
+// (generated frames) where the stick's turn turns the view about, in the tracking space: the game turns the mapping's
+// heading, which swings the head's offset from the room-scale origin (held within `limit` metres sideways,
+// gameplay_head) about that origin, not about the head itself (vr_game.cpp first-person view)
+void set_turn_pivot(Vec3 origin, float limit);
+bool turn_pivot(Vec3& origin, float& limit);
 void set_link_arm_length(float units);  // measured from his skeleton (vr_game.cpp)
 void set_config(const Config& c);  // applies at once and saves the vr.* settings
 void load_settings();              // the saved vr.* and vr.bind.* settings (hostui); defaults when missing or unreadable
@@ -123,6 +164,10 @@ void set_eye_fields(const Fov& left, const Fov& right, bool on);
 // where it moves in instead of its edge pixels stretched (a Quest 3 report: "stretched pixels on the edges of the
 // screen, like the bottom and the right"). 5 degrees on Android, none elsewhere; WWHD_VR_FOV_MARGIN=<degrees>
 float fov_margin();
+// (docs/VR_EYE_PROJECTION.md "Field of view") the share of each eye's field (its tangents) drawn this session:
+// vr.fieldOfView in 0.05 steps, 0.75 .. 1, latched at the session's start (latch_fov_scale); 1 in PC VR
+float fov_scale();
+void latch_fov_scale();
 #endif
 
 // Menus (game thread sets, render thread reads): the size the TV's layouts are drawn at (1: as the game draws

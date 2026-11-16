@@ -9,6 +9,9 @@
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
+
+// (record_worker.cpp places its thread on the CPU's core groups and logs it: core_groups, platform/fast_cores.h)
+void log_msg(const char*, ...) {}
 #include <atomic>
 #include <cstdlib>
 #include <new>

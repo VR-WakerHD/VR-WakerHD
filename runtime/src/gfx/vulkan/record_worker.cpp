@@ -205,6 +205,7 @@ void drain_record_commands(fallback_stats::Boundary boundary, uint32_t opcode, P
     if (!worker) return;
     fallback_stats::Drain observation(boundary, opcode, reason, pending.empty());
     publish_record_commands(); worker->drain();
+    note_direct_recording();  // (the caller may now record into a command buffer directly: pod_commands.cpp's guard)
     observation.complete();
 }
 void stop_record_worker() {

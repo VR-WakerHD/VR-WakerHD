@@ -40,6 +40,7 @@
 #include <vector>
 
 #include "aspect.h"
+#include "interp.h"
 #include "gfx/renderer.h"
 #include "gfx/vulkan/motion_history.h"
 #include "gfx/display_modes.h"
@@ -72,7 +73,7 @@
 #include "vr_bud_view.h"
 
 namespace interp { float pass_t(); uint64_t logic_steps(); int output_fps(); }
-namespace gx2 { uint64_t swaps_in_flight(); }  // (gx2_core.cpp: swaps queued, not yet executed)
+namespace gx2 { uint64_t swaps_in_flight(); uint64_t swaps_issued(); }  // (gx2_core.cpp: swaps queued, not yet executed; issued)
 
 namespace vr::game {
 namespace {
@@ -99,6 +100,8 @@ void set_link_xz(uint32_t link, float x, float z) {
     stf32(kKeptPos + 8, z);
 }
 constexpr uint32_t kEquipModel = 0x4440, kCameraInfoIdx = 0x69BC, kCurProc = 0x65F0;
+// (carrying, standing: daPyProc_GRAB_WAIT_e, daPyProc_GRAB_HEAVY_WAIT_e; walking backwards moves him there too)
+constexpr uint32_t kProcGrabWait = 0x73, kProcGrabHeavyWait = 0x74;
 constexpr uint32_t kWaterY = 0x6A28;  // mWaterY: the water's surface height where he is (mods.cpp's swim effect)
 constexpr uint32_t kKeptEquipActor = 0x6594;  // mActorKeepEquip.mActor (+0x6590 the keep, +4 the actor)
 constexpr uint32_t kKeptGrabActor = 0x65A4;   // mActorKeepGrab.mActor (+0x65A0 the keep, +4 the actor)
@@ -323,6 +326,8 @@ struct SmoothTurn {
     bool allowed = false;  // the right stick turns the view (not in the wheel, conducting, aiming, third person...)
     std::chrono::steady_clock::time_point read{}, lastFrame{};
     XrTime lastDisplay = 0;
+    float lastRate = 0;          // (the last frame's stick rate, radians a second: the frames after it carry it on)
+    bool lastRateValid = false;  // (it turned the last frame)
 } g_smoothTurn;
 constexpr float kSmoothTurnStale = 0.1f;  // seconds: a stick older than this (the pad not read: a pause) does not turn
 // when the game last read the pad (filter_pad_controllers, at its 30 Hz steps): while it does, the controllers are read
@@ -336,10 +341,16 @@ uint64_t g_throwFrom = 0, g_throwTo = 0;  // logic steps during which an off-han
 HitLedger g_ledger;
 PhysicalSword g_physical;
 uint32_t g_physicalLink = 0;  // Link whose capsules the physical sword armed (unarmed before his next execute)
+uint64_t g_trailHiddenFrom = 0;  // (1 + the step of the last downward swing in first person: its trail hidden)
 uint64_t g_bFrom = 0, g_bTo = 0;   // logic steps during which a swing holds B
 bool g_bThrust = false;            // that swing was a thrust: the stick held forward with B (thrust_press)
 bool g_bHammer = false;            // that swing was made with the Skull Hammer: its own button, never B
 bool g_padZL = false, g_padZLShield = false, g_padA = false;
+// the tracked shield's front panel as last drawn (link_draw_begin), for shield_check: its centre, its face's normal (out
+// of its front), in the game's world
+struct ShieldPanel { bool valid = false; uint32_t link = 0; Vec3 centre, face; };
+std::mutex g_panelMutex;
+ShieldPanel g_shieldPanel;
 // The lock-on taken again (asked for, 2026-11-05: "camera lost tracking ... we should always track and be facing the
 // enemy"): the game let go of its target 6 times in a play test with ZL still held, and with Z held it takes no new
 // one. From g_lockLostAt (the step it let go, ZL held) ZL is let go for one pad read kRelockFirst steps on, and again
@@ -459,6 +470,8 @@ bool g_haveAngleOffset = false;
 float g_armWeight[2] = {0, 0};
 float g_detachWeight = 0;  // vr.detachedArms eased: 0 the arms held to Link's shoulders .. 1 detached
 uint32_t g_armsCheckedLink = 0;
+uint32_t g_armsPosedLink = 0;  // the Link whose hands' frames were measured from a clear pose (link_arms)
+uint32_t g_armsWaitLink = 0;   // (its "not measured yet" logged once)
 bool g_armsOk = false;
 bool g_claviclesOk = false;
 bool g_handsLogged[2] = {};
@@ -475,6 +488,9 @@ uint32_t g_shoulderLink = 0;  // smoothed: the elbow never pops to another side 
 // frame on its wrist at the last two logic steps (drawn blended between them, like his model)
 Pose g_passHead;
 bool g_passHeadValid = false;
+// the aiming laser (update_laser, below): set every pass with that pass's controllers and mapping; the pad reads set it
+// only when no pass has for 100 ms
+std::chrono::steady_clock::time_point g_laserPassAt{};
 std::atomic<uint64_t> g_passSerial{0};  // counts the passes (camera overrides): the wrist displays' per-pass cache
 // (diagnostics, WWHD_VR_TRACE_LAG=1) each hand's IK target at the last two logic steps and its scale from the
 // controller's offset to the target: how far the drawn hand (from the steps) trails the controller at each frame
@@ -520,6 +536,8 @@ struct HandMove {
 // - g_weaponGrip: the weapon's base in the frame of the hand holding it, at the step (link_draw_begin), and its root
 //   joint in its base's frame (weapon_drawing).
 struct DrawnHand { Quat rot; Vec3 pos; uint64_t serial = ~0ull; } g_drawnHand[2];
+DrawnHand g_drawnFore[2];  // each forearm (its joint: the elbow, turned along the forearm) as drawn this pass
+DrawnHand g_blendHand[2], g_blendFore[2];  // each hand and forearm as the game posed them, this pass's blend (frame_correct)
 // One piece (docs/VR_HELD_ITEMS.md): the sword (blade and hilt) and the shield rigidly in the hand as it is drawn each
 // pass: their root in the frame of the hand holding them (arm joint set), taken from the step's placement
 // (link_draw_begin), so each pass places them from that hand (frame_correct_pose) as the picked-up stick is. Moved
@@ -612,7 +630,10 @@ int aim_side(const Config& c, uint16_t item) {
 // speed), from kArrowMiddle behind its position (the arrowhead: its flight collision runs back from there). Before, where
 // the arrow's hand (the left, vr_sword.h fixed_item_side) points; `onArrow` says which
 constexpr float kArrowMiddle = 30.0f;  // game units from the arrowhead to the arrow's middle (an estimate)
+LaserView g_laserLast;  // what update_laser last set (hook_laser_drawn rebuilds the hookshot's each pass)
+struct LaserAim { bool hit = false, valid = false; Vec3 sightGame; } g_laserAim;  // (update_laser: the game's sight)
 bool g_bowOnBow = false;  // the arrow on the bow: the bow's button held for the player (vr_bow.h)
+bool g_bowRaise = false;  // the bow in his hand out of the game's aim (after a hit or a roll): its button raises it again
 // The arrow on the bow as drawn (frame_correct, each pass; game units): the game keeps it on Link's left hand, where it
 // holds the bow, its arrowhead at the bow; in VR the bow is in the right hand and the left draws, so it stood out of the
 // drawing hand at that hand's angle (reported with a video: not flush or parallel with the bow). Now it lies along the
@@ -629,6 +650,26 @@ constexpr float kArrowFallGravity = 2.5f;     // game units a step, each step
 constexpr float kArrowFallMax = 40.0f;        // its fastest fall a step
 constexpr float kArrowFallForward = 1.5f;     // game units a step along the bow
 constexpr float kArrowLength = 2.0f * kArrowMiddle;  // game units, nock to head (an estimate)
+// (2026-11-15) the arrow rests on the bow: its line runs through the bow's arrow rest, from the bow model in the game's
+// files (Link.bfres "bow", gcmodel_tool extents with WWHD_SLICE / WWHD_POINTS): the string runs up the model's Y at X 0;
+// the grip, Y -4.8 to 3.3, is X 4.7 to 6.9 and Z -1.0 to 0.5, flaring at Y 4.6 into a wedge that widens to a plate at
+// the bottom of the upper limb: its corners (2.64, 6.18, -2.36 / 1.81), (8.53, 6.61, -4.09 / 3.48) and (15.61, 7.37,
+// -0.27), the limb rising from it (AA_jnt, Y 7.29). The arrow's shaft is 0.82 units round ("arrow"). The rest: on top
+// of the grip, the shaft's middle 0.82 above its top (Y 4.0), over the grip's middle (X 5.8), in the bow's middle plane
+// (Z -0.27). Before: through the bow hand's joint, the bow model's own origin (setItemModel: the bow's base matrix is the
+// hand's), on the string behind the grip ("placed behind the bow"). (Raised to Y 7.23 and 9.23 after "too low on the
+// bow": it was the arrow's angle, not its height; back here, asked for)
+constexpr float kBowRest[3] = {5.8f, 4.82f, -0.27f};
+// the rest as drawn, in the bow hand's frame (each pass the bow is drawn: frame_correct_pose), for the arrow's line
+struct BowRest { bool valid = false; Vec3 inHand, axisInHand, sideInHand; } g_bowRest;
+// (2026-11-15) beside the grip, not through it ("it looks like its going through the bow"): at the rest's height the grip
+// has flared to Z -1.40 .. 0.85 (its ring at Y 4.6), so the shaft's middle goes 0.82 past it, on the side facing the eyes
+// (chosen once each time an arrow is put on: it does not change sides while aimed)
+constexpr float kBowRestSideZ[2] = {-1.40f - 0.82f, 0.85f + 0.82f};
+// (2026-11-15) the arrow square to the bow, asked for ("square to the bow", "so rotate it up"): along the bow's own
+// forward, its model's +X (from the string, X 0, through the grip, X 4.7 to 6.9), through its rest; its nock where the
+// drawing hand is along that line (the string drawn to it). Before: along the line from the drawing hand to the rest,
+// its angle whatever the two hands made
 constexpr float kHeadPastBow = 5.0f;                 // game units the head stays past the bow hand at least
 constexpr uint32_t kArrowModel = 0x3B0;              // daArrow_c::mpModel
 bool bow_aim(Vec3& from, Vec3& dir, bool* onArrow = nullptr) {
@@ -765,6 +806,16 @@ Grip mirror_grip(const Grip& g, Vec3 sign, int flipAxis) {
     return out;
 }
 int g_gripFlipAxis = 2;
+// The mirrored sword grip's two candidates (the hand turned half round the blade from each other) and the one in use,
+// per hand set (asked for, 2026-11-12, with a video: "when the shield is dropped down the hand holding the sword gets
+// flipped upside down"). Mirroring the game's grip onto the other hand flips one of the sword's two axes square to the
+// blade; across_axis chose it each step from the game's animated pose, and as the animation turned the sword a
+// quarter round about its blade (the guard's pose with the shield raised, the idle one with it lowered) the other
+// axis won and the hand turned half round the blade. Now both are made from the game's grip, and the one kept is the
+// one that turns the hand nearest to how its controller is held (the hand's own controller-to-hand turn, g_ctrlToHand),
+// changed only for one nearer by more than kGripSwitch (sword_grip_choice)
+Grip g_gripCand[2][2];
+int g_gripChoice[2] = {-1, -1};
 uint32_t matrices_of(uint32_t model, uint16_t& count, uint32_t* block = nullptr) {
     const uint32_t b = model ? ld32(model + kMtxBlock) : 0;
     const uint32_t m = b ? ld32(b + kMtxBlockMatrices) : 0;
@@ -990,8 +1041,11 @@ void measure_held(uint32_t link) {
             } else {
                 if (item != lockItem) g_bowHold.valid = false, lockItem = item;
                 aimSteps = bow_aim_proc(ld32(link + kCurProc)) ? aimSteps + 1 : 0;  // (the land's 0x94, the boat's 0x8D)
-                if (aimSteps >= kBowSettle && finite(g_held.itemPos)) {
-                    if (!g_bowHold.valid) LOG("[vr] bow: its place in the hand taken from the aiming pose");
+                // (2026-11-14) taken once per hold, as documented: it was taken again every aiming step, so anything the
+                // step's pose carried (the animation's roll of the hand while moving left or right) turned the bow in the
+                // hand. Kept until the bow is put away or another is taken out
+                if (aimSteps >= kBowSettle && finite(g_held.itemPos) && !g_bowHold.valid) {
+                    LOG("[vr] bow: its place in the hand taken from the aiming pose (kept while it is held)");
                     g_bowHold = {true, g_held.itemRot, g_held.itemPos};
                 }
                 if (g_bowHold.valid) {
@@ -1045,6 +1099,19 @@ void measure_held(uint32_t link) {
         const Joint h = read_joint(body, g_held.gameHand);
         g_grip[set] = {normalize(conjugate(h.rot) * root.rot), rotate(conjugate(h.rot), root.pos - h.pos), true};
         g_grip[1 - set] = g_mirrorKnown ? mirror_grip(g_grip[set], g_mirrorSign, g_gripFlipAxis) : Grip{};
+        // (the two candidates: the axes square to the blade, the blade's own axis being the largest of its direction in
+        // the sword's frame; kept as chosen, else the step's choice)
+        g_gripCand[1 - set][0] = g_gripCand[1 - set][1] = Grip{};
+        g_gripCand[set][0] = g_gripCand[set][1] = Grip{};
+        const Vec3 blade = g_held.tipLocal - g_held.baseLocal;
+        if (g_mirrorKnown && finite(blade) && length(blade) > 1.0f) {
+            const Vec3 b{std::fabs(blade.x), std::fabs(blade.y), std::fabs(blade.z)};
+            const int bladeAxis = b.x >= b.y && b.x >= b.z ? 0 : b.y >= b.z ? 1 : 2;
+            const int a0 = (bladeAxis + 1) % 3, a1 = (bladeAxis + 2) % 3;
+            g_gripCand[1 - set][0] = mirror_grip(g_grip[set], g_mirrorSign, std::min(a0, a1));
+            g_gripCand[1 - set][1] = mirror_grip(g_grip[set], g_mirrorSign, std::max(a0, a1));
+            if (g_gripChoice[1 - set] >= 0) g_grip[1 - set] = g_gripCand[1 - set][g_gripChoice[1 - set]];
+        }
         // a picked-up weapon by its handle: its root is far out along it (about 62 units), where a mirrored grip's
         // small errors grew into the weapon floating beside the hand (seen in the headset); its handle is at the hand
         if (enemyWeapon && g_held.haveLast && g_mirrorKnown && !stickKept) {
@@ -1340,6 +1407,47 @@ bool conducting_first_person(uint32_t link) {
     const uint32_t proc = ld32(link + kCurProc);
     return (proc == 0x9A || proc == 0x9B) && play_view();
 }
+// (vr.batonAutoStart, asked for 2026-11-14: "when the player loads in to windwaker or resets the song, allows it to wait
+// 1.5s and then have the song note tracking process start") daPy_lk_c::procTactWait counts the song's beats only once it
+// has started, and it starts on the first note (HD: "the first input starts the beat": m3624, the measure's beats left,
+// set to the conductor's beat, mDoAud_tact_getBeat, and m35A0, the frames to the next beat, to a full beat, so the
+// metronome sounds and the first note is taken at once). A new beat (the beat's hand or stick) or the end of a measure
+// puts it back to waiting. In first person, after kAutoStartSteps waiting this does what the first note does, so the
+// song starts by itself; a note played before then starts it as always. Once a logic step, on the game thread, before
+// Link's step reads it
+constexpr uint32_t kTactBeatsLeft = 0x6A7C;   // m3624 (u32): the measure's beats still to sound; 0: not started
+constexpr uint32_t kTactBeatFrames = 0x69F8;  // m35A0 (f32): frames counted towards the next beat
+constexpr uint32_t kTactBeat = 0x6920;        // mProcVar5 (s16): the measure's beat index
+constexpr uint32_t kTactJudge = 0x6916;       // mProcVar0 (s16): frames to the beat's judgement; -1: none pending
+constexpr uint32_t kTactEnd = 0x6918;         // mProcVar1 (s16): -1 conducting; above 0 a song's end; below -1 the HD count-up
+constexpr uint32_t kTactMode = 0x69C0;        // mProcVar6 (s32): -5 and -4 are event modes (no player song)
+static uint32_t tact_inst() { return GD(0x1048CDD0); }  // mTact (JAIZelInst): +7 mBeat (u8), +0x18 mBeatFrames (f32)
+constexpr int kAutoStartSteps = 45;           // 1.5 s of 30 Hz steps
+void baton_auto_start(uint32_t link, const Config& c) {
+    static uint64_t lastStep = ~0ull;
+    static int waited = 0;
+    const uint64_t step = interp::logic_steps();
+    if (step == lastStep) return;
+    lastStep = step;
+    const bool waiting = c.batonAutoStart && link && conducting_first_person(link) && ld32(link + kCurProc) == 0x9A &&
+                         int32_t(ld32(link + kTactMode)) != -5 && int32_t(ld32(link + kTactMode)) != -4 &&
+                         int16_t(ld16(link + kTactEnd)) == -1 && ld32(link + kTactBeatsLeft) == 0 &&
+                         int16_t(ld16(link + kTactBeat)) == 0 && int16_t(ld16(link + kTactJudge)) == -1;
+    if (!waiting) {
+        waited = 0;
+        return;
+    }
+    if (++waited < kAutoStartSteps) return;
+    waited = 0;
+    const uint32_t inst = tact_inst();
+    const uint8_t beat = ld8(inst + 7);
+    const float frames = float(ldf32(inst + 0x18));
+    if (beat == 0 || !(frames > 0)) return;
+    st32(link + kTactBeatsLeft, beat);
+    stf32(link + kTactBeatFrames, frames);
+    LOG("[vr] Wind Waker: the song started by itself (%u beats a measure, a beat %.1f frames; vr.batonAutoStart)",
+        unsigned(beat), double(frames));
+}
 // the body follows the head (docs/VR_BODY_FOLLOW.md) in first-person play while Link stands, and while he conducts
 // with the Wind Waker (conducting_first_person): the game holds his facing while he conducts, and with his arms
 // on the controllers they reached across his body when you faced another way (reported in the headset)
@@ -1396,7 +1504,28 @@ XrTime display_time(int* aheadOut = nullptr) {
         const char* e = std::getenv("WWHD_VR_PREDICT_QUEUED_MAX");
         return uint64_t(e ? std::max(0, std::min(3, std::atoi(e))) : 3);
     }();
-    const int frames = std::min(4, ahead + int(std::min<uint64_t>(gx2::swaps_in_flight(), queuedMax)));
+    // (2026-11-14, docs/VR_STREAMING_AUDIT.md finding 2) the swaps issued after the one the base display time belongs to:
+    // the render thread sets that time in frame_begin, inside its swap, but counts the swap executed only after the swap
+    // (the eye copies, the frame's end, Turn smoothing's frames), so a camera located in between took the new time and
+    // still counted its swap as queued: a refresh too far. Without a paired swap (none yet) the swaps not yet executed,
+    // as before. On by default (the owner's choice, 2026-11-14; not yet run in a headset); WWHD_VR_PREDICT_PAIRED=0:
+    // the old count, for a comparison run
+    static const bool paired = [] {
+        const char* e = std::getenv("WWHD_VR_PREDICT_PAIRED");
+        const bool on = !(e && *e == '0');
+        if (!on) LOG("[vr] WWHD_VR_PREDICT_PAIRED=0: the camera's prediction counts the swaps not yet executed (as before)");
+        return on;
+    }();
+    uint64_t baseSwap = 0;
+    const int64_t realDisplay = vr::real_frame_display(&baseSwap);
+    uint64_t queued = 0;
+    if (paired && realDisplay && baseSwap) {
+        const uint64_t issued = gx2::swaps_issued();
+        queued = issued > baseSwap ? issued - baseSwap : 0;
+    } else {
+        queued = gx2::swaps_in_flight();
+    }
+    const int frames = std::min(4, ahead + int(std::min<uint64_t>(queued, queuedMax)));
     if (aheadOut) *aheadOut = frames;
     // each frame is shown for the headset's refreshes per drawn frame: 1 at 90 fps on 90 Hz, 2 at 45 fps, 3 at 30 (and
     // 1.5 on average at 60 fps). Counted as one period a frame, the pose at 45 fps was predicted a refresh (11 ms) before
@@ -1404,7 +1533,12 @@ XrTime display_time(int* aheadOut = nullptr) {
     const XrDuration period = s.predicted_period();
     const int fps = interp::output_fps();
     const double perFrame = period > 0 && fps > 0 ? std::clamp(1e9 / double(period) / double(fps), 1.0, 4.0) : 1.0;
-    return s.predicted_display_time() + XrTime(double(frames) * perFrame * double(period));
+    // (2026-11-12) from the last real frame's display time: frames shown again or generated between the game's (turn
+    // smoothing, generated frames) also wait for the runtime and move its last prediction on, and the camera read one or
+    // the other: a headset run had real frames drawn 0 to 22 ms ahead of their own refresh, frame to frame, the real
+    // frames themselves stepping unevenly ("more jittery")
+    const XrTime base = realDisplay ? XrTime(realDisplay) : s.predicted_display_time();
+    return base + XrTime(double(frames) * perFrame * double(period));
 }
 // The head's views at a display time, shared by the game thread's VR work: the pad's input, the camera, the pad filter
 // and the arms each located them, three to four xrLocateViews and xrLocateSpace calls a frame for the same prediction
@@ -1475,7 +1609,9 @@ Pose head_in_game(const xr::Views& v, const Config& c) {
     // and, in the water, above its surface (Steam Frame video, 2026-11-03: swimming, the eyes sat at the surface, half
     // the view a flat sheet of water, and dipped under it into the black the game never draws below the sea)
     if (g_link.valid) floor = above_water(floor, feet, g_link.waterY);
-    return g_head.first_person(head, eyes, facing, t, c.heightOffset, c.maxHeadOffset, world_scale(), leanBack, floor);
+    const Pose fp = g_head.first_person(head, eyes, facing, t, c.heightOffset, c.maxHeadOffset, world_scale(), leanBack, floor);
+    set_turn_pivot(g_map.origin, std::min(c.maxHeadOffset, g_head.wall_lean()));  // (generated frames: the turn's pivot)
+    return fp;
 }
 const char* stage_name() { return reinterpret_cast<const char*>(mem::ptr(play() + kPlayStage)); }
 
@@ -1657,6 +1793,8 @@ void sync_input_locked(const Config& c) {
                 g_bVertical = e.fullKind == SwingKind::Vertical && g_link.link && g_link.valid && locked_on(g_link.link) &&
                               !g_held.hammer && first_person_play();
                 g_bSide = e.fullSide;
+                // (the sword trail of any downward swing hidden in first person, locked on or not: sword_trail_hidden)
+                if (e.fullKind == SwingKind::Vertical && first_person_play()) g_trailHiddenFrom = s + 1;
                 g_bParry = kParryBySwing && g_parry.ready && !g_held.hammer;  // (A: the game's parry; docs/VR_CONTROLS.md)
                 if (g_bParry) LOG("[vr] parry: a swing in the parry's window at step %llu: A", (unsigned long long)s);
                 // locked on (docs/VR_CONTROLS.md, "Locked-on sword moves")
@@ -1737,6 +1875,7 @@ void sync_input_locked(const Config& c) {
     }
 }
 }  // namespace
+void update_laser(const Config& c, const xr::Views* head);  // (the aiming laser, below: set every pass)
 
 void request_recenter() {
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -1750,6 +1889,16 @@ void take_camera_ahead(uint64_t (&ahead)[5], uint64_t& changes) {
 // ---- camera
 bool screen_blur_off() { return running() && !config().screenBlur; }
 bool depth_of_field_off() { return running() && !config().depthOfField; }
+bool lens_flare_off() { return running() && !config().lensFlare; }
+float draw_distance() {
+    // (2026-11-12) by the game's own state, not a time or a number: vr.drawDistance applies only while the game's camera
+    // is its normal play camera (aspect::gameplay_camera) and Link does not look through the telescope or a Picto Box
+    // (seeing far is their point); everywhere else (events, cutscenes, menus, those views and the frames the game
+    // switches between cameras) the culling is the game's own. The share scales whatever distance the game asks for at
+    // each call (aspect.cpp stereo_clipper), so it follows the game's own distance changes (20000 <-> 400000 units)
+    if (!running() || !aspect::gameplay_camera() || subject_zoom_view()) return 1.0f;
+    return std::clamp(config().drawDistance, 0.4f, 1.0f);
+}
 bool blur_head_turn(float a[6]) {
     Fov f;
     if (!running() || !projection(f)) return false;
@@ -1773,6 +1922,10 @@ BoatMeasure g_boatMeasure;
 // triggers and the right stick (CameraOverride), over the time between the frames' display times
 FreeRoamCamera g_freeRoam;
 XrTime g_freeRoamShown = 0;
+// (2026-11-12, a player's request with a video: "going to the map and exiting will reset the free roam view back to
+// default") the Free Roam Camera taken back after a pause of sailing (the map, a menu, a talk: ViewCycle::resume) keeps
+// the zoom and slide it had; only a view chosen with the click starts again from its first place
+bool g_freeRoamResumed = false;
 uint32_t riding_ship() {
     return (ld32(play() + kPlayPlayerStatus0) & kShipRide) ? ld32(play() + kPlayShip) : 0;
 }
@@ -1840,9 +1993,21 @@ void update_boat() {
 // the boat's views end as soon as sailing does (a cutscene, a talk, a menu, getting off, another stage...): third
 // person, the game's camera. Called each frame and at each pad read
 void end_boat_view_unless_sailing() {
+    // (2026-11-12, a player's request: "when he exits the menu on the ship he turns to third person, not the view he
+    // was using when sailing") a pause of sailing with Link still on the boat (a menu, a talk, a cutscene) keeps the
+    // boat's view, and sailing again takes it back (vr_sail_view.h ViewCycle::resume)
+    if (g_view.resume_pending()) {
+        const SailState s = sail_state();
+        if (g_view.resume(sailing_eligible(s), s.riding)) {
+            g_freeRoamResumed = g_view.mode == ViewMode::FreeRoam;
+            g_head.end_game_camera();
+            view_mode_changed("(the boat's view again: sailing resumed)");
+        }
+        return;
+    }
     if (!boat_view_mode(g_view.mode)) return;
     const SailState s = sail_state();
-    if (!g_view.update(sailing_eligible(s))) return;
+    if (!g_view.update(sailing_eligible(s), s.riding)) return;
     g_head.end_game_camera();
     char why[160];
     std::snprintf(why, sizeof why, "(the boat's views end: %s)", sail_blocker(s));
@@ -1895,14 +2060,64 @@ void talk_text_anchor(const Pose& head, const Quat& headTracking, const Config& 
     set_layout_offset_y(y + c.textHeight);
 }
 
+namespace {
+// (drawn_head_eye) the last camera_draw's head eye, per the camera drawn; the stamp: interp's pass count then
+uint32_t g_headEyeCam = 0;
+uint64_t g_headEyePass = 0;
+bool g_headEyeValid = false;
+Vec3 g_headEye{};
+}  // namespace
+bool drawn_head_eye(uint32_t cam, uint64_t pass, float out[3]) {  // (pass: interp::pass_count)
+    if (!g_headEyeValid || !cam || cam != g_headEyeCam || pass > g_headEyePass + 1 || !finite(g_headEye)) return false;
+    out[0] = g_headEye.x;
+    out[1] = g_headEye.y;
+    out[2] = g_headEye.z;
+    return true;
+}
+
 CameraOverride::CameraOverride(uint32_t cam) {
     GameWorkTimer workTimer(GameWork::Camera);  // (docs/VR_PERFORMANCE.md: the VR work on the game thread)
+    if (cam && cam == g_headEyeCam) g_headEyeValid = false;  // (set again below when the head draws it)
     if (!running() || !cam) return;
     xr::Views v;
     int ahead = 0;
     // the runtime moved the tracking space's origin (a recentre on the headset): recentre the game on it too
     if (session().take_space_changed()) request_recenter();
     if (!game_views(display_time(&ahead), v, true)) return;
+    // (diagnostics, 2026-11-12, "[vr] camera calls per frame (10 s)") the head pose each camera call of a frame locates:
+    // located fresh at every call, a frame whose camera is set more than once is drawn with one call's pose and sent with
+    // the last one's (the views stored at the end of this function go with its swap). Headset sequence captures had real
+    // frames 0.3 to 0.7 degrees off their generated neighbours while the head turned
+    {
+        static XrTime frameTime = 0;
+        static Quat first;
+        static int calls = 0;
+        static double frameMax = 0;
+        static uint64_t frames = 0, multi = 0, callSum = 0;
+        static double maxAngle = 0, angleSum = 0;
+        static auto since = std::chrono::steady_clock::now();
+        auto finish = [&] {
+            if (!calls) return;
+            ++frames, callSum += uint64_t(calls);
+            if (calls > 1) ++multi, angleSum += frameMax, maxAngle = std::max(maxAngle, frameMax);
+        };
+        if (v.time == frameTime && calls) {
+            ++calls;
+            const double d = std::min(1.0, std::fabs(double(first.x * v.head.orientation.x + first.y * v.head.orientation.y + first.z * v.head.orientation.z + first.w * v.head.orientation.w)));
+            frameMax = std::max(frameMax, 2.0 * std::acos(d) * 57.29578);
+        } else {
+            finish();
+            frameTime = v.time, first = v.head.orientation, calls = 1, frameMax = 0;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - since >= std::chrono::seconds(10) && frames) {
+            LOG("[vr] camera calls per frame (10 s): %.2f on average over %llu frames; %llu frames set it more than once, "
+                "their head poses apart by %.3f degrees on average, %.3f at most (one call a frame, or 0 apart: the pose "
+                "drawn is the pose sent)", double(callSum) / double(frames), (unsigned long long)frames,
+                (unsigned long long)multi, multi ? angleSum / double(multi) : 0.0, maxAngle);
+            frames = multi = callSum = 0, maxAngle = angleSum = 0, since = now;
+        }
+    }
     {
         static int previous = -1;
         g_cameraAhead[ahead].fetch_add(1, std::memory_order_relaxed);
@@ -1912,6 +2127,74 @@ CameraOverride::CameraOverride(uint32_t cam) {
     const Config c = config();
     std::lock_guard<std::mutex> lock(g_mutex);
     g_head.begin_frame(int64_t(v.time));  // (a new frame: its view is set below, when it is drawn from the head)
+    // (turn smoothing, vr.h view_turn_rate) the view's turn since the last camera, per second of their display times: the
+    // mapping's heading (the stick's smooth turn, the view following Link round). First person in play only (third person
+    // and the boat's views draw the game's own camera); a change of 20 degrees or more at once is a snap, a recentre or a
+    // cut, never smoothed
+    {
+        static float prevHeading = 0;
+        static WorldMapping prevMap;
+        static Vec3 prevEyes{};
+        static XrTime prevTime = 0;
+        static bool have = false;
+        const bool play = first_person_play() && !g_thirdPerson.load() && !boat_view_mode(g_view.mode);
+        float rate = 0;
+        Vec3 velocity{};
+        if (play && have && v.time > prevTime) {
+            const double dt = double(v.time - prevTime) * 1e-9;
+            const float turned = wrap_radians(g_map.heading - prevHeading);
+            if (dt > 0 && dt < 0.2 && std::fabs(turned) < 0.35f) rate = float(double(turned) / dt);
+            // (movement smoothing) the view's own movement through the game since the last camera: where the mapping puts
+            // the head's tracked position now against where the last mapping put it (the head's own movement left out;
+            // the room-scale step, which moves the anchor and the origin together, cancels), as metres a second in the
+            // tracking space. Not on the boat (its deck moves with the view: shown again, it would slide), and a jump of
+            // more than kJump (a door, a warp, a recentre) is none
+            constexpr float kJump = 40.0f;  // game units in one camera frame (1.2 m: no walk or run covers it)
+            const SailState s = sail_state();
+            if (dt > 0 && dt < 0.2 && !s.riding && g_map.unitsPerMetre > 0) {
+                // (the first-person view is placed from Link's eyes, anchor(), each frame, not from the mapping's own
+                // anchor, which stays where it was calibrated: measured against that one the movement was always 0, a
+                // headset run running about read "0.00 m/s" all session, 2026-11-12)
+                const Vec3 eyesNow = anchor();
+                auto at = [&](const WorldMapping& m, Vec3 eyes) {
+                    return eyes + to_game_dir(m, v.head.position - m.origin) * m.unitsPerMetre;
+                };
+                // (2026-11-12) both at this frame's heading: a turn swings the head's offset from the origin, and measured
+                // with the old heading that swing read as movement (up to 1 m of offset, vr.maxHeadOffset) and the generated
+                // frames moved by it on top of turning; they now turn about the turn's own pivot (vr::turn_pivot)
+                WorldMapping prevAtNow = prevMap;
+                prevAtNow.heading = g_map.heading;
+                const Vec3 moved = at(g_map, eyesNow) - at(prevAtNow, prevEyes);
+                if (finite(moved) && length(moved) < kJump)
+                    velocity = rotate(conjugate(game_rotation(g_map)), moved) * float(1.0 / (dt * g_map.unitsPerMetre));
+            }
+        }
+        prevHeading = g_map.heading;
+        prevMap = g_map;
+        prevEyes = anchor();
+        prevTime = v.time;
+        have = play;
+        // (2026-11-12, after the first generated-frames run showed no change) smoothed over kRateTau: the view's heading
+        // and position may change on the game's 30 Hz steps while frames come at 45, so frame to frame the measure went
+        // between nothing and one and a half times the turn, and the frames made from it turned unevenly. A snap, a cut or
+        // leaving play resets it at once
+        constexpr double kRateTau = 0.08;  // seconds
+        static float smoothRate = 0;
+        static Vec3 smoothVelocity{};
+        static XrTime lastSmooth = 0;
+        const double sdt = lastSmooth && v.time > lastSmooth ? double(v.time - lastSmooth) * 1e-9 : 0.0;
+        lastSmooth = v.time;
+        if (!play || !(sdt > 0) || sdt > 0.2) {
+            smoothRate = rate;
+            smoothVelocity = finite(velocity) ? velocity : Vec3{};
+        } else {
+            const float k = float(1.0 - std::exp(-sdt / kRateTau));
+            smoothRate += (rate - smoothRate) * k;
+            if (finite(velocity)) smoothVelocity = smoothVelocity + (velocity - smoothVelocity) * k;
+        }
+        set_view_turn_rate(smoothRate, v.time);
+        set_view_velocity(smoothVelocity);
+    }
     // the game camera's heading as its own logic left it (the left stick is relative to it)
     const Vec3 eye = ld_vec(cam + kCamEye), center = ld_vec(cam + kCamCenter);
     if (finite(eye) && finite(center) && length(center - eye) > 1e-3f) {
@@ -1962,12 +2245,47 @@ CameraOverride::CameraOverride(uint32_t cam) {
             (padLive && (!g_thirdPerson.load() || g_view.mode == ViewMode::FreeRoam)))
             sync_input_locked(c);
         const float stickX = g_input.valid ? g_input.hand[1].stickX : 0.0f;  // (the right controller's, as the pad read)
+        // (2026-11-12, generated frames and turn smoothing) the frames between the game's (Capped 45, Steady 30) carry
+        // on the last frame's turn rate for the refreshes before this one (vr_vulkan.cpp planned_repeats): this frame
+        // turns by that for the time they showed and by the stick's new rate only for the rest (its own refresh). Turned
+        // by the new rate over the whole interval, a stick let go showed the frames between running on two refreshes and
+        // this one jumping back to where the last frame was (a bounce), and a stick pushed showed the view held and then
+        // jumping three refreshes' worth at once
+        float carried = 0, shownSpan = 0;
+        {
+            const vr::FrameRate rateMode = c.frameRate;
+            const XrDuration period = session().refresh_period();
+            const int fps = interp::mode() == 1 ? interp::output_fps() : 30;
+            // (Auto Mode: by this frame's own interval, as Turn smoothing's frames are planned there: none while the game
+            // keeps up with the headset)
+            const bool fixedLow = rateMode == vr::FrameRate::Half || rateMode == vr::FrameRate::Original;
+            const bool autoLow = rateMode == vr::FrameRate::Auto && period > 0 && dt > 0 &&
+                                 std::lround(double(dt) * 1e9 / double(period)) >= 2;
+            if ((fixedLow || autoLow) && c.turnSmoothing && period > 0 && fps > 0 && dt > 0 &&
+                g_smoothTurn.lastRateValid) {
+                const int repeats = fixedLow ? std::clamp(int(std::lround(1e9 / double(period) / double(fps))) - 1, 0, 3)
+                                             : std::clamp(int(std::lround(double(dt) * 1e9 / double(period))) - 1, 0, 3);
+                shownSpan = std::min(dt, float(double(repeats) * double(period) * 1e-9));
+                carried = g_smoothTurn.lastRate * shownSpan;
+            }
+        }
+        if (dt > 0) g_smoothTurn.lastRateValid = false;  // (a second pass of the same frame keeps it)
         if (c.turn == Turn::Smooth && fresh && g_smoothTurn.allowed && stickX != 0) {
-            const float turn = g_turner.update(stickX, dt, c);
+            // (the stick's rate: its turn over the whole interval, over the interval)
+            const float full = g_turner.update(stickX, dt, c);
+            const float rateNow = dt > 0 ? full / dt : 0.0f;
+            const float turn = shownSpan > 0 ? carried + rateNow * (dt - shownSpan) : full;
+            if (dt > 0 && g_view.mode != ViewMode::Neck) g_smoothTurn.lastRate = rateNow, g_smoothTurn.lastRateValid = true;
             if (g_view.mode == ViewMode::Neck)
                 g_head.boat_turn(turn);  // (the neck view: the view turns about its anchor, Link not)
             else
                 g_head.turn(turn);  // (frame_correct: Link's body turns with it every pass)
+            // (generated frames, turn smoothing) the stick's own turn rate for this frame, exactly: the stick and the Turn
+            // speed setting (vr.smoothDegreesPerSecond) as the turn just applied, in place of the rate measured from the
+            // heading at the frame's start (asked for, 2026-11-12: "make sure the settings are linked in case someone
+            // changes their turning speed"; the frames made between the game's showed "the after image of the previous
+            // spot you were looking")
+            if (dt > 0 && g_view.mode != ViewMode::Neck) set_view_turn_rate(rateNow, v.time);
             // (log, every 10 s of turning) the frames turned and their steps: even when each frame turns its share
             static int frames = 0;
             static double sum = 0, most = 0;
@@ -1983,6 +2301,13 @@ CameraOverride::CameraOverride(uint32_t cam) {
                 sum = most = 0;
                 since = now;
             }
+        }
+        else if (c.turn == Turn::Smooth && fresh && g_smoothTurn.allowed && g_view.mode != ViewMode::Neck && dt > 0) {
+            // the stick let go: the turn the frames between already showed kept, not taken back; and the frames after this
+            // one hold still (the rate measured from the headings, smoothed, would carry them on for a few frames more and
+            // the game's frames would take it back), unless a ladder, ledge or lock-on turns the view
+            if (carried != 0) g_head.turn(carried);
+            if (!g_head.rig_turn().active) set_view_turn_rate(0.0f, v.time);
         }
         // a ladder, a ledge or a lock-on: the view's base turns to Link by this frame's share (HeadController's rig
         // turn); not while the pad is not read (a pause), as the smooth turn
@@ -2002,13 +2327,17 @@ CameraOverride::CameraOverride(uint32_t cam) {
         // starts again from its first place
         const float t = std::clamp(interp::pass_t(), 0.0f, 1.0f);
         if (g_head.boat_view() != int(ViewMode::FreeRoam)) {
-            g_freeRoam.reset();
+            const bool kept = g_freeRoamResumed;
+            g_freeRoamResumed = false;
+            if (!kept) g_freeRoam.reset();
             g_freeRoamShown = v.time;
             g_head.begin_boat_view(v.head, int(ViewMode::FreeRoam));
             const Vec3 at = g_freeRoam.local(g_boatMeasure.geometry());
-            LOG("[vr] free roam: begins at %.0f,%.0f,%.0f in the boat's frame (%s geometry), %.0f units from its middle",
-                double(at.x), double(at.y), double(at.z), g_boatMeasure.kept.measured ? "its measured" : "the default",
-                double(g_freeRoam.distance));
+            LOG("[vr] free roam: %s at %.0f,%.0f,%.0f in the boat's frame (%s geometry), %.0f units from its middle, slid "
+                "%.0f across and %.0f along",
+                kept ? "back after the pause, its zoom and slide kept," : "begins", double(at.x), double(at.y), double(at.z),
+                g_boatMeasure.kept.measured ? "its measured" : "the default", double(g_freeRoam.distance),
+                double(g_freeRoam.slideX), double(g_freeRoam.slideZ));
         }
         // this frame's share of the triggers and the stick: the time between the frames' predicted display times (a
         // second pass of the same frame moves nothing); not while the pad is not read (a pause)
@@ -2116,6 +2445,13 @@ CameraOverride::CameraOverride(uint32_t cam) {
             g_maxLean = std::max(g_maxLean, std::sqrt(d.x * d.x + d.z * d.z));
         }
         head = head_in_game(v, c);
+        // the aiming laser every pass (2026-11-15, a player's report: "when you are moving around the laser doesn't keep
+        // up with the hook shot location"): it was set only at the game's 30 Hz pad reads (filter_pad_controllers), from
+        // the controller and the mapping of that moment, and held for the frames between, while the hookshot in the hand
+        // is drawn every frame from the controller of that frame (frame_correct). Now from this pass's controllers (read
+        // above) and this pass's mapping (head_in_game just set it), as the hand is drawn
+        g_laserPassAt = std::chrono::steady_clock::now();
+        update_laser(c, &v);
         g_passHead = head;
         g_passHeadValid = true;
         talk_text_anchor(head, v.head.orientation, c);
@@ -2216,9 +2552,16 @@ CameraOverride::CameraOverride(uint32_t cam) {
     st16(cam + kCamBank, 0);
     cam_ = cam;
     written_ = true;
+    g_headEyeCam = cam;
+    g_headEyePass = interp::pass_count();
+    g_headEye = la.eye;
+    g_headEyeValid = true;
     g_head.drawn(head.orientation);
     // these views are what this frame shows: they go with its swap to the compositor
-    set_frame_views(store_views(rendered, double(interp::logic_steps()) + double(interp::pass_t())));
+    xr::Views stored = rendered;
+    stored.heading = g_map.heading;  // (diagnostics: the frames' evenness, vr_vulkan.cpp note_shown)
+    stored.hasHeading = true;
+    set_frame_views(store_views(stored, double(interp::logic_steps()) + double(interp::pass_t())));
 }
 
 CameraOverride::~CameraOverride() {
@@ -2961,6 +3304,30 @@ void link_executed(uint32_t link, Cpu* cpu) {
                     offeredStep = 0;
                 }
             }
+        }
+    }
+    // The shout on ZL with empty hands (asked for, 2026-11-11: "when the player is empty handed and uses ZL it should use
+    // the shout command"): the game's call, procCall_init (Link's hand to his mouth, ANM_YOBU, and his "Hoi!", voice
+    // 0x2A), which the game itself offers only on R with a partner about (daPyFlg1_NPC_CALL_COMMAND). A press of ZL by the
+    // trigger (not the raised shield's hold), Link's hands empty (no sword drawn, no item, nothing carried), and, after
+    // kShoutWait steps, nothing locked on (the press found no target) and Link standing, walking or in the target-less
+    // walk (procAtnMove 7): he calls out once for the press; still held, the game takes ZL back when the call ends
+    {
+        constexpr uint64_t kShoutWait = 3;  // steps (0.1 s: the lock-on comes on the press's step or the next)
+        const uint32_t kProcCallInit = GC(0x023EE208);  // daPy_lk_c::procCall_init()
+        static bool zlWas = false;
+        static uint64_t pressedAt = 0;
+        const bool zl = g_padZL && !g_padZLShield;
+        if (zl && !zlWas) pressedAt = step;
+        zlWas = zl;
+        if (pressedAt && step >= pressedAt + kShoutWait) {
+            const uint32_t proc = ld32(link + kCurProc);
+            const bool idle = proc >= 4 && proc <= 7;
+            if (first_person_play() && !locked_on(link) && idle && game_item(link) == 0x100 /* kItemNone */ && !carries_overhead(link)) {
+                guest_call(cpu, kProcCallInit, {link});
+                LOG("[vr] shout: ZL with empty hands and nothing to lock onto: Link calls out (action 0x%X)", proc);
+            }
+            pressedAt = 0;
         }
     }
     // (diagnostics, the blocking audit, 2026-11-10; docs/VR_CONTROLS.md, "Blocking") the game's guard as it decides it
@@ -3843,7 +4210,9 @@ static void filter_pad_controllers(input::PadState& s) {
     // while choosing)
     const bool wheel = update_item_wheel(c, haveHead ? &head : nullptr, dt);
     update_wrist_hud(c, haveHead ? &head : nullptr);
-    update_laser(c, haveHead ? &head : nullptr);
+    // (the passes set it each frame, g_laserPassAt; here only when no pass has for a moment: no first-person view drawn)
+    if (std::chrono::steady_clock::now() - g_laserPassAt > std::chrono::milliseconds(100))
+        update_laser(c, haveHead ? &head : nullptr);
     uint32_t held = g_input.held;
     // the boat's controls (vr_sail_view.h boat_controls, docs/VR_CONTROLS.md "On the boat"): only while Link rides it
     const SailState boatState = sail_state();
@@ -3916,6 +4285,21 @@ static void filter_pad_controllers(input::PadState& s) {
         if (guard != guardWas) LOG("[vr] third person: the left grip %s", guard ? "held: the block (ZR held)" : "let go: the block ends");
         guardWas = guard;
     }
+    // first person on a rope (asked for, 2026-11-14: "L1 works to readjust on the rope in 3rd person but L1 is inactive and
+    // does nothing to stop and adjust in first person"): the left grip held is the game's R action button (ZR,
+    // spActionButton: procRopeSwing slows the swing to a stop while it is held), as it is in third person. Only while
+    // Link holds a rope (ROPE_READY 0x77 .. ROPE_UP_HANG 0x7F); elsewhere in first person the grip closes his hand and
+    // blocks only with the shield raised, as before. His hand still closes
+    if (!g_thirdPerson.load() && g_link.valid && g_link.link) {
+        const uint32_t proc = ld32(g_link.link + kCurProc);
+        const bool rope = proc >= 0x77 && proc <= 0x7F;
+        const bool ropeGrip = rope && g_gripLatch[0].closed;
+        if (ropeGrip) s.buttons |= pad::kZR;
+        static bool ropeGripWas = false;
+        if (ropeGrip != ropeGripWas)
+            LOG("[vr] first person: the left grip on the rope %s", ropeGrip ? "held: the action button (ZR held)" : "let go");
+        ropeGripWas = ropeGrip;
+    }
     // the Free Roam Camera (sailing only: vr_sail_view.h): the triggers zoom it and the right stick slides it, so the game
     // gets neither trigger's button nor the stick's crouch there; everywhere else they are as before
     if (g_view.mode == ViewMode::FreeRoam)
@@ -3964,15 +4348,25 @@ static void filter_pad_controllers(input::PadState& s) {
         const uint32_t mainBit = 1u << int(Action::MainTrigger), offBit = 1u << int(Action::OffTrigger);
         const int bowSide = 1, stringSide = 0;  // the bow in the right hand either way (vr_sword.h fixed_item_side)
         BowInput bi;
+        // (2026-11-14, a player's report and log: after a hit or a roll the bow stayed in Link's hand, he stood or walked
+        // (actions 4, 6 after the damage reaction 0x68/0x69) and the string could not be taken for over a minute: it was
+        // only looked for in the game's aim (0x94), which the hit had left, and only a string on the bow presses the
+        // button that raises it again. The rule asked for: "if the player can see the bow and its in his hand he should
+        // be able to pull the string and fire as he pleases".) The string is looked for whenever the bow is in his hand
+        // in first person; out of the aim its button raises it again (tapped until the game aims: g_bowRaise below)
+        const bool bowAimNow = l && mods::camera_mouse::aiming_item(ld32(l + kCurProc));
         bi.aiming = l && g_link.valid && !g_thirdPerson.load() && aspect::gameplay_camera() && g_input.valid &&
-                    bow_in_hand(ld16(l + 0x69B0)) && mods::camera_mouse::aiming_item(ld32(l + kCurProc));
+                    bow_in_hand(ld16(l + 0x69B0));
+        g_bowRaise = bi.aiming && !bowAimNow;
         bi.mainTrigger = (held & mainBit) != 0;
         bi.offTrigger = (held & offBit) != 0;
         bi.stringGrip = g_gripLatch[stringSide].closed;  // (the arrow hand's grip takes the string, its release shoots)
         if (g_input.hand[bowSide].active && g_input.hand[stringSide].active)  // (the draw from the controllers themselves)
             bi.pull = length(g_input.hand[bowSide].grip.position - g_input.hand[stringSide].grip.position);
         bi.dt = dt;
-        if (bi.aiming) held &= ~(mainBit | offBit);
+        // (the triggers shoot: their own buttons, A leaving the aim and ZL's lock-on, not given meanwhile; with the bow
+        // only in his hand, out of the aim and the string not drawn, they keep their own uses)
+        if (bi.aiming && (bowAimNow || g_bowOnBow)) held &= ~(mainBit | offBit);
         // the hands: the nearer pair of the drawn ones (Link's posed hand joints, metres) and the controllers (his arms
         // are shorter and reach-clamped: his hands meet before yours, measured 41 to 76 cm apart in the headset)
         bi.bowHand = g_input.hand[bowSide].grip.position;
@@ -3993,6 +4387,21 @@ static void filter_pad_controllers(input::PadState& s) {
         }
         const BowOutput bo = g_bow.update(bi);
         g_bowOnBow = bo.onBow;
+        // (2026-11-14, a crash in the game's object draw right after "arrow 47C3F4C4 dropped ... (direction 0.40 0.55
+        // 0.73)", the direction of a drop asked for before the bow was put away: the game gives each new arrow the same
+        // address, and the old drop request and aim line were never cleared, so a new arrow was made to fall and its
+        // speed written on after the game removed it) cleared at each new arrow on the bow and while the bow is not
+        // in his hand
+        if (bo.nocked || !(l && g_link.valid && bow_in_hand(ld16(l + 0x69B0)))) {
+            std::lock_guard<std::mutex> lock(g_bowLineMutex);
+            if (g_bowDropArrow || g_bowLine.valid || g_arrowFall.arrow) {
+                if (!bo.nocked)
+                    LOG("[vr] bow: put away: the arrow line, a drop asked for and a falling arrow cleared");
+                g_bowDropArrow = 0;
+                g_bowLine.valid = false;
+                if (!bo.nocked) g_arrowFall = {};
+            }
+        }
         // (the line stays past the shot: the arrow flies along it at its own next step, arrow_kept)
         if (bo.nocked) {
             session().haptic(bowSide, c.hapticStrength * 0.5f, 0.03f);
@@ -4094,7 +4503,10 @@ static void filter_pad_controllers(input::PadState& s) {
         const uint32_t proc = l ? ld32(l + kCurProc) : 0;
         const uint16_t heldItem = l ? ld16(l + 0x69B0) : 0;
         if (l && g_link.valid && !g_thirdPerson.load() && aspect::gameplay_camera() &&
-            (mods::camera_mouse::aiming_item(proc) || heldItem == kItemBoomerang ||
+            // (2026-11-14, a player's log after a hit: the string was taken, no arrow came, and the bow's button was never
+            // pressed: this block ran only in the game's aim. The bow in his hand with its string drawn is let in, so its
+            // button raises it again: the bow branch below)
+            (mods::camera_mouse::aiming_item(proc) || (bow_in_hand(heldItem) && g_bowOnBow) || heldItem == kItemBoomerang ||
              heldItem == kItemDekuLeaf ||  // (the leaf held: the left trigger is its button, not Z-targeting)
              (heldItem == kItemGrapplingHook && proc >= 4 && proc <= 9))) {  // (8, 9: locked on, the right trigger)
             const uint16_t item = ld16(l + 0x69B0);
@@ -4126,7 +4538,18 @@ static void filter_pad_controllers(input::PadState& s) {
                 if (st >= g_throwFrom && st < g_throwTo) s.buttons |= button;
             }
             // the bow: its button held for the player while the arrow is on the bow (vr_bow.h): drawn; let go: shot
-            if (b >= 0 && bow_in_hand(item) && g_bowOnBow) s.buttons |= button;
+            // (out of the aim, the string drawn: tapped on alternate steps, so the game sees a press and raises it when it
+            // can, after a hit's reaction too; held from the aim on. Counted: [vr] bow: raised again)
+            if (b >= 0 && bow_in_hand(item) && g_bowOnBow) {
+                if (!g_bowRaise || (interp::logic_steps() & 1) == 0) s.buttons |= button;
+                static bool raising = false;
+                if (g_bowRaise != raising) {
+                    raising = g_bowRaise;
+                    if (raising) LOG("[vr] bow: the string drawn out of the aim (action 0x%X): its button tapped until the game raises it",
+                                     unsigned(g_link.link ? ld32(g_link.link + kCurProc) : 0));
+                    else LOG("[vr] bow: raised again (the game's aim, action 0x%X)", unsigned(g_link.link ? ld32(g_link.link + kCurProc) : 0));
+                }
+            }
         }
     }
     // third person with the bow out: either trigger draws it (its item button held) and shoots it when let go
@@ -4199,6 +4622,7 @@ static void filter_pad_controllers(input::PadState& s) {
     // conducting with the Wind Waker (vr_baton.h, docs/VR_WIND_WAKER.md): the left stick or the wand's hand holds the
     // note, the right stick or the other hand the beat, given to the game's two sticks; neither moves Link nor turns the view meanwhile
     BatonOutput baton;
+    baton_auto_start(g_link.valid ? g_link.link : 0, c);
     {
         BatonInput bi;
         bi.conducting = conducting();
@@ -4220,6 +4644,8 @@ static void filter_pad_controllers(input::PadState& s) {
         bi.tracked[0] = bi.tracked[0] && haveHead;  // (the centre's frame is the head's heading)
         bi.tracked[1] = bi.tracked[1] && haveHead;
         bi.headingYaw = haveHead ? yaw_of(head.head.orientation) : 0.0f;
+        bi.haveHead = haveHead;
+        if (haveHead) bi.head = head.head.position;
         bi.hands = c.batonHands;
         bi.reach = c.batonHandReach;
         bi.noteHand = dominant_side(c);  // (the wand's hand: read at the wand's tip, with the wand's zone)
@@ -4299,17 +4725,13 @@ static void filter_pad_controllers(input::PadState& s) {
             g_wantedHeading = g_map.heading + yaw_of(left.aim.orientation);
             g_haveWanted = true;
         } else if (haveHead) {
-            // with Detached Arms: the head's heading turned towards where the hands reach, as the standing body follows
-            // (body_follow_yaw). Moving, the game turns Link to this heading: by the head alone, a look round or a
-            // reach while he moved left his body facing away from the arms until he stood again (reported in the
-            // headset)
-            float facing = yaw_of(head.head.orientation);
-            if (c.detachedArms && (left.active || right.active)) {
-                const Vec3 mid = left.active && right.active ? (left.grip.position + right.grip.position) * 0.5f
-                                 : left.active ? left.grip.position : right.grip.position;
-                facing = body_follow_yaw(facing, true, mid - head.head.position);
-            }
-            g_wantedHeading = g_map.heading + facing;
+            // "Where you look" (vr.moveDirection head): the head's heading alone. (Until 2026-11-11, with Detached Arms,
+            // it was turned towards where the hands reach, body_follow_yaw, so that a look round while moving kept
+            // Link's body with the arms; with the controllers held out in front, 40 cm and more, that was the hands'
+            // heading entirely, and both choices walked where the controllers were: a player's report, "I can only move
+            // in the direction of my controller even though I have movement where I look selected". The arms still
+            // reach the controllers (Detached Arms); the standing body still follows the head, body_follows_head.)
+            g_wantedHeading = g_map.heading + yaw_of(head.head.orientation);
             g_haveWanted = true;
         }
     }
@@ -4365,7 +4787,14 @@ static void filter_pad_controllers(input::PadState& s) {
         const uint32_t proc = l && g_link.valid ? ld32(l + kCurProc) : 0;
         const bool was = g_backStep;
         const bool back = g_stickPushed && stickAngle > (was ? 80.0f : 100.0f) * kPi / 180.0f;
-        const bool step = back && haveHead && g_head.calibrated() && first_person_play() && proc >= 4 && proc <= 6;
+        // (2026-11-14, a player's video and log, "Slow Backward Movement with Objects Picked Up": carrying a pot or a statue,
+        // walking backwards began 274 times and ended 270 times at action 0x73 in about a minute: the step gave the game no
+        // stick, so carrying it stood (GRAB_WAIT 0x73, GRAB_HEAVY_WAIT 0x74), which ended the step, the stick went back,
+        // he took a step, and the step began again: he crawled. Carrying and standing is now a standing of the step's
+        // too: back_slide moves him there at the same speed)
+        const bool carryStand = proc == kProcGrabWait || proc == kProcGrabHeavyWait;
+        const bool step = back && haveHead && g_head.calibrated() && first_person_play() &&
+                          ((proc >= 4 && proc <= 6) || carryStand);
         if (step != was) {
             g_backStep = step;
             LOG("[vr] walking backwards: %s (action 0x%X)",
@@ -4600,6 +5029,7 @@ static void filter_pad_controllers(input::PadState& s) {
                                                    : attacking ? "an attack: the guard let go for it" : "the locked-on guard ends");
             lockedGuardWas = lockedGuard;
             if (guardGrip || lockedGuard) s.buttons |= pad::kZR;
+
         }
         if (g_lockLostAt && (s.buttons & pad::kZL) && first_person_play()) {
             if (g_relockTries < kRelockTries && step >= g_lockLostAt + kRelockFirst + kRelockEvery * g_relockTries) {
@@ -4674,6 +5104,19 @@ static void filter_pad_controllers(input::PadState& s) {
         s.rx = std::clamp(s.rx + right.stickX, -1.0f, 1.0f);
         s.ry = std::clamp(s.ry + right.stickY, -1.0f, 1.0f);
         g_turner.update(0, dt, c);
+    } else if (telescope_view()) {
+        // (2026-11-14, players: "allow the player to use R-stick to turn and use the telescope when its out") looking
+        // through the telescope the view is the game's own camera (its subject camera) turned by the head, as in an event,
+        // so a turn of the view had no effect and the game never got the stick: the right stick goes to the game, whose
+        // "Look Around" turns the telescope (and Link) with it
+        s.rx = std::clamp(s.rx + right.stickX, -1.0f, 1.0f);
+        s.ry = std::clamp(s.ry + right.stickY, -1.0f, 1.0f);
+        g_turner.update(0, dt, c);
+        static bool logged = false;
+        if (!logged && (right.stickX != 0 || right.stickY != 0)) {
+            logged = true;
+            LOG("[vr] telescope: the right stick goes to the game (its Look Around)");
+        }
     } else if (g_view.mode == ViewMode::FreeRoam && aspect::gameplay_camera()) {
         // the Free Roam Camera: the right stick slides it (CameraOverride), nothing to the game's camera
         g_turner.update(0, dt, c);
@@ -4713,6 +5156,7 @@ static void filter_pad_controllers(input::PadState& s) {
         g_head.turn(turn);  // (a snap: frame_correct turns Link's body with it every pass)
     }
     g_smoothTurn.allowed = c.turn == Turn::Smooth && !wheel && !g_baton.conducting() && !windCompass && !aiming &&
+                           !telescope_view() &&
                            !(g_thirdPerson.load() && aspect::gameplay_camera() && g_view.mode != ViewMode::Neck) &&
                            !ladder && !lockOn && !spin;
     // the body's facing (docs/VR_BODY_FOLLOW.md): in first-person play it is Link's while the game turns him (moving,
@@ -4945,16 +5389,48 @@ static void filter_pad_controllers(input::PadState& s) {
     // what the lenses show). The photo is the part inside the frame (aspect.cpp), so it shrinks with it. No eyepiece fill
     const bool picto = !scope && picto_view();
     float layoutScale = picto ? picto_frame_scale() : gameplay ? 1.0f : 1.0f / (menu ? c.menuZoomOut : c.textZoomOut);
+    // (2026-11-14, players: "when you play a song in first person the UI is too close to the player they can't read the
+    // full screen so move it away further") while Link conducts, the layouts (the bar of notes and beat, a song's
+    // message) at vr.batonUiSize of their size, as if farther away
+    // (2026-11-14, asked for: "when the player uses the windwaker and the attempt fails, the dialog box telling you it
+    // didnt work appears off screen, have it show up in the center like the rest of the wind waker UI") A failed song
+    // stops the metronome (conducting) while Link is still in the Wind Waker's actions (TactWait 0x9A, TactPlay 0x9B):
+    // its message was drawn at the flat screen's full size, the box at its bottom below the view. The song's size holds
+    // while he is in those actions too (a conversation's text there as well: held where you look, at that size)
+    const uint32_t tactProc = g_link.valid && g_link.link ? ld32(g_link.link + kCurProc) : 0;
+    const bool inTact = tactProc == 0x9A || tactProc == 0x9B;
+    if (!scope && !picto && ((gameplay && conducting()) || ((gameplay || talk) && inTact))) {
+        layoutScale = std::clamp(c.batonUiSize, 0.3f, 1.0f);
+        static bool loggedTactOnly = false;
+        if (!conducting() && !loggedTactOnly) {
+            loggedTactOnly = true;
+            LOG("[vr] Wind Waker: a message with the metronome stopped (action 0x%X): drawn at the song screen's size %.2f",
+                tactProc, double(layoutScale));
+        }
+    }
     if (scope) {
-        // the eyepiece at vr.telescopeSize of the size that covers the eye; outside the mask's own black, the eye
-        // copies fill black (vr_vulkan.cpp), so its ring stays inside what the lenses show
+        // (2026-11-14, players: "too zoomed in and can't see the controls for it") the eyepiece (its round view, the zoom
+        // gauge, the stick prompts) at vr.telescopeSize of its full size, centred, as the Picto Box's viewfinder: it had
+        // been enlarged until its black covered the whole eye picture (about 1.9 times on a PS VR2's) and then taken at
+        // 0.85 of that, so the gauge and the prompts were outside what the lenses show. Outside the layout's area the eye
+        // copies fill black, as round the Picto Box's frame (the shares are of the UI layer's image: the drawn field)
+        layoutScale = std::clamp(c.telescopeSize, 0.5f, 1.0f);
         Fov f;
-        const float eyeAspect = eye_image_aspect() > 0 ? std::max(0.5f, eye_image_aspect())  // (the eye pictures' shape)
-                                : projection(f) ? std::max(0.5f, fov_aspect(f)) : 16.0f / 9.0f;
-        const float cover = std::max(1.0f, (16.0f / 9.0f) / eyeAspect);  // the layout's height share is 1/cover
-        layoutScale = cover * c.telescopeSize;
-        set_eyepiece(std::min(1.0f, layoutScale * (eyeAspect >= 16.0f / 9.0f ? (16.0f / 9.0f) / eyeAspect : 1.0f)),
-                     std::min(1.0f, layoutScale / cover));
+        const float uiAspect = projection(f) ? std::max(0.5f, fov_aspect(f))
+                               : eye_image_aspect() > 0 ? std::max(0.5f, eye_image_aspect()) : 16.0f / 9.0f;
+        const float cover = std::max(1.0f, (16.0f / 9.0f) / uiAspect);  // the layout's height share is 1/cover
+        // (2026-11-14 in the headset: "telescope needs more black fill it doesn't fully cover everything yet") only a
+        // square round the round view is copied (as wide as it is tall, in the drawn field's tangents): the game's mask
+        // leaves the 16:9 screen's sides beside the circle open, which showed the world there
+        // (and 2026-11-14 again: "need more black to fill openings on top and bottom between the telescope UI and our black
+        // fill": the game's mask does not reach the 16:9 screen's top and bottom either) the square is kScopeSquare of
+        // the screen's height, round the round view
+        constexpr float kScopeSquare = 0.88f;
+        const float eh = std::min(1.0f, kScopeSquare * layoutScale / cover);
+        float ew = std::min(1.0f, layoutScale * (uiAspect >= 16.0f / 9.0f ? (16.0f / 9.0f) / uiAspect : 1.0f));
+        if (projection(f) && std::tan(f.right) > 0 && std::tan(f.up) > 0)
+            ew = std::min(ew, eh * std::tan(f.up) / std::tan(f.right));
+        set_eyepiece(ew, eh);
     } else if (picto) {
         // the viewfinder at its smaller size: outside the layout's area the eye copies fill black, as around the
         // telescope's eyepiece, so the frame's black reaches the edges of the view (the 3D window around the smaller
@@ -4996,6 +5472,49 @@ static void filter_pad_controllers(input::PadState& s) {
 }
 
 // ---- movement angle
+// (a player's report, 2026-11-14: "when they release from the rope swing ... they dont fly far enough to make it to the
+// next rope") On a rope the game builds the swing from the stick pushed forward or back of the way Link faces (within
+// about 45 degrees: procRopeSwing's getDirectionFromAngle 0 or 1), and turns him round the rope with the stick to either
+// side; his release flies 15 x and rises 30 x the swing's share of its most. In first person the stick's forward was the
+// head's: with the view turned away from him (the player's log: smooth turns while on the rope), forward read as a side
+// and turned him instead of swinging, so the swing stayed small. On a rope the stick is taken from the way he faces:
+// forward and back always swing him, the sides turn him, wherever you look. Hanging, climbing and swinging
+// (ROPE_SWING 0x78 .. ROPE_MOVE 0x7D, ROPE_UP_HANG 0x7F); not the rope's throw and catch
+bool rope_stick_proc(uint32_t proc) { return (proc >= 0x78 && proc <= 0x7D) || proc == 0x7F; }
+// (a player's report with a video and logs, 2026-11-14, "Rope Stuck 2": in first person Link let go but stayed on the
+// rope; 3rd person jumped off every time. The log: let go at full speed, then "rope: swinging" again within a step or
+// two) Falling, the game catches any rope his body touches (changeRopeSwingProc), the one he let go of included. As he
+// left it the stick went back to the head's heading: with the view turned from the way he flew, the held stick steered
+// him back or across, into the rope he had just left. Until he lands or catches something (kRopeAirSteps at most), the
+// stick stays with the way he faces, as on the rope: held forward, he goes on the way he jumped
+constexpr uint64_t kRopeAirSteps = 45;  // (1.5 s)
+uint64_t g_ropeAirUntil = 0;
+bool rope_air_stick(uint32_t proc) { return proc == 0x27 && interp::logic_steps() < g_ropeAirUntil; }
+// (a player's video and log, 2026-11-14, "Rope Stuck Test 2": the stick above did not help. The log: A let him go each
+// time (fall, forward 15, rising 27.5), and in 4 of 6 jumps "caught a rope again" 1 or 2 steps later: still touching
+// the rope he left, the fall's catch (changeRopeSwingProc: any rope his body cylinder touches, the game keeping no
+// note of the one just left) took him straight back onto it, and he swung on it again. Asked for: "A should allow the
+// player to jump off the rope every time".) In first person, for kRopeAirSteps after letting go, the rope he let go of
+// is not caught (another rope is, as before)
+constexpr uint32_t kRopeKeepActor = 0x65A8 + 4;  // daPy_lk_c::mActorKeepRope.mActor (the rope he holds)
+constexpr uint32_t kLinkCyl = 0x765C;             // daPy_lk_c::mCyl (dCcD_Cyl): his body's collider
+constexpr uint32_t kCylCo = 0xDC;                 // dCcD_GObjInf::mGObjCo
+uint32_t g_ropeHeld = 0, g_ropeLeft = 0;
+bool rope_catch_blocked(Cpu* cpu, uint32_t link) {
+    if (!running() || !cpu || !link || !g_ropeLeft || g_thirdPerson.load()) return false;
+    if (interp::logic_steps() >= g_ropeAirUntil) return false;
+    const Cpu saved = *cpu;
+    const bool hit = guest_call(cpu, GC(0x02516464), {link + kLinkCyl}) & 0xFF;  // dCcD_GObjInf::ChkCoHit
+    const uint32_t actor = hit ? guest_call(cpu, GC(0x02515BBC), {link + kLinkCyl + kCylCo}) : 0;  // GetCoHitAc
+    *cpu = saved;
+    if (!actor || actor != g_ropeLeft) return false;
+    static uint64_t lastLog = ~0ull;
+    if (g_ropeAirUntil != lastLog) {
+        lastLog = g_ropeAirUntil;
+        LOG("[vr] rope: not caught again by the rope he let go of (first person; the jump takes him off it)");
+    }
+    return true;
+}
 int16_t controlled_angle_hook(int16_t original) {
     if (!running()) return original;
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -5013,7 +5532,48 @@ int16_t controlled_angle_hook(int16_t original) {
         }
     }
     if (!g_haveAngleOffset) return original;
+    if (g_link.valid && g_link.link &&
+        (rope_stick_proc(ld32(g_link.link + kCurProc)) || rope_air_stick(ld32(g_link.link + kCurProc))))
+        return controlled_angle(s16_to_radians(int16_t(ld16(g_link.link + kShapeAngleY))), g_angleOffset);
     return controlled_angle(g_wantedHeading, g_angleOffset);
+}
+// (diagnostics, with the rope's stick above) once a step: the swing on a rope (mProcVar2 +0x691A, of 12000 at most, 1500
+// on a special rope) and, when Link lets go of a swinging rope, how big it was and how fast he leaves
+void rope_swing_watch(uint32_t link) {
+    static uint32_t lastProc = 0;
+    static int16_t lastSwing = 0, peak = 0;
+    static uint64_t lastStep = ~0ull;
+    const uint64_t step = interp::logic_steps();
+    if (step == lastStep || !link) return;
+    lastStep = step;
+    const uint32_t proc = ld32(link + kCurProc);
+    static uint64_t letGoAt = 0;
+    if (proc != 0x27 && step >= 1) g_ropeAirUntil = std::min(g_ropeAirUntil, step);  // (landed or caught: ended)
+    if (proc == 0x78) {
+        const int16_t swing = int16_t(ld16(link + 0x691A));
+        if (lastProc != 0x78) {
+            if (letGoAt && step - letGoAt <= 15)
+                LOG("[vr] rope: caught a rope again %llu steps after letting go (%s)", (unsigned long long)(step - letGoAt),
+                    g_thirdPerson.load() ? "third person" : "first person");
+            letGoAt = 0;
+            peak = 0;
+            LOG("[vr] rope: swinging (%s)", g_thirdPerson.load() ? "third person: the stick from the game's camera"
+                                                                 : "first person: the stick from the way Link faces");
+        }
+        peak = std::max(peak, swing);
+        lastSwing = swing;
+        g_ropeHeld = ld32(link + kRopeKeepActor);
+    } else if (lastProc == 0x78 && !rope_stick_proc(proc)) {
+        LOG("[vr] rope: let go with the swing at %d (%.0f%% of 12000; the biggest this swing %d): forward speed %.1f, "
+            "rising %.1f (action 0x%X)", int(lastSwing), double(lastSwing) / 120.0, int(peak),
+            double(float(ldf32(link + kSpeedF))), double(float(ldf32(link + kSpeed + 4))), proc);
+        letGoAt = step;
+        if (proc == 0x27 && !g_thirdPerson.load()) {
+            g_ropeAirUntil = step + kRopeAirSteps;
+            g_ropeLeft = g_ropeHeld;  // (not caught again by it: rope_catch_blocked)
+        }
+    }
+    lastProc = proc;
 }
 
 // ---- arms
@@ -5049,37 +5609,13 @@ void link_arms(uint32_t link) {
             g_armsOk = g_armsOk && plausible_arm(arm, 3.0f, 80.0f);
         }
         if (!g_armsOk) LOG("[vr] Link's arm joints do not look like arms: the arms keep the animation");
-        // which set is his left arm: its shoulder lies to the left of his heading (else the controllers would drive
-        // the opposite arms and the elbows bend to the inside)
         if (g_armsOk) {
-            // this Link's own position and heading (the step's record may still be another scene's)
-            const Vec3 right = heading_right(s16_to_radians(int16_t(ld16(link + kHeading))));
-            const Vec3 at = ld_vec(link + kPos);
-            const float a = dot(read(kArmJoints[0][0]).pos - at, right);
-            const float b = dot(read(kArmJoints[1][0]).pos - at, right);
-            // only a clear answer (shoulders a believable distance apart) changes the assignment
-            if (std::isfinite(a) && std::isfinite(b) && std::fabs(a - b) > 5.0f && std::fabs(a - b) < 60.0f) {
-                const bool swapped = a > b;
-                g_jointSet[0] = swapped ? 1 : 0;
-                g_jointSet[1] = swapped ? 0 : 1;
-            }
-            LOG("[vr] arm sides: joints %d %.1f, joints %d %.1f units to Link's right: left arm %d", kArmJoints[0][0],
-                double(a), kArmJoints[1][0], double(b), kArmJoints[g_jointSet[0]][0]);
             set_link_arm_length(0.5f * (length(read(kArmJoints[0][1]).pos - read(kArmJoints[0][0]).pos) +
                                         length(read(kArmJoints[0][2]).pos - read(kArmJoints[0][1]).pos) +
                                         length(read(kArmJoints[1][1]).pos - read(kArmJoints[1][0]).pos) +
                                         length(read(kArmJoints[1][2]).pos - read(kArmJoints[1][1]).pos)));
             LOG("[vr] world scale %.1f units per metre%s", double(world_scale()),
                 vr::config().matchLinkBody ? " (matched to Link's arms)" : "");
-            // each hand's straight-wrist direction: the forearm's, in the hand joint's frame (his idle pose)
-            for (int set = 0; set < 2; ++set) {
-                const Joint hand = read(kArmJoints[set][2]), fore = read(kArmJoints[set][1]);
-                g_wristStraight[set] = normalize(rotate(conjugate(hand.rot), normalize(hand.pos - fore.pos)), {0, 0, 1});
-                const Vec3 fwdIdle = heading_dir(s16_to_radians(int16_t(ld16(link + kHeading))));
-                g_handLevelUp[set] = level_hand_up(hand.rot, g_wristStraight[set], fwdIdle);
-                g_ctrlToHand[set] = controller_to_hand(level_hand(hand.rot, g_wristStraight[set], fwdIdle), fwdIdle);
-                g_ctrlToHandOk[set] = std::isfinite(g_ctrlToHand[set].x) && std::isfinite(g_ctrlToHand[set].w);
-            }
         }
         // the clavicles: a short bone from them to each upper arm (else the shoulders stay as animated)
         g_claviclesOk = g_armsOk;
@@ -5089,18 +5625,62 @@ void link_arms(uint32_t link) {
             g_claviclesOk = g_claviclesOk && std::isfinite(d) && d > 1.0f && d < 25.0f;
         }
         if (g_armsOk && !g_claviclesOk) LOG("[vr] the clavicles do not check out: the shoulders keep the animation");
-        // the hands' frames mirrored: Link's left hand's axes reflected across his body against his right hand's
-        if (g_armsOk) {
-            const Vec3 right = heading_right(s16_to_radians(int16_t(ld16(link + kHeading))));
-            const Joint l = read(kArmJoints[0][2]), r = read(kArmJoints[1][2]);
-            float dots[3];
-            for (int a = 0; a < 3; ++a) {
-                const Vec3 e{a == 0 ? 1.0f : 0.0f, a == 1 ? 1.0f : 0.0f, a == 2 ? 1.0f : 0.0f};
-                Vec3 la = rotate(l.rot, e);
-                la = la - right * (2.0f * dot(la, right));
-                dots[a] = dot(la, rotate(r.rot, e));
+    }
+    // The hands' frames (the wrists' straight line, controller to hand, the mirror between the hands) are measured
+    // from his idle pose, and only once his shoulders stand clearly apart across his heading. Measured on the Link's
+    // first step after a scene change, he could be mid-turn (action 0x89, turned 180 degrees at once) with his
+    // shoulders 3 units apart: the mirror read -0.74 0.67 0.51 (an idle pose reads 1 -1 1), passed as clear, and both
+    // hands held the sword and shield turned the wrong way round until the next scene (headset, 2026-11-11). Until a
+    // clear pose comes, the last good measurement is kept.
+    if (g_armsOk && g_armsPosedLink != link) {
+        const Vec3 right = heading_right(s16_to_radians(int16_t(ld16(link + kHeading))));
+        const Vec3 at = ld_vec(link + kPos);
+        const float a = dot(read(kArmJoints[0][0]).pos - at, right);
+        const float b = dot(read(kArmJoints[1][0]).pos - at, right);
+        const bool apart = std::isfinite(a) && std::isfinite(b) && std::fabs(a - b) > 20.0f && std::fabs(a - b) < 60.0f;
+        // the hands' frames mirrored: Link's left hand's axes reflected across his body against his right hand's (an
+        // idle pose reads each axis within 0.1 of 1 or -1; under 0.8 the hands are not in it)
+        const Joint l = read(kArmJoints[0][2]), r = read(kArmJoints[1][2]);
+        float dots[3];
+        for (int ax = 0; ax < 3; ++ax) {
+            const Vec3 e{ax == 0 ? 1.0f : 0.0f, ax == 1 ? 1.0f : 0.0f, ax == 2 ? 1.0f : 0.0f};
+            Vec3 la = rotate(l.rot, e);
+            la = la - right * (2.0f * dot(la, right));
+            dots[ax] = dot(la, rotate(r.rot, e));
+        }
+        // (2026-11-13) an idle pose reads each axis within 0.1 of 1 or -1: clear only at 0.9 and more, and for the first
+        // measurement of a session too. With 0.8 a Quest 3S player's hands were measured from a pose reading 0.82 -0.87
+        // 0.95 after a scene change, and a PC player's first one from -0.49 0.48 0.88 (taken as the first, unclear): the
+        // controllers' rotation onto the hands was then off by tens of degrees ("palms down, hands horizontal while I
+        // hold the controllers upright") until the next scene. Until a clear pose comes the arms keep the animation (the
+        // first time) or the last good measurement (after)
+        constexpr float kClearMirror = 0.9f;
+        const bool clear = std::fabs(dots[0]) > kClearMirror && std::fabs(dots[1]) > kClearMirror &&
+                           std::fabs(dots[2]) > kClearMirror;
+        if (!apart || !clear) {
+            if (g_armsWaitLink != link)
+                LOG("[vr] hands: not measured yet (shoulders %.1f and %.1f units to Link's right; mirror %.2f %.2f %.2f): "
+                    "not his idle pose, the last measurement kept until it is", double(a), double(b), double(dots[0]),
+                    double(dots[1]), double(dots[2]));
+            g_armsWaitLink = link;
+        } else {
+            g_armsPosedLink = link;
+            // which set is his left arm: its shoulder lies to the left of his heading (else the controllers would
+            // drive the opposite arms and the elbows bend to the inside)
+            const bool swapped = a > b;
+            g_jointSet[0] = swapped ? 1 : 0;
+            g_jointSet[1] = swapped ? 0 : 1;
+            LOG("[vr] arm sides: joints %d %.1f, joints %d %.1f units to Link's right: left arm %d", kArmJoints[0][0],
+                double(a), kArmJoints[1][0], double(b), kArmJoints[g_jointSet[0]][0]);
+            // each hand's straight-wrist direction: the forearm's, in the hand joint's frame (his idle pose)
+            const Vec3 fwdIdle = heading_dir(s16_to_radians(int16_t(ld16(link + kHeading))));
+            for (int set = 0; set < 2; ++set) {
+                const Joint hand = read(kArmJoints[set][2]), fore = read(kArmJoints[set][1]);
+                g_wristStraight[set] = normalize(rotate(conjugate(hand.rot), normalize(hand.pos - fore.pos)), {0, 0, 1});
+                g_handLevelUp[set] = level_hand_up(hand.rot, g_wristStraight[set], fwdIdle);
+                g_ctrlToHand[set] = controller_to_hand(level_hand(hand.rot, g_wristStraight[set], fwdIdle), fwdIdle);
+                g_ctrlToHandOk[set] = std::isfinite(g_ctrlToHand[set].x) && std::isfinite(g_ctrlToHand[set].w);
             }
-            const bool clear = std::fabs(dots[0]) > 0.5f && std::fabs(dots[1]) > 0.5f && std::fabs(dots[2]) > 0.5f;
             if (clear) {
                 g_mirrorSign = {dots[0] > 0 ? 1.0f : -1.0f, dots[1] > 0 ? 1.0f : -1.0f, dots[2] > 0 ? 1.0f : -1.0f};
                 g_mirrorKnown = true;
@@ -5229,7 +5809,40 @@ void link_arms(uint32_t link) {
         facesAway = false;
     else if (haveHead) {
         const float off = std::fabs(wrap_radians(stepHeading - link_facing(g_map.heading, yaw_of(v.head.orientation))));
-        facesAway = off > (facesAway ? 80.0f : 100.0f) * kPi / 180.0f;
+        // (2026-11-15) nor while the stick moves him a way within 100 degrees of the view (g_stickPushed, not g_stickBack),
+        // or for kAfterStickSteps after: he walks that way, at most 100 degrees off the view, and faces further away
+        // only while the game turns him to it. Circling both sticks in opposite ways (moving round while the view
+        // turns the other way) left him past 100 degrees for moments at a time, and each time both arms went to the
+        // animation and back in 0.15 s: the hand and what it held flipped and spun (the Hookshot, the Skull Hammer's
+        // free hand, the Deku Leaf), and with the leaf his animated arms were seen away from the view (a player's
+        // video, 2026-11-15). Walking backwards keeps its own exemption (g_stickBack, g_backStep)
+        constexpr uint64_t kAfterStickSteps = 15;  // (half a second: he finishes the turn after the stick lets go)
+        static uint64_t lastStickStep = 0;
+        if (g_stickPushed && !g_stickBack) lastStickStep = interp::logic_steps();
+        const bool turningToStick = lastStickStep && interp::logic_steps() <= lastStickStep + kAfterStickSteps;
+        const bool wouldFaceAway = off > (facesAway ? 80.0f : 100.0f) * kPi / 180.0f;
+        facesAway = wouldFaceAway && !turningToStick;
+        // (proof it ran, every 10 s while it does: the steps the arms stayed on the controllers that would have gone
+        // to the animation, and how far he faced from the view)
+        static int keptSteps = 0;
+        static float keptMax = 0;
+        static uint64_t lastKeptStep = ~0ull;
+        static auto keptSince = std::chrono::steady_clock::now();
+        if (wouldFaceAway && turningToStick && interp::logic_steps() != lastKeptStep) {
+            lastKeptStep = interp::logic_steps();
+            ++keptSteps;
+            keptMax = std::max(keptMax, off);
+        }
+        if (keptSteps && std::chrono::steady_clock::now() - keptSince > std::chrono::seconds(10)) {
+            LOG("[vr] arms kept on the controllers while Link turns to the stick (10 s): %d steps he faced past 100 "
+                "degrees from the view (at most %.0f), action 0x%X, held item 0x%X",
+                keptSteps, double(keptMax * 180.0f / kPi), unsigned(armProc), unsigned(ld16(link + 0x69B0)));
+            keptSteps = 0;
+            keptMax = 0;
+            keptSince = std::chrono::steady_clock::now();
+        } else if (!keptSteps) {
+            keptSince = std::chrono::steady_clock::now();
+        }
     }
     for (int side = 0; side < 2; ++side) {
         // Link's left arm follows the left controller, his right arm the right one
@@ -5417,6 +6030,30 @@ void link_arms(uint32_t link) {
         if (swordHand) {
             g_swordRot = held_sword_rotation(sword_base(hand), c);
             g_swordRotValid = true;
+            // the mirrored grip's candidate that turns the hand nearest to its controller's way (g_gripCand)
+            {
+                const int set = g_jointSet[side];
+                Grip* cand = g_gripCand[set];
+                if (cand[0].valid && cand[1].valid && g_ctrlToHandOk[set]) {
+                    constexpr float kGripSwitch = 0.5f;  // radians (about 30 degrees) nearer before changing
+                    const Quat natural = normalize(to_game_orientation(g_map, hand.aim.orientation) * g_ctrlToHand[set]);
+                    float off[2];
+                    for (int k = 0; k < 2; ++k)
+                        off[k] = angle_between(normalize(g_swordRot * conjugate(cand[k].rot)), natural);
+                    int& choice = g_gripChoice[set];
+                    const int was = choice;
+                    if (choice < 0) choice = off[1] < off[0] ? 1 : 0;
+                    else if (off[1 - choice] + kGripSwitch < off[choice]) choice = 1 - choice;
+                    if (choice != was) {
+                        static int lines = 0;
+                        if (lines++ < 100)
+                            LOG("[vr] sword grip: the hand %s on the %s candidate (%.0f degrees from the controller's way; the "
+                                "other %.0f)", was < 0 ? "set" : "turned half round the blade", choice ? "second" : "first",
+                                double(off[choice] * 180.0f / kPi), double(off[1 - choice] * 180.0f / kPi));
+                    }
+                    g_grip[set] = cand[choice];
+                }
+            }
             swordWant = normalize(g_swordRot * conjugate(g_grip[g_jointSet[side]].rot));
             const Vec3 along = rotate(swordWant, g_wristStraight[g_jointSet[side]]);
             const Vec3 elbowWant = wrist - along * length(anim.hand.pos - anim.lower.pos);
@@ -5435,8 +6072,28 @@ void link_arms(uint32_t link) {
         style.twistLimit = detached_limit(style.twistLimit, kPi, detach);
         // an empty hand: its roll the controller's from level, not added to the animation's (which turned with his body:
         // the hands rolled over when he ran left or right, reported with a video). A held item keeps the game's hold
-        if (g_held.gameHand != kArmJoints[g_jointSet[side]][2]) {
-            style.levelUp = g_handLevelUp[g_jointSet[side]];
+        // (2026-11-14) except the bow: its hand is held rigidly to its controller as an empty hand is. With the game's
+        // hold, its roll was the animation's plus the controller's, and the animation rolled the hand as Link moved left
+        // or right while aiming: the bow in it turned over and back ("the bow keeps flipping around upside down", a
+        // player's video). Asked for: the bow moves and turns only as the player's hand does (place_held places it
+        // from the same controller frame)
+        // (2026-11-15) the Hookshot and the Deku Leaf the same way (not the leaf's glide: its hand takes the glide pose's
+        // turn, below): their hand's roll was the animation's plus the controller's, and the run animation turned it as
+        // Link went round, the item spinning or flipping in the hand (a player's video, 2026-11-15: both sticks circled)
+        const uint16_t handItem = game_item(link);
+        const bool bowHand = (bow_in_hand(handItem) || handItem == kItemHookshot || (handItem == kItemDekuLeaf && !gliding)) &&
+                             g_held.gameHand == kArmJoints[g_jointSet[side]][2];
+        {
+            static uint16_t loggedItem = 0xFFFF;
+            if (bowHand && handItem != loggedItem && g_ctrlToHandOk[g_jointSet[side]]) {
+                loggedItem = handItem;
+                LOG("[vr] held item 0x%X: its hand held rigidly to the %s controller (the animation's roll left out)",
+                    unsigned(handItem), side ? "right" : "left");
+            }
+            if (!bowHand && g_held.gameHand < 0) loggedItem = 0xFFFF;
+        }
+        if (g_held.gameHand != kArmJoints[g_jointSet[side]][2] || bowHand) {
+            if (!bowHand) style.levelUp = g_handLevelUp[g_jointSet[side]];
             // (2026-11-10: held rigidly to the controller instead; the roll from level spun the hanging hands as the
             // player walked round, there being no level with the hand pointing down)
             if (g_ctrlToHandOk[g_jointSet[side]]) {
@@ -5448,6 +6105,38 @@ void link_arms(uint32_t link) {
         ArmJoints posed = pose_arm_natural(anim, g_claviclesOk ? &clavicle : nullptr, wrist, point, style,
                                            g_armWeight[side], &clavicleOut, &g_hingeLocal[side]);
         if (!finite(posed.hand.pos) || !finite(posed.lower.pos)) continue;
+        // (diagnostics, 2026-11-13: a Quest 3S player's empty hands showed open, palms forward and down, fingers up, while
+        // he held the controllers upright; a video) every 5 s per hand: what the controller reports (its aim and grip
+        // poses' forward and up, in degrees: pitch above level, roll of its up from vertical) and where the drawn hand's
+        // fingers point (the straight-wrist direction measured from his idle pose), and how it is driven
+        {
+            static std::chrono::steady_clock::time_point lastHandLog[2];
+            const auto now = std::chrono::steady_clock::now();
+            if (now - lastHandLog[side] > std::chrono::seconds(5) && hand.active) {
+                lastHandLog[side] = now;
+                const float deg = 180.0f / kPi;
+                auto pitch = [&](Vec3 f) { return std::asin(std::clamp(normalize(f).y, -1.0f, 1.0f)) * deg; };
+                auto roll = [&](Quat q) {
+                    const Vec3 f = normalize(rotate(q, Vec3{0, 0, -1})), u = rotate(q, Vec3{0, 1, 0});
+                    Vec3 level = Vec3{0, 1, 0} - f * f.y;  // world up across the forward
+                    if (length(level) < 1e-3f) return 0.0f;
+                    level = normalize(level);
+                    return std::atan2(dot(cross(level, u), f), dot(level, u)) * deg;
+                };
+                const int set = g_jointSet[side];
+                const Vec3 fingers = rotate(posed.hand.rot, g_wristStraight[set]);
+                const Vec3 palm = rotate(posed.hand.rot, Vec3{0, 1, 0});
+                LOG("[vr] hand pose (%s): aim pitch %.0f roll %.0f, grip pitch %.0f roll %.0f (degrees, tracking space); "
+                    "the drawn hand's fingers pitch %.0f, its local up pitch %.0f (game space); driven %s, measured %s, "
+                    "held item %s, weight %.2f",
+                    side == 0 ? "left" : "right", double(pitch(rotate(hand.aim.orientation, Vec3{0, 0, -1}))),
+                    double(roll(hand.aim.orientation)), double(pitch(rotate(hand.grip.orientation, Vec3{0, 0, -1}))),
+                    double(roll(hand.grip.orientation)), double(pitch(fingers)), double(pitch(palm)),
+                    style.rigid ? "rigidly by the aim pose" : "by the animation and the controller's roll",
+                    g_ctrlToHandOk[set] ? "yes" : "not yet", g_held.gameHand == kArmJoints[set][2] ? "yes" : "no",
+                    double(g_armWeight[side]));
+            }
+        }
         // the sword hand holds the sword: turned so the game's grip holds while the blade follows this controller
         // (the wrist stays where the IK put it; the controller still decides the hand's orientation, through the sword)
         if (swordHand) {
@@ -5761,6 +6450,12 @@ constexpr uint32_t kHookshotTopMtx = 0xD778;       // daHookshot_c's top matrix 
 constexpr float kHookshotRestUnits = 50.0f;        // the actor's top this near the tip's rest: in the barrel (resting it reads
                                                   // 0 or 21.9 on alternate draws; fired, 100 and more)
 struct HookshotTip { bool rest = false; Joint local; } g_hookshotTip;
+// (2026-11-15) the hookshot's muzzle and barrel, from its model in the game's files (Link.bfres "hookshot", read with
+// gcmodel_tool extents): the barrel's mesh runs along the model's +X from -7.66 to 24.27 units, centred on its Y and Z
+// axes; its front end, (24.27, 0, 0), is the hookshot's point (the hook's head, X -0.79 to 18.00 on its tip joint,
+// rests inside the barrel). The laser starts there and runs along +X, both from the model as drawn (frame_correct_pose)
+constexpr float kHookMuzzleX = 24.27f;
+struct HookBarrel { bool valid = false; Vec3 dir; std::chrono::steady_clock::time_point at; } g_hookBarrel;  // (game space)
 void hookshot_tip_begin(uint32_t link) {
     g_hookshotTip.rest = false;
     if (!first_person_play() || game_item(link) != kItemHookshot) return;
@@ -5812,12 +6507,15 @@ bool shield_by_controller(const Joint& to, const Config& c, int d, Quat& rot, Ve
     const ShieldAxes& axes = g_shield.axes;
     const auto& ctrl = g_input.hand[1 - d];
     if (!axes.valid() || !g_input.valid || !ctrl.active || !(g_armWeight[1 - d] > 0) || !finite(to.pos)) return false;
-    rot = shield_rotation(axes, to_game_dir(g_map, shield_face_tilted(ctrl.aim.orientation)), to_game_dir(g_map, Vec3{0, 1, 0}));
+    // its face and top: free (vr.shieldFreeRotation), the controller's own forward and top, turned with every roll and
+    // twist of the wrist; else levelled, its top straight up
+    const Vec3 face = c.shieldFreeRotation ? rotate(ctrl.aim.orientation, Vec3{0, 0, -1}) : shield_face_tilted(ctrl.aim.orientation);
+    const Vec3 top = c.shieldFreeRotation ? rotate(ctrl.aim.orientation, Vec3{0, 1, 0}) : Vec3{0, 1, 0};
+    rot = shield_rotation(axes, to_game_dir(g_map, face), to_game_dir(g_map, top));
     const Vec3 handInShield = mirror_across_face(rotate(conjugate(g_held.shieldRot), g_held.shieldPos * -1.0f), axes);
     pos = to.pos - rotate(rot, handInShield);
-    if (!c.leftHanded) {  // right-handed play: where the offsets were set (tilted with the face)
-        const Vec3 face = shield_face_tilted(ctrl.aim.orientation);
-        const Vec3 up = normalize(Vec3{0, 1, 0} - face * face.y), right = cross(face, up);
+    if (!c.leftHanded) {  // right-handed play: where the offsets were set (in the shield's own frame)
+        const Vec3 up = normalize(top - face * dot(top, face)), right = cross(face, up);
         pos = pos + to_game_dir(g_map, right * c.shieldOffsetX + up * c.shieldOffsetY - face * c.shieldOffsetZ) * world_scale();
     }
     return finite(pos);
@@ -5872,6 +6570,16 @@ void link_draw_begin(uint32_t link) {
     // - nothing in a hand (a sheathed sword, a shield on the back, an item being put away): as the game draws it.
     std::lock_guard<std::mutex> lock(g_mutex);
     for (HandLock& l : g_locks) l.valid = false;  // (taken again below from this step's placement)
+    // (the shield's panel: taken again below when the tracked shield is placed, else none: the game's own block)
+    bool shieldPanelSet = false;
+    struct PanelClear {
+        bool& set;
+        ~PanelClear() {
+            if (set) return;
+            std::lock_guard<std::mutex> panelLock(g_panelMutex);
+            g_shieldPanel.valid = false;
+        }
+    } panelClear{shieldPanelSet};
     const int d = dominant_side(c);
     uint16_t bodyCount = 0;
     const uint32_t body = matrices_of(ld32(link + kBodyModel), bodyCount);
@@ -5924,6 +6632,13 @@ void link_draw_begin(uint32_t link) {
             g_held.shieldPlaced = to.pos + rotate(to.rot, held.pos);
         }
         place(shieldModel, shieldWorld, g_held.shieldPlaced);
+        if (axes.valid() && finite(g_held.shieldPlaced)) {  // its front panel, for the hits on it (shield_check)
+            Vec3 e{};
+            (&e.x)[axes.face] = axes.faceSign;
+            std::lock_guard<std::mutex> panelLock(g_panelMutex);
+            g_shieldPanel = {true, link, g_held.shieldPlaced, normalize(rotate(shieldWorld, e))};
+            shieldPanelSet = true;
+        }
         lock_to_hand(kLockShield, shieldModel, body, offHand);
         g_drawShieldHand = offHand;  // its hand closes round its grip (apply_hands)
         static int loggedWay = -1;
@@ -5931,7 +6646,8 @@ void link_draw_begin(uint32_t link) {
         if (way != loggedWay) {
             loggedWay = way;
             LOG("[vr] shield: in Link's %s hand, %s", offHand == kArmJoints[0][2] ? "left" : "right",
-                way ? "turned by its controller (flush with the body: face where it points, top up)"
+                way ? (c.shieldFreeRotation ? "turned freely by its controller (face where it points, top with its top)"
+                                            : "turned by its controller (flush with the body: face where it points, top up)")
                     : "the game's attachment mirrored onto the posed hand");
         }
     }
@@ -6001,8 +6717,22 @@ void link_draw_begin(uint32_t link) {
     } else if (itemHand == g_held.gameHand && g_bowHold.valid && bow_in_hand(game_item(link))) {
         // the bow in the hand the game holds it in: its place from the aiming pose (g_bowHold), not the game's
         // attachment of this action, which turned it flat or sideways while walking or standing
-        rot = normalize(hand.rot * g_bowHold.rot);
-        at = hand.pos + rotate(hand.rot, g_bowHold.pos);
+        // (2026-11-14) turned by its controller alone: the hand's frame the controller's through the hand's fixed offset
+        // (what the rigid hand is posed from, link_arms), not the posed hand, which the wrist's limit may turn back from
+        // it. At the posed hand's place. Moving left or right while aiming, the bow turned over with the hand's
+        // animated roll ("keeps flipping around upside down", a player's video); asked for: it moves and turns only
+        // as the player's hand does. Without the controller or its offset, the posed hand as before
+        Quat frame = hand.rot;
+        {
+            const int side = aim_side(c, game_item(link));
+            const int set = g_jointSet[side];
+            if (g_input.valid && g_input.hand[side].active && g_ctrlToHandOk[set]) {
+                const Quat ctrlHand = normalize(to_game_orientation(g_map, g_input.hand[side].aim.orientation) * g_ctrlToHand[set]);
+                if (std::isfinite(ctrlHand.x) && std::isfinite(ctrlHand.w)) frame = ctrlHand;
+            }
+        }
+        rot = normalize(frame * g_bowHold.rot);
+        at = hand.pos + rotate(frame, g_bowHold.pos);
         g_drawItemHand = itemHand;
     } else if (itemHand != g_held.gameHand) {
         // another item: the game's attachment, on its hand (the dominant one, or the off hand: off_hand_item),
@@ -6184,6 +6914,35 @@ Joint moved_with(const Joint& j, const HandMove& h) {
     out.pos = h.to + rotate(h.rot, j.pos - h.from);
     return out;
 }
+void hook_laser_drawn(Vec3 muzzleGame, Vec3 barrelGame);  // (the aiming laser, below)
+// the arrow square to the bow (g_bowRest): its rest, its way (the bow's +X) and its nock (the drawing hand's place
+// along that way, the head kept kHeadPastBow past the rest); false until the bow has been drawn
+bool bow_arrow_square(uint64_t pass, Vec3& rest, Vec3& dir, Vec3& nock) {
+    const DrawnHand& hs = g_drawnHand[g_jointSet[0]];
+    const DrawnHand& hb = g_drawnHand[g_jointSet[1]];
+    auto usable = [&](const DrawnHand& h) { return (h.serial == pass || h.serial + 1 == pass) && finite(h.pos); };
+    if (!g_bowRest.valid || !usable(hs) || !usable(hb)) return false;
+    rest = hb.pos + rotate(hb.rot, g_bowRest.inHand);
+    dir = normalize(rotate(hb.rot, g_bowRest.axisInHand));
+    if (!finite(rest) || !finite(dir)) return false;
+    // beside the grip (kBowRestSideZ), on the side facing the eyes, chosen when the arrow is put on
+    const Vec3 side = normalize(rotate(hb.rot, g_bowRest.sideInHand));
+    static int chosen = 0;  // 0: not chosen; 1: -Z; 2: +Z
+    static bool loggedSide = false;
+    if (!g_bowOnBow) chosen = 0, loggedSide = false;
+    if (!chosen && finite(side)) {
+        chosen = g_passHeadValid && dot(side, g_passHead.position - rest) > 0 ? 2 : 1;
+        if (!loggedSide) {
+            loggedSide = true;
+            LOG("[vr] bow: the arrow beside the grip on its %s side (Z %.2f), the side facing the eyes",
+                chosen == 2 ? "+Z" : "-Z", double(kBowRestSideZ[chosen - 1]));
+        }
+    }
+    if (chosen && finite(side)) rest = rest + side * (kBowRestSideZ[chosen - 1] - kBowRest[2]);
+    const float back = std::clamp(dot(rest - hs.pos, dir), 2.0f, kArrowLength - kHeadPastBow);
+    nock = rest - dir * back;
+    return finite(nock);
+}
 static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t) {
     (void)t;
     if (!model || !w || !running() || g_thirdPerson.load() || !play_view()) return false;
@@ -6249,6 +7008,12 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
             const Joint h = be_joint(w + 12 * jh);
             if (g_drawnHand[set].serial != pass) g_drawnHandPrev[set] = g_drawnHand[set];  // (the pass before: lock_target)
             if (finite(h.pos)) g_drawnHand[set] = {h.rot, h.pos, pass};
+            if (const Joint lo = be_joint(w + 12 * jl); jl < n && finite(lo.pos)) g_drawnFore[set] = {lo.rot, lo.pos, pass};
+            // (the game's own hand and forearm this pass, blended as every model's joints are and before any turn or
+            // controller: what the Power Bracelets' fixed place against the hand is learned from, the same pass's blend
+            // as their own copy of his forearm)
+            if (finite(handBlend[set].pos)) g_blendHand[set] = {handBlend[set].rot, handBlend[set].pos, pass};
+            if (finite(lowerBlend[set].pos)) g_blendFore[set] = {lowerBlend[set].rot, lowerBlend[set].pos, pass};
             if (turning && finite(handBlend[set].pos) && finite(lowerBlend[set].pos)) {
                 // (what is on the hand and the forearm turns with them: a controller below may move them further)
                 g_handMove[set] = {true, handBlend[set].pos, h.pos, normalize(h.rot * conjugate(handBlend[set].rot)), pass};
@@ -6294,6 +7059,7 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
             put_be_joint(w + 12 * jl, lower);
             put_be_joint(w + 12 * jh, hand);
             g_drawnHand[set] = {hand.rot, hand.pos, pass};
+            g_drawnFore[set] = {lower.rot, lower.pos, pass};
             move.from = handBlend[set].pos;
             move.to = hand.pos;
             move.rot = normalize(hand.rot * conjugate(handBlend[set].rot));
@@ -6328,12 +7094,136 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
     };
     bool changed = false;
     if (bracelets) {
+        // (2026-11-14 and 2026-11-15, players, three times: the bracelets "rotate around the hands instead of staying in
+        // the same spot attached to the hands"; asked for: "lock them into the hands position in 1st person VR mode")
+        // The game copies his forearms (CL_JNT_LARMB 7 / RARMB 11) into the bracelets' joints 1 and 2 each step
+        // (daPy_lk_c::setItemModel). Before, with empty hands they were moved by the forearm's change (g_foreMove), so
+        // they kept the forearm's roll; their turn against the hand was learned again every such frame from that
+        // turning source, and with an item out they took the last angle learned plus a turn onto the drawn forearm.
+        // Now: ONE fixed place against the hand per arm, from the game's own pose (its forearm copy against its own
+        // animated hand, g_animHand, both as the game posed them), averaged over kLearnFrames steps with empty hands,
+        // then kept. Every pass after, empty hands or an item out, each bracelet is placed rigidly on the hand as drawn
+        // (g_drawnHand). Until learned: as before (the forearm's change)
+        constexpr int kLearnFrames = 30;
+        static Quat lockRot[2];
+        static Vec3 lockPos[2];
+        static int learnN[2] = {0, 0};
+        static Vec3 written[2];  // what was put in the joint last: a pass after that is not the game's own copy
+        static bool wrote[2] = {false, false};
+        static uint64_t locked = 0, learning = 0, fallback = 0;
+        static uint64_t lockedStale = 0, lockedEmpty = 0, lockedItem = 0, lockedNoHand = 0;
+        static double proofAngle = 0, proofDist = 0, gameOff = 0, elbowGap = 0, copyGapMin = 1e9;
+        static uint64_t learnSeen = 0;
+        static auto since = std::chrono::steady_clock::now();
+        const bool emptyHands = game_item(link) == kItemNone;
         for (int set = 0; set < 2; ++set) {
             const uint32_t j = uint32_t(set + 1);
+            if (j >= n) continue;
+            const DrawnHand& hd = g_drawnHand[set];
+            const bool fresh = hd.serial == pass || hd.serial + 1 == pass;
+            Joint b = be_joint(w + 12 * j);
+            const bool gameCopy = !(wrote[set] && same(b.pos, written[set]));
+            // learning: the game's forearm copy against the game's own hand, both from THIS pass's blend (g_blendHand,
+            // recorded by the body's correction before any turn or controller). (First try, 2026-11-15: against the
+            // hand link_arms read at the step, another moment than the blended copy: the place came out 22 and 31 units
+            // off, 151 and 77 degrees, and the bracelets were not seen in the headset.) Only when the copy is on the
+            // game's forearm this pass (kCopyGap: the same moment and space), else not learned from
+            (void)gameCopy;
+            const DrawnHand& gh = g_blendHand[set];
+            const DrawnHand& gf = g_blendFore[set];
+            // (this pass's, or the one before when the bracelets are drawn before his body: the copy's gap from the
+            // forearm below decides whether the two are the same moment)
+            const bool samePass = gh.serial == gf.serial && (gh.serial == pass || gh.serial + 1 == pass);
+            const float copyGap = samePass && finite(b.pos) ? length(b.pos - gf.pos) : 1e9f;
+            constexpr float kCopyGap = 2.0f;
+            if (learnN[set] < kLearnFrames && emptyHands) {
+                ++learnSeen;
+                if (samePass) copyGapMin = std::min(copyGapMin, double(copyGap));
+            }
+            if (learnN[set] < kLearnFrames && emptyHands && samePass && copyGap < kCopyGap && std::isfinite(b.rot.w) &&
+                finite(gh.pos) && std::isfinite(gh.rot.w)) {
+                const Quat off = normalize(conjugate(gh.rot) * b.rot);
+                const Vec3 offPos = rotate(conjugate(gh.rot), b.pos - gh.pos);
+                {
+                    const float k = 1.0f / float(learnN[set] + 1);
+                    lockRot[set] = learnN[set] ? normalize(slerp(lockRot[set], off, k)) : off;
+                    lockPos[set] = learnN[set] ? lockPos[set] + (offPos - lockPos[set]) * k : offPos;
+                    if (++learnN[set] == kLearnFrames)
+                        LOG("[vr] Power Bracelets: the %s one locked to the hand: offset turn (w x y z) %.4f %.4f %.4f "
+                            "%.4f = %.1f degrees from the hand, place %.2f %.2f %.2f (%.1f units) in the hand's frame "
+                            "(the bracelet joint is the forearm's copy: its origin at the elbow, the band near the wrist), "
+                            "from %d passes of the game's own blended pose with empty hands (the copy %.2f units from the "
+                            "game's forearm); model joints %u",
+                            set ? "right" : "left", double(lockRot[set].w), double(lockRot[set].x),
+                            double(lockRot[set].y), double(lockRot[set].z),
+                            double(angle_between(lockRot[set], Quat{}) * 180.0f / kPi), double(lockPos[set].x),
+                            double(lockPos[set].y), double(lockPos[set].z), double(length(lockPos[set])), kLearnFrames,
+                            double(copyGap), n);
+                    ++learning;
+                }
+            }
+            // locked: its turn ONLY the drawn hand's times the one fixed offset (nothing from the animation or the
+            // forearm). The hand as drawn this pass or the one before; a hand older than that is still the hand (never the
+            // forearm again once locked), counted as stale
+            const bool everDrawn = hd.serial != ~0ull && finite(hd.pos) && std::isfinite(hd.rot.w);
+            if (learnN[set] >= kLearnFrames && everDrawn) {
+                const Quat want = normalize(hd.rot * lockRot[set]);
+                const Vec3 wantPos = hd.pos + rotate(hd.rot, lockPos[set]);
+                const Quat gameRot = b.rot;  // (diagnostics: the game's forearm copy this pass, overridden)
+                b.rot = want;
+                b.pos = wantPos;
+                put_be_joint(w + 12 * j, b);
+                written[set] = b.pos;
+                wrote[set] = true;
+                changed = true;
+                ++locked;
+                if (!fresh) ++lockedStale;
+                // (proof, read back from the matrix this pass draws: w is copied to the model's matrices and drawn
+                // right after, interp.cpp draw_turned / the blend's draw) its angle and distance from hand * offset
+                const Joint back = be_joint(w + 12 * j);
+                proofAngle = std::max(proofAngle, double(angle_between(back.rot, want) * 180.0f / kPi));
+                proofDist = std::max(proofDist, double(length(back.pos - wantPos)));
+                if (std::isfinite(gameRot.w))
+                    gameOff = std::max(gameOff, double(angle_between(gameRot, want) * 180.0f / kPi));
+                // (where it is: its origin against the drawn forearm's, the elbow; near 0 with the wrist straight, a few
+                // units with it bent. Far off: the band is not on the arm and is not seen)
+                if (g_drawnFore[set].serial == pass && finite(g_drawnFore[set].pos))
+                    elbowGap = std::max(elbowGap, double(length(wantPos - g_drawnFore[set].pos)));
+                if (emptyHands) ++lockedEmpty; else ++lockedItem;
+                continue;
+            }
+            if (learnN[set] >= kLearnFrames) ++lockedNoHand;  // (locked, but no drawn hand yet: the fallback below)
+            // not learned yet (or no drawn hand this pass): as before, moved by the forearm's change
             const HandMove& f = g_foreMove[set];
-            if (j >= n || !f.valid || f.serial != pass) continue;
-            put_be_joint(w + 12 * j, moved_with(be_joint(w + 12 * j), f));
-            changed = true;
+            if (f.valid && f.serial == pass) {
+                b = moved_with(b, f);
+                put_be_joint(w + 12 * j, b);
+                written[set] = b.pos;
+                wrote[set] = true;
+                changed = true;
+            }
+            ++fallback;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - since >= std::chrono::seconds(10)) {
+            since = now;
+            if (locked || learning || fallback)
+                LOG("[vr] Power Bracelets (10 s): %llu placed locked to the hand (%llu with empty hands, %llu with an "
+                    "item out, %llu from a hand older than a pass); drawn bracelet against hand * offset: %.3f degrees, "
+                    "%.3f units at most (must be 0); its origin up to %.1f units from the drawn elbow (on the arm: about "
+                    "0 to 8); the game's forearm copy was up to %.0f degrees off it (overridden); %llu learning passes "
+                    "(left %d, right %d of %d; %llu empty-hand passes looked at, the copy at least %.2f units from the "
+                    "game's forearm in them, under 2 needed); %llu by the forearm (%llu of them locked but no drawn hand "
+                    "yet)",
+                    (unsigned long long)locked, (unsigned long long)lockedEmpty, (unsigned long long)lockedItem,
+                    (unsigned long long)lockedStale, proofAngle, proofDist, elbowGap, gameOff,
+                    (unsigned long long)learning, learnN[0], learnN[1], kLearnFrames, (unsigned long long)learnSeen,
+                    copyGapMin > 1e8 ? -1.0 : copyGapMin, (unsigned long long)fallback, (unsigned long long)lockedNoHand);
+            locked = learning = fallback = 0;
+            lockedStale = lockedEmpty = lockedItem = lockedNoHand = 0;
+            proofAngle = proofDist = gameOff = elbowGap = 0;
+            copyGapMin = 1e9;
+            learnSeen = 0;
         }
         return changed;
     }
@@ -6372,11 +7262,55 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
         const DrawnHand& hb = g_drawnHand[g_jointSet[1]];
         auto usable = [&](const DrawnHand& h) { return h.serial == pass || h.serial + 1 == pass; };
         if (!usable(hs) || !usable(hb) || !finite(hs.pos) || !finite(hb.pos)) return false;
-        const Vec3 nock = hs.pos, toBow = hb.pos - nock;
+        // (through the bow's arrow rest as drawn, kBowRest, g_bowRest: its place in the bow hand's frame, from this pass's
+        // or the last's bow; the bow hand itself until the bow has been drawn)
+        const Vec3 bowPoint = g_bowRest.valid ? hb.pos + rotate(hb.rot, g_bowRest.inHand) : hb.pos;
+        {
+            static int onRest = 0, onHand = 0;
+            static double moved = 0;
+            static auto since = std::chrono::steady_clock::now();
+            if (g_bowRest.valid) ++onRest, moved += double(length(bowPoint - hb.pos));
+            else ++onHand;
+            if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+                if (onRest || onHand)
+                    LOG("[vr] bow: the arrow through the bow's rest %d passes (%d through the bow hand: no bow drawn yet); the "
+                        "rest %.1f units from the bow hand's joint on average (in the hand: %.1f %.1f %.1f)", onRest, onHand,
+                        onRest ? moved / onRest : 0.0, double(g_bowRest.inHand.x), double(g_bowRest.inHand.y),
+                        double(g_bowRest.inHand.z));
+                onRest = onHand = 0;
+                moved = 0;
+                since = std::chrono::steady_clock::now();
+            }
+        }
+        Vec3 sqRest, sqDir, sqNock;
+        const bool square = bow_arrow_square(pass, sqRest, sqDir, sqNock);
+        const Vec3 nock = square ? sqNock : hs.pos, toBow = bowPoint - nock;
         if (!(length(toBow) > 1.0f)) return false;
-        const Vec3 dir = normalize(toBow);
+        const Vec3 dir = square ? sqDir : normalize(toBow);
+        {
+            // (proof, every 10 s: passes square to the bow, and how far that turned it from the line between the hands)
+            static int sq = 0, between = 0;
+            static double turned = 0, turnedMax = 0;
+            static auto since2 = std::chrono::steady_clock::now();
+            if (square) {
+                ++sq;
+                const double a = std::acos(std::clamp(double(dot(sqDir, normalize(bowPoint - hs.pos))), -1.0, 1.0)) * 180.0 / kPi;
+                if (std::isfinite(a)) turned += a, turnedMax = std::max(turnedMax, a);
+            } else {
+                ++between;
+            }
+            if (std::chrono::steady_clock::now() - since2 > std::chrono::seconds(10)) {
+                if (sq || between)
+                    LOG("[vr] bow: the arrow square to the bow %d passes (%d between the hands: no bow drawn yet); %.1f degrees "
+                        "from the line between the hands on average, %.1f at most", sq, between, sq ? turned / sq : 0.0,
+                        turnedMax);
+                sq = between = 0;
+                turned = turnedMax = 0;
+                since2 = std::chrono::steady_clock::now();
+            }
+        }
         Vec3 head = nock + dir * kArrowLength;
-        const float past = dot(head - hb.pos, dir);
+        const float past = dot(head - bowPoint, dir);
         if (past < kHeadPastBow) head = head + dir * (kHeadPastBow - past);
         // its roll from the bow hand's up (the fletching turns with the bow)
         Vec3 side = cross(rotate(hb.rot, Vec3{0, 1, 0}), dir);
@@ -6507,6 +7441,29 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
     }
     if (!h) return false;
     for (uint32_t j = 0; j < n; ++j) put_be_joint(w + 12 * j, moved_with(be_joint(w + 12 * j), *h));
+    // the bow's arrow rest as drawn this pass (kBowRest through its root's whole matrix: a mirrored hold stays mirrored),
+    // kept in the bow hand's frame for the arrow (drawn before or after the bow in a pass)
+    if (model == ld32(link + kEquipModel) && bow_in_hand(ld16(link + 0x69B0))) {
+        float m[12];
+        for (int i = 0; i < 12; ++i) m[i] = be_float(w[i]);
+        const Vec3 rest{m[0] * kBowRest[0] + m[1] * kBowRest[1] + m[2] * kBowRest[2] + m[3],
+                        m[4] * kBowRest[0] + m[5] * kBowRest[1] + m[6] * kBowRest[2] + m[7],
+                        m[8] * kBowRest[0] + m[9] * kBowRest[1] + m[10] * kBowRest[2] + m[11]};
+        const DrawnHand& hb = g_drawnHand[g_jointSet[1]];
+        if (finite(rest) && finite(hb.pos) && (hb.serial == pass || hb.serial + 1 == pass)) {
+            const Vec3 inHand = rotate(conjugate(hb.rot), rest - hb.pos);
+            const Vec3 axis = normalize(Vec3{m[0], m[4], m[8]});  // (the bow's +X as drawn: its matrix's first column)
+            const Vec3 sideAxis = normalize(Vec3{m[2], m[6], m[10]});  // (its +Z: the third column)
+            if (length(inHand) < 40.0f && finite(axis) && finite(sideAxis))
+                g_bowRest = {true, inHand, rotate(conjugate(hb.rot), axis), rotate(conjugate(hb.rot), sideAxis)};
+        }
+    }
+    // the hookshot's muzzle and barrel as drawn this pass (its model's root, moved with the hand: kHookMuzzleX on its +X)
+    if (model == ld32(link + kEquipModel) && game_item(link) == kItemHookshot) {
+        const Joint r = be_joint(w);
+        if (finite(r.pos) && std::isfinite(r.rot.w) && std::isfinite(r.scale.x))
+            hook_laser_drawn(r.pos + rotate(r.rot, Vec3{kHookMuzzleX * r.scale.x, 0, 0}), rotate(r.rot, Vec3{1, 0, 0}));
+    }
     // the bow's string at the drawing hand while the arrow is on (g_bowString): the string bends back with the hand
     if (g_bowOnBow && g_bowString.model == model && g_bowString.joint > 0 && uint32_t(g_bowString.joint) < n) {
         const DrawnHand& sh = g_drawnHand[g_jointSet[0]];  // (the arrow's hand: the left, vr_bow.h)
@@ -6514,7 +7471,8 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
             for (const int sjIndex : {g_bowString.joint, g_bowString.joint2}) {  // (the top and bottom halves)
                 if (sjIndex <= 0 || uint32_t(sjIndex) >= n) continue;
                 Joint sj = be_joint(w + 12 * uint32_t(sjIndex));
-                sj.pos = sh.pos;
+                Vec3 r, d, nk;
+                sj.pos = bow_arrow_square(pass, r, d, nk) ? nk : sh.pos;  // (square to the bow: drawn to the arrow's nock)
                 put_be_joint(w + 12 * uint32_t(sjIndex), sj);
             }
         }
@@ -6644,6 +7602,91 @@ void filter_pad(input::PadState& s) {
     s.buttons &= ~held;
 }
 bool menu_open() { return running() && g_menuOpen.load(); }
+
+// B leaves command mode (asked for, 2026-11-11: "when in command mode or using the windwaker in any mode lets allow B
+// to exit any windwaker mode"). Conducting already ends on B (daPy_lk_c::checkTactCancelTrigger in procTactWait); a
+// song being played ends by itself. Controlling Medli, Makar or a stone head (the Command Melody), the game hands
+// Link back on its own return button only (daNpc_Md_c::returnLinkCheck and the others: the game pad's pressed bit 0x20,
+// 02007840, the GameCube's R or START; on the ground only, which the game checks). Here, at the start of each logic
+// step, after the pad's read and before any actor runs: a partner the player (the play's player 0 not Link) and B just
+// pressed (the game pad's bit 2, 020078BC), the return bit is pressed with it. B keeps its own use (Medli's harp light
+// let go, Makar's flight), and in the air nothing returns, as before
+bool frame_display_time(int64_t& displayNs, int64_t& periodNs) {
+    if (!running()) return false;
+    displayNs = int64_t(display_time());
+    periodNs = int64_t(session().predicted_period());
+    return displayNs > 0 && periodNs > 0;
+}
+
+void logic_step_starting() {
+    if (!running()) return;
+    constexpr uint32_t kPlayPlayer0 = 0x5B2C, kPlayLink = 0x5B34;  // mPlayerInfo[0].mpPlayer, mpPlayerPtr[0]
+    constexpr uint32_t kPadTrigger = 0x18, kTrigB = 0x2, kTrigReturn = 0x20;
+    const uint32_t pl = play();
+    const uint32_t pad = ld32(GD(0x101F5088));  // the game pad's state (as mods/turbo.cpp)
+    if (!pl || !pad) return;
+    const uint32_t player = ld32(pl + kPlayPlayer0), link = ld32(pl + kPlayLink);
+    if (!player || !link || player == link) return;
+    const uint32_t trig = ld32(pad + kPadTrigger);
+    if ((trig & kTrigB) && !(trig & kTrigReturn)) {
+        st32(pad + kPadTrigger, trig | kTrigReturn);
+        LOG("[vr] command mode: B pressed: the game's return to Link pressed with it (it returns on the ground)");
+    }
+}
+
+// The shield blocks only what meets its front panel (asked for, 2026-11-12: "blocks only happen if attacks make contact
+// with the face of the shield or front of the shield"). The game asks dCcS::ChkShield (02517DEC, hooked: mods/vr_hooks.cpp)
+// for each attack that hits a collider whether the hit is on a shield; for Link's body collider (mCyl) it said yes in a
+// guard pose for any attacker within 90 degrees of his front, wherever the shield was. In first person with the tracked
+// shield in hand, the answer is the shield's own: the attack's collider (its bounding box, every shape's: the
+// dCcD_GObjInf's shape attribute at +0xF8, min and max) reaches the shield's panel (a disc of kShieldRadius round its
+// centre, as drawn: g_shieldPanel), on its front (the attack's centre in front of the face, or moving into it: its AT
+// vector, +0x7C). 1: on the shield (blocked), 0: not, -1: the game decides (third person, no tracked shield, not Link)
+int shield_check(uint32_t atInf, uint32_t tgInf) {
+    if (!running() || !atInf || !tgInf || g_thirdPerson.load() || !first_person_play()) return -1;
+    const uint32_t link = g_link.link;
+    constexpr uint32_t kLinkCyl = 0x765C;  // daPy_lk_c::mCyl (dCcD_Cyl: dCcD_GObjInf first)
+    if (!link || tgInf != link + kLinkCyl || !g_held.shieldOnHand || !config().trackedSword) return -1;
+    ShieldPanel p;
+    {
+        std::lock_guard<std::mutex> panelLock(g_panelMutex);
+        p = g_shieldPanel;
+    }
+    if (!p.valid || p.link != link || !finite(p.centre) || !finite(p.face)) return -1;
+    static const float kShieldRadius = [] {  // game units (WWHD_VR_SHIELD_RADIUS: tuning)
+        const char* e = std::getenv("WWHD_VR_SHIELD_RADIUS");
+        const float v = e ? float(std::atof(e)) : 0.0f;
+        return v > 1.0f && v < 100.0f ? v : 18.0f;
+    }();
+    constexpr float kReach = 6.0f;     // units past its rim and in front of its face that still meet it
+    constexpr float kBehind = 4.0f;    // units behind its face (its thickness, the handle)
+    const Vec3 lo = ld_vec(atInf + 0xF8), hi = ld_vec(atInf + 0x104);
+    if (!finite(lo) || !finite(hi) || hi.x < lo.x || hi.y < lo.y || hi.z < lo.z) return -1;
+    // the box's point nearest the panel's centre, in the panel's frame: along its face and across it
+    const Vec3 q{std::clamp(p.centre.x, lo.x, hi.x), std::clamp(p.centre.y, lo.y, hi.y), std::clamp(p.centre.z, lo.z, hi.z)};
+    const Vec3 d = q - p.centre;
+    const float along = dot(d, p.face);
+    const float across = length(d - p.face * along);
+    const bool meets = across <= kShieldRadius + kReach && along >= -kBehind && along <= kShieldRadius + kReach;
+    const Vec3 mid = (lo + hi) * 0.5f;
+    const float midAlong = dot(mid - p.centre, p.face);
+    const Vec3 v = ld_vec(atInf + 0x7C);  // dCcD_GObjAt::mVec: which way the attack moves (zero for many)
+    const float speed = finite(v) ? length(v) : 0.0f;
+    const bool intoFace = speed > 0.01f && dot(v, p.face) < 0.0f;
+    const bool front = midAlong > 0.0f || intoFace;
+    const bool blocked = meets && front;
+    static int lines = 0;
+    if (lines < 400) {
+        ++lines;
+        LOG("[vr] shield check: %s (the attack %.1f units across the shield's face from its centre, %.1f in front of it; "
+            "its centre %.1f in front, moving %s; box %.0f x %.0f x %.0f; radius %.0f)",
+            blocked ? "on the shield's front: blocked" : meets ? "on the shield but from behind: not blocked"
+                                                         : "missed the shield: not blocked",
+            double(across), double(along), double(midAlong), intoFace ? "into the face" : speed > 0.01f ? "not into it" : "(no vector)",
+            double(hi.x - lo.x), double(hi.y - lo.y), double(hi.z - lo.z), double(kShieldRadius));
+    }
+    return blocked ? 1 : 0;
+}
 
 // The new save's name (docs/VR_MENU.md, "The name of a new save"): the game asks the system keyboard for it (swkbd) on
 // the title or file select, and the settings overlay's text prompt stands in for the GamePad's keyboard
@@ -6831,6 +7874,22 @@ void parry_unwiden(uint32_t enemy, const uint32_t saved[3]) {
 }
 // (2026-11-09, asked for: the game completes the attack on its own) the finishing cut no longer waits for a swing
 constexpr bool kParryAutoCut = false;  // (false again since 2026-11-10, asked for: "after A is pressed then allow the player follow and execute the attack")
+bool hands_layer_view(bool force) { return (force || vr::hands_layer_on()) && first_person_play(); }
+// (asked for, 2026-11-14: "when we do vertical slice in VR 1st person, turn off the sword trail ... keep the sounds on";
+// then "vertical slash / vertical swing (up to down)": any downward swing, locked on or not) its trail not drawn for
+// about 1.3 s after the swing
+// (the slash and the trail's fade); only its drawing is left out, its sounds and the attack are the game's
+bool sword_trail_hidden() {
+    if (!g_trailHiddenFrom || !first_person_play()) return false;
+    const uint64_t s = interp::logic_steps(), from = g_trailHiddenFrom - 1;
+    return s >= from && s - from < 40;
+}
+// (diagnostics, docs/VR_HANDS_LAYER_PLAN.md: the body shown with the hands layer on) Link's body model, for the UBO
+// update's log in interp.cpp; 0: none
+uint32_t link_body_model() {
+    const uint32_t link = g_link.link;
+    return link && g_link.valid ? ld32(link + kBodyModel) : 0u;
+}
 bool parry_cut_wait() {
     if (kParryAutoCut) return false;  // (the game's own cut, at once)
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -6897,7 +7956,11 @@ void subject_angle(uint32_t cam, uint32_t pitchAddr, uint32_t yawAddr) {
     if (!g_input.valid || !g_input.hand[d].active) return;  // not tracked: the game's (stick) aim
     Vec3 bowFrom, bowDir;
     const bool bow = bow_in_hand(ld16(link + 0x69B0)) && bow_aim(bowFrom, bowDir);  // the bow: from its arrow
-    const Vec3 point = to_game_dir(g_map, bow ? bowDir : rotate(g_input.hand[d].aim.orientation, {0, 0, -1}));
+    Vec3 point = to_game_dir(g_map, bow ? bowDir : rotate(g_input.hand[d].aim.orientation, {0, 0, -1}));
+    // the hookshot: along its barrel as drawn (hook_laser_drawn: the laser's line), so it fires the laser's way
+    if (aimItem == kItemHookshot && g_hookBarrel.valid && finite(g_hookBarrel.dir) &&
+        std::chrono::steady_clock::now() - g_hookBarrel.at < std::chrono::milliseconds(100))
+        point = g_hookBarrel.dir;
     int16_t pitch = 0, yaw = 0;
     if (!pointing_aim(point, pitchLimit, pitch, yaw)) return;
     st16(pitchAddr, uint16_t(pitch));
@@ -6960,6 +8023,28 @@ void update_laser(const Config& c, const xr::Views* head) {
         const xr::HandState& hand = g_input.hand[d];
         const Vec3 fwd = bow ? bowDir : rotate(hand.aim.orientation, {0, 0, -1});
         v.from = bow ? bowFrom : hand.aim.position + fwd * laser_muzzle(ld16(l + 0x69B0 /* mEquipItem */));
+        // (2026-11-15) the hookshot: its start where the hookshot is drawn. Link's hand is drawn at the controller's offset
+        // from the head times k, his arm over yours (link_arms: eye_wrist_target, lag.k), so the hookshot in it is nearer
+        // the head than the controller; the laser started at the controller itself, ahead of the hookshot and off it
+        // (the player: "it didnt look like the laser was coming out of the hookshot"). The same scale about the head
+        // puts its start on the drawn hookshot; its direction stays the controller's aim (the game's aim: unchanged)
+        if (!bow && ld16(l + 0x69B0) == kItemHookshot && g_lag[d].valid && std::isfinite(g_lag[d].k) &&
+            g_lag[d].k > 0.2f && g_lag[d].k < 1.5f) {
+            const Vec3 scaled = head->head.position + (v.from - head->head.position) * g_lag[d].k;
+            static int n = 0;
+            static double gap = 0;
+            static auto since = std::chrono::steady_clock::now();
+            ++n;
+            gap += double(length(v.from - scaled));
+            if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+                LOG("[vr] hookshot laser (10 s): started where the hookshot is drawn (Link's arm over yours k %.2f), %.0f mm "
+                    "nearer the head than the controller on average, %d settings", double(g_lag[d].k), 1000.0 * gap / n, n);
+                n = 0;
+                gap = 0;
+                since = std::chrono::steady_clock::now();
+            }
+            v.from = scaled;
+        }
         v.eye = (head->eye[0].pose.position + head->eye[1].pose.position) * 0.5f;
         bool hit = false;
         // the game's sight, held for kSightHoldSeconds while it blinks off: the boat's boomerang draws it only on the
@@ -6992,6 +8077,7 @@ void update_laser(const Config& c, const xr::Views* head) {
             }
         }
         if (!hit) v.to = v.from + fwd * kLaserMissMetres;
+        g_laserAim = {hit, v.valid, heldSight};
         v.visible = finite(v.from) && finite(v.to) && finite(v.eye);
         // (diagnostics) every 2 s while shown: what the line is drawn to, and the game's sight
         {
@@ -7023,11 +8109,109 @@ void update_laser(const Config& c, const xr::Views* head) {
             since = std::chrono::steady_clock::now();
         }
     }
+    // (proof the laser moves every frame, every 10 s while shown: how often it was set and by which caller, and how far
+    // its start moved between settings, on average and at most: at 30 Hz the start jumped 3 frames' movement at a time)
+    {
+        static int setTimes = 0, fromPass = 0;
+        static double moved = 0, movedMax = 0;
+        static Vec3 lastFrom{};
+        static bool haveLast = false;
+        static auto since = std::chrono::steady_clock::now();
+        if (v.visible) {
+            ++setTimes;
+            if (std::chrono::steady_clock::now() - g_laserPassAt < std::chrono::milliseconds(2)) ++fromPass;
+            if (haveLast) {
+                const double m = double(length(v.from - lastFrom));
+                moved += m;
+                movedMax = std::max(movedMax, m);
+            }
+            lastFrom = v.from;
+            haveLast = true;
+        } else {
+            haveLast = false;
+        }
+        if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+            if (setTimes)
+                LOG("[vr] aiming laser (10 s): set %d times (%d by the frame passes), its start moved %.1f mm between "
+                    "settings on average, %.1f mm at most", setTimes, fromPass,
+                    1000.0 * moved / std::max(1, setTimes - 1), 1000.0 * movedMax);
+            setTimes = fromPass = 0;
+            moved = movedMax = 0;
+            since = std::chrono::steady_clock::now();
+        }
+    }
     static bool shown = false;
     if (v.visible != shown) {
         shown = v.visible;
         LOG("[vr] aiming laser %s", shown ? "shown" : "hidden");
     }
+    g_laserLast = v;
+    // (the hookshot drawn in the last 100 ms: published by hook_laser_drawn, once a pass from its muzzle. Published here
+    // too, the render thread could take this line between the two in a pass, and the start would flicker between them)
+    const bool hookDrawn = v.visible && l && ld16(l + 0x69B0) == kItemHookshot && g_hookBarrel.valid &&
+                           std::chrono::steady_clock::now() - g_hookBarrel.at < std::chrono::milliseconds(100);
+    if (!hookDrawn) set_laser(v);
+}
+// each pass, the hookshot drawn: the laser from its muzzle along its barrel, both as drawn (kHookMuzzleX), to the depth
+// of the game's sight (its dot there; 15 m when nothing is aimed at). The game's aim follows the same barrel
+// (g_hookBarrel, aim_by_pointing), so the hook flies the laser's way. Before: from the controller (then the controller
+// scaled by Link's arm), along the controller's aim, to the sight: ahead of the hookshot and off it (the player: "the
+// laser must come out of the point of the hookshot and be parallel to it coming out and point to the direction its
+// firing"). The drawn model is the game's, moved rigidly with the hand (frame_correct_pose), and the hand is held rigidly
+// to its controller: nothing in it follows the game's aim, so the aim following it cannot feed back. A muzzle more than
+// kHookPointMax from the arm-scaled start is not taken (logged)
+constexpr float kHookPointMax = 0.30f;  // metres
+void hook_laser_drawn(Vec3 muzzleGame, Vec3 barrelGame) {
+    const Vec3 barrel = normalize(barrelGame);
+    // (anything that stops it below: the line update_laser left unpublished goes out as it is)
+    auto keep = [] { if (g_laserLast.visible) set_laser(g_laserLast); };
+    if (!finite(muzzleGame) || !finite(barrel)) return keep();
+    g_hookBarrel = {true, barrel, std::chrono::steady_clock::now()};
+    LaserView v = g_laserLast;
+    if (!v.visible || !g_link.link || ld16(g_link.link + 0x69B0) != kItemHookshot) return;
+    const Vec3 from = to_xr_point(g_map, muzzleGame);
+    const Vec3 dir = normalize(rotate(conjugate(game_rotation(g_map)), barrel));
+    if (!finite(from) || !finite(dir)) return keep();
+    const double gap = double(length(from - v.from));
+    const Vec3 oldDir = normalize(v.to - v.from);
+    const double angle = std::acos(std::clamp(double(dot(oldDir, dir)), -1.0, 1.0)) * 180.0 / kPi;
+    const bool ok = gap < kHookPointMax;
+    // (proof, every 10 s while shown: passes drawn from the muzzle, how far it was from the arm-scaled start, and the
+    // barrel's angle to the controller's aim, the line the laser had)
+    static int used = 0, refused = 0;
+    static double gapSum = 0, gapMax = 0, angSum = 0, angMax = 0;
+    static auto since = std::chrono::steady_clock::now();
+    if (ok) {
+        ++used;
+        gapSum += gap, gapMax = std::max(gapMax, gap);
+        if (std::isfinite(angle)) angSum += angle, angMax = std::max(angMax, angle);
+    } else {
+        ++refused;
+        set_laser(v);  // (the arm-scaled line update_laser left unpublished)
+    }
+    if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+        if (used || refused)
+            LOG("[vr] hookshot laser (10 s): from the muzzle along the barrel %d passes (%d refused, over %.0f mm); the muzzle "
+                "%.0f mm from the arm-scaled start on average (%.0f at most); the barrel %.1f degrees from the controller's "
+                "aim on average (%.1f at most)", used, refused, 1000.0 * kHookPointMax, used ? 1000.0 * gapSum / used : 0.0,
+                1000.0 * gapMax, used ? angSum / used : 0.0, angMax);
+        used = refused = 0;
+        gapSum = gapMax = angSum = angMax = 0;
+        since = std::chrono::steady_clock::now();
+    }
+    if (!ok) return;
+    float len = kLaserMissMetres;
+    bool valid = false;
+    if (g_laserAim.hit) {
+        const float along = dot(to_xr_point(g_map, g_laserAim.sightGame) - from, dir);
+        if (std::isfinite(along) && along > kLaserMinMetres && along < 300.0f) {
+            len = along;
+            valid = g_laserAim.valid;
+        }
+    }
+    v.from = from;
+    v.to = from + dir * len;
+    v.valid = valid;
     set_laser(v);
 }
 
@@ -7276,7 +8460,8 @@ void back_slide(uint32_t link, Cpu* cpu) {  // g_mutex held
         return;
     const uint32_t proc = ld32(link + kCurProc);
     // (walking backwards: standing only, walking he stops first, the game having no stick; aiming: its aims)
-    if (g_aimStep ? !mods::camera_mouse::aiming_item(proc) : (proc != 4 && proc != 5)) return;
+    if (g_aimStep ? !mods::camera_mouse::aiming_item(proc)
+                  : (proc != 4 && proc != 5 && proc != kProcGrabWait && proc != kProcGrabHeavyWait)) return;
     Vec3 game = to_game_dir(g_map, g_backSlide) * back_slide_speed(link);
     game.y = 0;
     const float want = length(game);
@@ -7291,6 +8476,25 @@ void back_slide(uint32_t link, Cpu* cpu) {  // g_mutex held
     }
     set_link_xz(link, pos.x + game.x, pos.z + game.z);
     if (g_link.eyeHold) g_link.eyeHoldPoint = g_link.eyeHoldPoint + game;  // (held in the world: moved with him)
+    // (proof, per 10 s: the steps walked backwards standing and carrying, and how far, in game units a step)
+    {
+        static uint64_t standing = 0, carrying = 0;
+        static double carriedUnits = 0, standingUnits = 0;
+        static auto since = std::chrono::steady_clock::now();
+        const bool carry = proc == kProcGrabWait || proc == kProcGrabHeavyWait;
+        ++(carry ? carrying : standing);
+        (carry ? carriedUnits : standingUnits) += double(length(game));
+        const auto now = std::chrono::steady_clock::now();
+        if (now - since >= std::chrono::seconds(10)) {
+            since = now;
+            if (standing || carrying)
+                LOG("[vr] walking backwards (10 s): %llu steps standing (%.1f units a step), %llu carrying (%.1f units a step)",
+                    (unsigned long long)standing, standing ? standingUnits / double(standing) : 0.0,
+                    (unsigned long long)carrying, carrying ? carriedUnits / double(carrying) : 0.0);
+            standing = carrying = 0;
+            standingUnits = carriedUnits = 0;
+        }
+    }
 }
 
 void link_executing(uint32_t link, Cpu* cpu) {
@@ -7306,6 +8510,7 @@ void link_executing(uint32_t link, Cpu* cpu) {
         }
         room_scale_move(link, cpu);
         back_slide(link, cpu);
+        rope_swing_watch(link);
     }
     // the physical sword's capsules: its hits of the last collision check (haptics), then unarmed, so that Link's
     // logic sees no attack of its own (link_executed arms them again while the hand swings)

@@ -1390,6 +1390,9 @@ void transition_buffer(Buffer& buffer, VkPipelineStageFlags stage, VkAccessFlags
 }
 void transition_image(Surface *s, VkImageLayout layout,
                       VkPipelineStageFlags stage, VkAccessFlags access) {
+  // a held clear is recorded before any use of the surface, except the pass begin that folds it (surfaces.cpp)
+  if (s->pendingClear) [[unlikely]]
+    if (!folding_clears_here()) flush_pending_clear(s);
   if (stereo_timeline_on()) stereo_timeline_layout(s, layout);  // (diagnostics: stereo.h)
   thread_check::note(thread_check::Area::Layouts);  // (diagnostics: thread_check.h)
   // (docs/VR_SCENE_THREADS.md, "S6: B's reads deferred") the second drawing thread's reads beside the scene's thread
@@ -1665,6 +1668,7 @@ static void publish_or_finish_present_prefix(DeferredCommands& owner) {
 static void submit(VkSemaphore wait = VK_NULL_HANDLE,
                    VkSemaphore signal = VK_NULL_HANDLE, bool asynchronous=false) {
   if (!R.recording)return;
+  hands_thread_join_emit();  // (docs/VR_HANDS_LAYER_PLAN.md: Link's span's commands belong to this submission too)
   stereo_flush(); // stereo eye 1's held commands belong to this submission
   RendererCommands rendererCommands;
   // Presentation owns externally synchronized semaphores: finish the entire
@@ -3154,10 +3158,11 @@ static bool present(Screen &s) {
 #else
   constexpr bool workerAcquired=false;
 #endif
-#ifdef __ANDROID__
-  // VR in a standalone headset: the app's window is not seen while the session runs; composing a full-size picture
-  // for it cost the headset's GPU every frame. swap() records the eyes itself (vrvk::eyes_pending)
+  // VR in a standalone headset (Android; Steam Frame - Native since 2026-11-14): the app's window is not seen while the
+  // session runs; composing a full-size picture for it cost the headset's GPU every frame. swap() records the eyes
+  // itself (vrvk::eyes_pending). Always false on a PC
   if (&s == &R.tv && vrvk::skip_window_tv()) return false;
+#ifdef __ANDROID__
   if (&s == &R.tv && s.window) {
     if (surfaceRecreate.exchange(false))
       recreate_surface(s);
@@ -4021,6 +4026,7 @@ void present_completed_frame_while_pipeline_pending() {
   // crashed on that pass end (nvoglv64.dll+0xE3B650, a read at 0x130: 2026-10-26 and 2026-10-30, reproduced with
   // WWHD_TEST_SLOW_TRANSLATION_MS). Flushed here, before the isolation, they end and go into the renderer's stream in
   // order, as at every mid-frame flush; the paused draw carries on with both eyes' passes begun again
+  hands_thread_join_emit();  // (docs/VR_HANDS_LAYER_PLAN.md: Link's span before the eyes are copied out)
   stereo_flush();
   const auto proof = begin_pending_picture_proof();
   GamepadBackdropDemandFrame backdropDemandFrame;
@@ -4419,6 +4425,7 @@ void swap() {
   // frame's draws are all submitted (the eyes just flushed) and none of the next recorded; empty where present ran it
   run_pending_eye_repairs();
   vrvk::frame_end();
+  vrvk::planned_repeats();  // (VR turn smoothing: the frames for the refreshes before the next one, turned on)
   evenPresentSwap = false;
   if (reproj::enabled()) present_generated(tvShown);  // 60 fps (generated): the in-between frame (never in VR)
   // VR: the GamePad screen is a panel in the headset; the desktop's GamePad window is not presented beside it
@@ -5462,6 +5469,67 @@ static void init_device(std::vector<const char *> extensions,
     LOG("[vulkan] multiview: dynamic indexing of uniform buffer arrays %u, of sampled image arrays %u",
         enabled.shaderUniformBufferArrayDynamicIndexing, enabled.shaderSampledImageArrayDynamicIndexing);
   }
+  // fixed foveated rendering (foveation.cpp, docs/VR_FOVEATION.md): a shading rate map (VK_KHR_fragment_shading_rate by
+  // attachment) on the eye-sized two-eye passes: shapes and depth drawn per pixel, the colour of the edges shaded once a
+  // 2x2 or 4x4 block. Needs multiview, dynamic rendering, Vulkan 1.2 (create_renderpass2). Enabled where supported in
+  // mobile GPU builds (the level, vr.foveation, is chosen per pass); WWHD_VK_FOVEATION=0 never enables it, =1 elsewhere
+  VkPhysicalDeviceFragmentShadingRateFeaturesKHR fsrFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_FEATURES_KHR};
+  {
+    const char *e = getenv("WWHD_VK_FOVEATION");
+#ifdef WWHD_MOBILE_GPU_PATHS
+    const bool wanted = !(e && e[0] == '0');
+#else
+    const bool wanted = e && e[0] == '1';
+#endif
+    const bool offered = has_extension(des, VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+    if (wanted && offered && R.multiview && !R.renderPasses && deviceApi >= VK_API_VERSION_1_2) {
+      VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+      query.pNext = &fsrFeatures;
+      vkGetPhysicalDeviceFeatures2(R.physicalDevice, &query);
+      VkPhysicalDeviceFragmentShadingRatePropertiesKHR fsrp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_PROPERTIES_KHR};
+      VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+      props.pNext = &fsrp;
+      vkGetPhysicalDeviceProperties2(R.physicalDevice, &props);
+      VkFormatProperties r8{};
+      vkGetPhysicalDeviceFormatProperties(R.physicalDevice, VK_FORMAT_R8_UINT, &r8);
+      const VkExtent2D lo = fsrp.minFragmentShadingRateAttachmentTexelSize, hi = fsrp.maxFragmentShadingRateAttachmentTexelSize;
+      // 16 pixels a texel (AstroQuest's), or the nearest square power of two the device allows
+      uint32_t texel = 16;
+      while (texel < lo.width || texel < lo.height) texel *= 2;
+      while (texel > 1 && (texel > hi.width || texel > hi.height)) texel /= 2;
+      R.fsr = fsrFeatures.attachmentFragmentShadingRate && fsrFeatures.pipelineFragmentShadingRate &&
+              (r8.optimalTilingFeatures & VK_FORMAT_FEATURE_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR) &&
+              texel >= lo.width && texel >= lo.height && texel <= hi.width && texel <= hi.height;
+      R.fsrTexel = texel;
+      // the rates offered (1x1, 2x2 always where the feature is; 4x4 maybe)
+      R.fsr4x4 = false;
+      uint32_t nrates = 0;
+      std::string rates;
+      auto getRates = reinterpret_cast<PFN_vkGetPhysicalDeviceFragmentShadingRatesKHR>(
+          vkGetInstanceProcAddr(R.instance, "vkGetPhysicalDeviceFragmentShadingRatesKHR"));
+      if (R.fsr && getRates && getRates(R.physicalDevice, &nrates, nullptr) == VK_SUCCESS && nrates) {
+        std::vector<VkPhysicalDeviceFragmentShadingRateKHR> list(nrates, {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADING_RATE_KHR});
+        if (getRates(R.physicalDevice, &nrates, list.data()) == VK_SUCCESS)
+          for (uint32_t i = 0; i < nrates; ++i) {
+            const VkExtent2D f = list[i].fragmentSize;
+            if (f.width == 4 && f.height == 4) R.fsr4x4 = true;
+            rates += (rates.empty() ? "" : " ") + std::to_string(f.width) + "x" + std::to_string(f.height);
+          }
+      }
+      LOG("[vulkan foveation] shading rate maps: %s (by attachment %u, by pipeline %u, texel %ux%u .. %ux%u, using %u; "
+          "rates %s; with depth writes %u, sample mask %u)",
+          R.fsr ? "enabled" : "not usable", fsrFeatures.attachmentFragmentShadingRate,
+          fsrFeatures.pipelineFragmentShadingRate, lo.width, lo.height, hi.width, hi.height, texel,
+          rates.empty() ? "(not listed)" : rates.c_str(), fsrp.fragmentShadingRateWithShaderDepthStencilWrites,
+          fsrp.fragmentShadingRateWithSampleMask);
+    } else {
+      LOG("[vulkan foveation] shading rate maps: off (%s)", !wanted ? "WWHD_VK_FOVEATION" : !offered ? "not offered"
+          : !R.multiview ? "needs multiview" : R.renderPasses ? "needs dynamic rendering" : "needs Vulkan 1.2");
+    }
+    fsrFeatures.pNext = nullptr;
+    fsrFeatures.primitiveFragmentShadingRate = VK_FALSE;
+    if (R.fsr) de.push_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME);
+  }
   multiviewFeatures.pNext = nullptr;
   multiviewFeatures.multiviewGeometryShader = multiviewFeatures.multiviewTessellationShader = VK_FALSE;
   VkPhysicalDeviceVulkan13Features f13{
@@ -5482,6 +5550,10 @@ static void init_device(std::vector<const char *> extensions,
   if (R.multiview) {  // (stage M1: enabled, not used yet)
     *tail = &multiviewFeatures;
     tail = &multiviewFeatures.pNext;
+  }
+  if (R.fsr) {  // (foveation.cpp)
+    *tail = &fsrFeatures;
+    tail = &fsrFeatures.pNext;
   }
   if (R.portabilitySubset)
     *tail = &portability;

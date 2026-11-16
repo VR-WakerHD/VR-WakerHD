@@ -201,7 +201,15 @@ static Runner::Snapshot run(const std::vector<std::string>& args) {
     if (!r.start(args)) return r.snapshot();
     return r.wait();
 }
-static bool run_quiet(const std::string& cmd) { return std::system(cmd.c_str()) == 0; }
+static bool run_quiet(const std::string& cmd) {
+#ifdef _WIN32
+    // (cmd.exe /c drops the first and last quote of a line that starts with one and has more: the whole line in one
+    // more pair, so the quoted program and paths survive; the fixtures were never built on Windows, 2026-11-11)
+    return std::system(("\"" + cmd + "\"").c_str()) == 0;
+#else
+    return std::system(cmd.c_str()) == 0;
+#endif
+}
 static std::string q(const fs::path& p) { return "\"" + utf8(p) + "\""; }
 
 static void test_extractor(const std::string& x, const std::string& extractTest, const std::string& wuaTest, const fs::path& work) {

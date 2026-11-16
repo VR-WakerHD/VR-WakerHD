@@ -282,7 +282,22 @@ inline ArmJoints pose_arm_natural(const ArmJoints& anim, const Joint* clavicle, 
             const Vec3 p = normalize(rotate(h, local));
             const Vec3 within = limit_angle(p, forearm, style.wristLimit);
             if (finite(p) && finite(within)) h = normalize(rotation_between(p, within) * h);
-            if (std::isfinite(h.x) && std::isfinite(h.w)) hand = h;
+            if (std::isfinite(h.x) && std::isfinite(h.w)) {
+                // (2026-11-14, a player's video with the bow: "Link's bottom wrist section is rotating with all directional
+                // movements ... the bow and hands locked in when the player is moving they should be moving as 1 unit")
+                // the forearm takes the hand's turn about the forearm's own axis (the twist part of the change from the
+                // animated hand to the controller's): it had kept the animation's roll, which turns as he moves, and its
+                // wrist cuff twisted round the still fist. The wrist's position stays (a turn about its own axis)
+                const Quat delta = normalize(h * conjugate(hand));
+                const float along = delta.x * forearm.x + delta.y * forearm.y + delta.z * forearm.z;
+                Quat tw{forearm.x * along, forearm.y * along, forearm.z * along, delta.w};
+                const float len = std::sqrt(tw.x * tw.x + tw.y * tw.y + tw.z * tw.z + tw.w * tw.w);
+                if (len > 1e-4f && finite(forearm)) {
+                    tw = Quat{tw.x / len, tw.y / len, tw.z / len, tw.w / len};
+                    out.lower.rot = normalize(tw * out.lower.rot);
+                }
+                hand = h;
+            }
         } else if (length(style.levelUp) > 0.5f && finite(f)) {
             // the roll set from level (the up axis kept square to the pointing axis in the hand's frame)
             Vec3 up = style.levelUp - local * dot(style.levelUp, local);

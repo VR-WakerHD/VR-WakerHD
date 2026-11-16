@@ -21,7 +21,7 @@ bool aniso_flat_enabled();
 bool aniso_vr_enabled();
 void set_aniso_flat(bool enabled);
 void set_aniso_vr(bool enabled);
-uint32_t aniso_max_ratio();  // the forced ratio when on: 4 on a standalone headset, else 16 (WWHD_ANISO_MAX)
+uint32_t aniso_max_ratio();  // the forced ratio when on: 8 on a Quest, 2 on the Steam Frame, else 16 (WWHD_ANISO_MAX)
 bool fxaa_enabled();
 void set_fxaa(bool enabled);
 int scale_filter(); // 0 smooth, 1 sharp, 2 integer

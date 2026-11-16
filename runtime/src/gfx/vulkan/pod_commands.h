@@ -11,6 +11,13 @@ namespace gfxvk {
 // Host access to the graphics queue from two threads: the record worker's submissions and a held TV
 // present (even frame delivery, backend.cpp) that the producer issues between commands.
 std::mutex& graphics_queue_mutex();
+// (standalone draw guard, pod_commands.cpp) commands may now be recorded outside the replayed streams (a drain of the
+// record worker before direct recording): the guard stops judging the command buffers it saw begin until they begin again
+void note_direct_recording();
+// draws the guard left out so far (and of them, those with no graphics pipeline bound)
+uint64_t draw_guard_left_out(uint64_t* noPipeline = nullptr, uint64_t* noPass = nullptr);
+// (crash handler) the record worker's last replayed draw and what its command buffer had bound and open
+void replay_crash_note(int fd, void (*out)(int, const char*, size_t));
 // CPU argument storage only. Submission owner retains all referenced Vulkan
 // resources. Append failure is atomic: caller drains then uses its existing
 // immediate fallback.

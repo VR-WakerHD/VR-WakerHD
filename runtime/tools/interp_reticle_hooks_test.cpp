@@ -32,6 +32,8 @@ float reticle_t() { return fraction; }
 }
 void log_msg(const char*, ...) {}
 namespace test_aids { void reticle_targets(Cpu*, uint32_t) { assert(false); } }
+// (interp.cpp: dKyr_drawStar's projections in VR, used by hook_025F1018 since the night sky change; flat here: the game's own)
+bool interp_vr_star_project(Cpu*, void (*)(Cpu*)) { return false; }
 extern "C" void f_025F1018_orig(Cpu* c) {
     ++calls;
     for (int i = 0; i < 3; ++i)

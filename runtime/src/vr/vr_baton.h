@@ -368,6 +368,57 @@ private:
     BatonZone zone_;
 };
 
+// The beat's hand (asked for in the headset, 2026-11-14: "there should just be 3 positions for the left hand: Out middle and
+// In, and when the hand is in either of those positions it should stay in the mode that hand position sets and not change
+// until the hand moves ... evenly distributed across your left hands reach"). Where the hand is across the body, from the
+// head, in a frame turned to the head's heading when conducting began: three side-by-side bands of 2 x reach each, the
+// middle one centred kShoulder out to the hand's own side (in front of its shoulder, where the hand rests). Out (away from
+// the body: left for the left hand) gives that side's direction, In (across the body) the other, the middle nothing (4/4).
+// It never re-centres and nothing eases: a band is left only when the hand is kSwitch past its edge, so a hand held in one
+// keeps its mode. A hand that loses tracking keeps the band it was in. Up and down are not read
+class BatonBeatZones {
+public:
+    static constexpr float kShoulder = 0.20f;  // m from the head's centre to the hand's side: the middle band's centre
+    static constexpr float kSwitch = 0.02f;    // m past a band's edge before the hand is in the next one
+    // side: the hand's (0 left, 1 right); reach: half a band's width (vr.batonHandReach)
+    BatonDir update(bool tracked, Vec3 hand, bool haveHead, Vec3 head, float headingYaw, float reach, int side) {
+        if (!tracked || !haveHead || !finite(hand) || !finite(head)) return dir_;
+        if (!framed_) {
+            framed_ = true;
+            frame_ = conjugate(yaw_quat(headingYaw));
+        }
+        const float centre = side == 1 ? kShoulder : -kShoulder;
+        across_ = rotate(frame_, hand - head).x - centre;  // (right positive, from the middle band's centre)
+        const float edge = std::max(reach, 0.02f);
+        const float u = across_;
+        int band = dir_ == BatonDir::Left ? -1 : dir_ == BatonDir::Right ? 1 : 0;
+        if (band == 0) {
+            if (u < -edge - kSwitch) band = -1;
+            else if (u > edge + kSwitch) band = 1;
+        } else if (band < 0) {
+            if (u > edge + kSwitch) band = 1;
+            else if (u > -edge + kSwitch) band = 0;
+        } else {
+            if (u < -edge - kSwitch) band = -1;
+            else if (u < edge - kSwitch) band = 0;
+        }
+        return dir_ = band < 0 ? BatonDir::Left : band > 0 ? BatonDir::Right : BatonDir::None;
+    }
+    void reset() {
+        framed_ = false;
+        dir_ = BatonDir::None;
+        across_ = 0;
+    }
+    bool framed() const { return framed_; }
+    float across() const { return across_; }  // (diagnostics) metres from the middle band's centre, right positive
+
+private:
+    bool framed_ = false;
+    Quat frame_;
+    BatonDir dir_ = BatonDir::None;
+    float across_ = 0;
+};
+
 // the channel's direction: its stick's when the stick has one, else its hand's
 inline BatonDir baton_channel(BatonDir stick, BatonDir hand) { return stick != BatonDir::None ? stick : hand; }
 // the game's stick for a direction: a full push along it (x right, y up, as the controllers' sticks)
@@ -382,6 +433,8 @@ struct BatonInput {
     float stick[2][2] = {};     // the left and right sticks (x right, y up)
     bool tracked[2] = {};       // each controller's pose is tracked now
     Vec3 hand[2];               // each controller's grip position (tracking space, metres)
+    bool haveHead = false;      // the head's pose is known now
+    Vec3 head;                  // the head's position (tracking space): the beat hand's bands are from it
     float headingYaw = 0;       // the head's heading now (taken when a hand is centred)
     bool hands = true;          // vr.batonHands
     float reach = 0.12f;        // vr.batonHandReach
@@ -435,7 +488,7 @@ public:
         out.stopped = !in.conducting && conducting_;
         conducting_ = in.conducting;
         if (!in.conducting || out.started) {  // nothing kept from before (or from the last song)
-            for (int s = 0; s < 2; ++s) { stick_[s].dir = BatonDir::None; hand_[s].reset(); }
+            for (int s = 0; s < 2; ++s) { stick_[s].dir = BatonDir::None; hand_[s].reset(); beat_[s].reset(); }
             if (!in.conducting) return out;
         }
         for (int s = 0; s < 2; ++s) {
@@ -448,14 +501,21 @@ public:
             const int wand = in.noteHand == 1 ? 1 : 0;
             int h = s == 0 ? wand : 1 - wand;
             if (in.swapHands) h = 1 - h;  // (each hand keeps its calibration: the wand's zone stays with the wand's hand)
-            if (h != handOf_[s]) { handOf_[s] = h; hand_[s].reset(); }
+            if (h != handOf_[s]) { handOf_[s] = h; hand_[s].reset(); beat_[s].reset(); }
             const bool wandZone = h == wand;
+            beatOf_[s] = !wandZone;
             const float reach = wandZone ? in.reach * kNoteReachShare : in.reach;
-            out.handDir[s] = in.hands ? hand_[s].update(in.tracked[h], in.hand[h], in.headingYaw, reach, in.recentre,
-                                                        in.dt, false, wandZone ? note_shape(h) : BatonShape{}, wandZone)
-                                      : BatonDir::None;
+            if (!in.hands) out.handDir[s] = BatonDir::None;
+            else if (wandZone)
+                out.handDir[s] = hand_[s].update(in.tracked[h], in.hand[h], in.headingYaw, reach, in.recentre, in.dt, false,
+                                                 note_shape(h), true);
+            else {  // (the beat: three fixed bands across the body, BatonBeatZones)
+                // (its settled place is still kept, for where the body faces while conducting: hands_centre)
+                hand_[s].update(in.tracked[h], in.hand[h], in.headingYaw, reach, in.recentre, in.dt);
+                out.handDir[s] = beat_[s].update(in.tracked[h], in.hand[h], in.haveHead, in.head, in.headingYaw, reach, h);
+            }
             if (in.middle[h]) out.handDir[s] = BatonDir::None;  // (the middle held: the zone still follows the hand)
-            if (!in.hands) hand_[s].reset();
+            if (!in.hands) { hand_[s].reset(); beat_[s].reset(); }
             out.dir[s] = baton_channel(out.stickDir[s], out.handDir[s]);
         }
         return out;
@@ -465,8 +525,10 @@ public:
     // (diagnostics, the calibration) a channel's hand: which controller, its offset from its centre (metres, x right,
     // y up), whether it has settled
     int hand_of(int channel) const { return handOf_[channel & 1]; }
-    Vec3 hand_offset(int channel) const { return hand_[channel & 1].offset(); }
-    bool hand_settled(int channel) const { return hand_[channel & 1].centred(); }
+    Vec3 hand_offset(int channel) const {
+        return beatOf_[channel & 1] ? Vec3{beat_[channel & 1].across(), 0, 0} : hand_[channel & 1].offset();
+    }
+    bool hand_settled(int channel) const { return beatOf_[channel & 1] ? beat_[channel & 1].framed() : hand_[channel & 1].centred(); }
     uint32_t hand_rests(int channel) const { return hand_[channel & 1].rests(); }
     bool hand_flicking(int channel) const { return hand_[channel & 1].flicking(); }
     float hand_radius(int channel) const { return hand_[channel & 1].radius(); }
@@ -481,6 +543,8 @@ private:
     bool conducting_ = false;
     BatonFilter stick_[2];
     BatonHand hand_[2];  // by channel: the notes' hand, the beat's
+    BatonBeatZones beat_[2];  // (the beat's hand, by channel)
+    bool beatOf_[2] = {false, false};
     int handOf_[2] = {0, 1};
 };
 

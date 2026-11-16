@@ -363,6 +363,15 @@ public class WwhdActivity extends SDLActivity {
         if (savedInstanceState == null && offersCrashReports()) CrashReports.offer(this);
     }
 
+    /** From the game (main.cpp, before loading code/cking.rpx; SDL's thread): no game files at that path. The
+     *  "game files missing" screen in a process of its own, which asks the player to extract the game disc; the game's
+     *  process ends right after this returns. */
+    public void gameFilesMissing(String path) {
+        Log.w("wwhd", "no game files (" + path + "): asking the player to extract the game disc");
+        startActivity(new Intent(this, GameMissingActivity.class)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK));
+    }
+
     public void shareLog() { runOnUiThread(() -> LogShare.share(this)); }
     /** Settings > Bug reports > Share log, with "Include my save files" (off by default; names made "Link") */
     public void shareLogWithSaves(boolean saves) { runOnUiThread(() -> LogShare.share(this, saves)); }

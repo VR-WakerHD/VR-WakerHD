@@ -61,6 +61,13 @@ enum Op : uint32_t {
     // sparkles, poison mist, cloud shadows, waves, stars, sun, sky clouds) begin (1) / end (0): their one-quad draws
     // whose only changes are the vertex buffer and its fetch shader's copy are drawn as one draw (gx2_core.cpp)
     OP_WEATHER_QUADS,
+    // (VR fork, docs/VR_HANDS_LAYER_PLAN.md step 1) recorded with the draws it brackets: Link's draw lists (dComIfGd_
+    // setListP1: his hands, arms and what he holds once his body is hidden) begin (1 opaque, 2 the other) / end (0)
+    OP_VR_HANDS,
+    // (VR fork, 2026-11-14) recorded with the draws it brackets: the sky's draw lists (dComIfGd_setListSky, play +0x5D4C /
+    // +0x5D50: the sky dome, its back clouds) begin (1) / end (0): drawn at infinity, each eye's own field of view and no
+    // eye offset (stereo::sky_draw)
+    OP_VR_SKY,
     OP_COUNT
 };
 

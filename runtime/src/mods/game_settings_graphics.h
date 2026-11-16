@@ -38,7 +38,10 @@ inline int rate_choice(int mode, int fps, bool generated = false) {
 struct Rate { int mode, fps; bool generated; };
 inline Rate rate_of(int choice) {
     if (choice <= 0 || choice >= kRateCount) return {0, 0, false};
-    return {1, kRates[choice]};
+    // (the generated choice: its own branch, as upstream's; lost in the v0.5.1 port, 2026-11-07, it read kRates[5],
+    // past the list's end: game_settings_page_test crashed with heap corruption, 2026-11-11)
+    if (choice == kGenerated) return {0, 0, true};
+    return {1, kRates[choice], false};
 }
 
 // Dynamic resolution: the lowest factor (0: off), as the Settings window offers it

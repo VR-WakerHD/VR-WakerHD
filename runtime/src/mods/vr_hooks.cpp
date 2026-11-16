@@ -4,6 +4,9 @@
 // VR mode's game hooks that need a function of their own (tools/recomp/hooks_vr.txt; vr/vr_game.h).
 // Defined in every build: the recompiled code calls them whether or not VR is built in.
 #include "runtime.h"
+#include <algorithm>
+#include <mutex>
+#include "../j3d_draw_guard.h"
 #include "guest_addr.h"
 #include "interp.h"
 #ifdef WWHD_VR
@@ -24,6 +27,10 @@ void f_02414834_orig(Cpu* c);  // daPy_sightPacket_c::draw
 void f_023D8624_orig(Cpu* c);  // daPy_lk_c::setDrawHandModel
 void f_0205244C_orig(Cpu* c);  // daArrow_c::setKeepMatrix
 void f_020CDBFC_orig(Cpu* c);  // daBoomerang_sightPacket_c::draw
+void f_027F8974_orig(Cpu* c);  // dOvlpFadeRenderer_c::draw
+void f_02053188_orig(Cpu* c);  // daArrow_c::_draw
+void f_0272CAE0_orig(Cpu* c);  // the snapshot's render with a matrix (d_ovlp_fade2)
+void f_0272CF9C_orig(Cpu* c);  // the snapshot's blur (d_ovlp_fade4)
 void f_0242FA80_orig(Cpu* c);  // daPy_lk_c::procBtJumpCut_init
 void f_02430078_orig(Cpu* c);  // daPy_lk_c::procBtRollCut_init
 void f_024306C8_orig(Cpu* c);  // daPy_lk_c::procBtVerticalJumpCut_init
@@ -32,6 +39,34 @@ void f_023E5400_orig(Cpu* c);  // daPy_lk_c::changeSpecialBattle
 void f_026FD1DC_orig(Cpu* c);  // hdMsgWindow_updateWaitInput (the message window waiting for the button)
 void f_026FCC10_orig(Cpu* c);  // hdMsgWindow_updateOpen (the message window typing)
 void f_026FCEE0_orig(Cpu* c);  // hdMsgWindow_updateStop (a page's stop waiting for A)
+void f_02517DEC_orig(Cpu* c);  // dCcS::ChkShield (is an attack's hit on a shield)
+void f_0241D5F0_orig(Cpu* c);  // daPy_lk_c::changeRopeSwingProc (falling: catch a rope his body touches)
+}
+
+// dCcS::ChkShield(this, atObj, tgObj, atInf, tgInf) (02517DEC): VR first person, a hit on Link is on his shield only where
+// it meets the tracked shield's front panel (vr::game::shield_check). Not on it: no (his collider's shielded bit cleared
+// too, so an arrow that hit him is not taken for one knocked away by a shield). On it: the game's own answer with the
+// bit set and the 90-degree front range off (the panel decided the side), so an attack that no guard stops still
+// gets through; the bit kept for the arrow, the range as it was. Link's next execute sets the bit as the game has it
+extern "C" void hook_02517DEC(Cpu* c) {
+#ifdef WWHD_VR
+    const uint32_t atInf = c->r[6], tgInf = c->r[7];
+    const int answer = vr::game::shield_check(atInf, tgInf);
+    if (answer >= 0) {
+        constexpr uint32_t kTgSPrm = 0x94;  // dCcD_GObjInf::mGObjTg.mSPrm: bit 1 shielded, bit 8 its front range
+        const uint32_t sprm = ld32(tgInf + kTgSPrm);
+        if (answer == 0) {
+            st32(tgInf + kTgSPrm, sprm & ~1u);
+            c->r[3] = 0;
+            return;
+        }
+        st32(tgInf + kTgSPrm, (sprm | 1u) & ~8u);
+        f_02517DEC_orig(c);
+        st32(tgInf + kTgSPrm, sprm | 1u);
+        return;
+    }
+#endif
+    f_02517DEC_orig(c);
 }
 
 // dCamera_c::CalcSubjectAngle(this, s16* pitch, s16* yaw) (02506964): the first-person camera's aim from the sticks (and
@@ -389,6 +424,51 @@ extern "C" void hook_020CDBFC(Cpu* c) {
     f_020CDBFC_orig(c);
 }
 
+// The game's picture transitions (story cutscenes, the Song of Passing's day/night change, scene changes with a
+// snapshot wipe) capture the picture once and draw it over the whole screen while it fades, spins or blurs. A flat
+// full-screen picture in each eye's own view showed double in the headset (a player, 2026-11-14: "the transition screen
+// is mirrored (Double image)", then "all story transition cutscenes are doing the mirrored screen thing ... Jabun island
+// cutscene"). In VR each of their drawing calls goes into the UI layer, as the game's other flat pictures: one picture
+// ahead of the head. Only the drawing of the captured picture: its capture (dOvlpFadeRenderer_c::capture 027F84A4) is
+// the eye's picture as it is. The three ways the game draws it:
+//   - dOvlpFadeRenderer_c::draw (027F8974): the snapshot fade (d_ovlp_fade3, wipe 6) and the HD fade code's own draws;
+//   - the snapshot's render with a matrix (0272CAE0): the spinning fade (d_ovlp_fade2, captureSnapshot);
+//   - the snapshot's blur (0272CF9C): the blurring fade (d_ovlp_fade4).
+// Logged once per calling place: which transitions a run used
+namespace {
+void snapshot_into_ui_layer(Cpu* c, void (*orig)(Cpu*), const char* what) {
+#ifdef WWHD_VR
+    if (stereo::requestedXR.load(std::memory_order_relaxed)) {
+        static std::mutex m;
+        static uint32_t seen[24] = {};
+        static int nseen = 0;
+        {
+            std::lock_guard<std::mutex> l(m);
+            if (nseen < 24 && std::find(seen, seen + nseen, c->lr) == seen + nseen) {
+                seen[nseen++] = c->lr;
+                LOG("[vr] picture transition (%s, from %08X): its picture drawn into the UI layer", what, c->lr);
+            }
+        }
+        // (begin: no content clip, a layout, not a photograph, a whole-screen picture: it fills the UI layer, 2026-11-14)
+        gx2::emit(gx2::OP_LAYOUT_CONTENT, {0u, 1u, 0u, 1u});
+        orig(c);
+        gx2::emit(gx2::OP_LAYOUT_CONTENT, {0u, 0u});  // (end)
+        {  // (diagnostics: the frame's pictures saved, vr_vulkan.cpp; not on the title or the file select)
+            const char* st = reinterpret_cast<const char*>(mem::ptr(GD(0x1046F0B0) + 0x5134));
+            if (st[0] && std::strncmp(st, "sea_T", 8) != 0 && std::strncmp(st, "Name", 8) != 0)
+                stereo::transitionDrawn.store(true);
+        }
+        return;
+    }
+#endif
+    (void)what;
+    orig(c);
+}
+}  // namespace
+extern "C" void hook_027F8974(Cpu* c) { snapshot_into_ui_layer(c, f_027F8974_orig, "snapshot fade"); }
+extern "C" void hook_0272CAE0(Cpu* c) { snapshot_into_ui_layer(c, f_0272CAE0_orig, "spinning snapshot"); }
+extern "C" void hook_0272CF9C(Cpu* c) { snapshot_into_ui_layer(c, f_0272CF9C_orig, "blurred snapshot"); }
+
 // daArrow_c::setKeepMatrix (0205244C): the arrow on Link's hand, each step until shot; its procWait shoots it right
 // after, along the angles this sets. In VR the arrow lies along the bow (docs/VR_AIMING.md, "The arrow along the bow"):
 // its angles and place are set to that line afterwards, so it flies where its red laser points (reported in the
@@ -436,6 +516,38 @@ extern "C" void hook_02403150(Cpu* c) {
 #endif
 }
 
+// daPy_lk_c::changeRopeSwingProc (0241D5F0): falling, Link catches any rope his body touches. VR first person: not the one
+// he has just jumped off (vr::game::rope_catch_blocked; a player's video: caught again 1 or 2 steps after each jump)
+extern "C" void hook_0241D5F0(Cpu* c) {
+#ifdef WWHD_VR
+    if (vr::game::rope_catch_blocked(c, c->r[3])) {
+        c->r[3] = 0;
+        return;
+    }
+#endif
+    f_0241D5F0_orig(c);
+}
+
+// daArrow_c::_draw (02053188): the arrow on the bow (its procWait, 02053D24: nocked, placed by setKeepMatrix) is drawn
+// as Link's (2026-11-14 in the headset: "the bow when you are moving and turning and the arrow is out the arrow begins
+// to flicker", at a low capped frame rate). It enters Link's list (dComIfGd_setListP1) from its own draw, so the hands
+// layer (steady hands, 30/45 fps) drew it with the world while the bow and the hands holding it were in the layer: the
+// two are turned and kept differently between the game's frames, and the arrow jumped against the bow. Shot, it is
+// the world's again
+extern "C" void hook_02053188(Cpu* c) {
+#ifdef WWHD_VR
+    const uint32_t arrow = c->r[3];
+    constexpr uint32_t kArrowProc = 0x7A8 + 4;  // mCurrProcFunc's function (GHS member pointer: delta, index, function)
+    if (arrow && ld32(arrow + kArrowProc) == GC(0x02053D24)) {
+        j3d_draw_guard::link_draw(true);
+        f_02053188_orig(c);
+        j3d_draw_guard::link_draw(false);
+        return;
+    }
+#endif
+    f_02053188_orig(c);
+}
+
 // daPy_Draw (023DBBE4): Link's draw; VR's first-person presentation around it (head hidden, tracked sword)
 extern "C" void hook_023DBBE4(Cpu* c) {
 #ifdef WWHD_VR
@@ -446,7 +558,9 @@ extern "C" void hook_023DBBE4(Cpu* c) {
         return;
     }
     vr::game::link_draw_begin(link);
+    j3d_draw_guard::link_draw(true);  // (the packets he enters are his: the hands layer, j3d_draw_guard.cpp)
     f_023DBBE4_orig(c);
+    j3d_draw_guard::link_draw(false);
     vr::game::link_draw_end(link);
 #else
     f_023DBBE4_orig(c);

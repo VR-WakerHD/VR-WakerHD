@@ -8,6 +8,9 @@
 // Vulkan device the runtime creates), lets it run 30 frames with nothing drawn, prints one line and ends it:
 //   vr-refresh-probe: current=<Hz> offered=<Hz,Hz,...> choosable=<0|1> streamed=<0|1>
 // or "vr-refresh-probe: error=<why>". The headset shows its runtime's empty scene for that second or two.
+// Android (2026-11-12, Quest 3 / 3S): the launcher cannot read the game's stdout (the game is an activity of the app,
+// started with --vr-refresh-probe --vr-refresh-probe-out <file>), so the line is also written to that file, and the
+// game's process then ends (one SDL lifetime per process; the launcher is in front again).
 #include "openxr_session.h"
 
 #include <chrono>
@@ -20,14 +23,32 @@
 #else
 #include <dlfcn.h>
 #endif
+#ifdef __ANDROID__
+#include <unistd.h>
+#endif
 
 namespace vr {
 namespace {
-int fail(const std::string& why) {
-    std::printf("vr-refresh-probe: error=%s\n", why.c_str());
+[[maybe_unused]] const char* g_out = nullptr;  // Android: the launcher's answer file (--vr-refresh-probe-out)
+// the answer: stdout, and on Android also the launcher's file (written whole, then renamed: never read half written)
+void answer(const std::string& text) {
+    std::printf("vr-refresh-probe: %s\n", text.c_str());
     std::fflush(stdout);
+#ifdef __ANDROID__
+    if (!g_out || !*g_out) return;
+    const std::string part = std::string(g_out) + ".part";
+    if (FILE* f = std::fopen(part.c_str(), "wb")) {
+        std::fprintf(f, "vr-refresh-probe: %s\n", text.c_str());
+        std::fclose(f);
+        std::rename(part.c_str(), g_out);
+    }
+#endif
+}
+int fail(const std::string& why) {
+    answer("error=" + why);
     return 2;
 }
+int refresh_probe_run();
 PFN_vkGetInstanceProcAddr vulkan_loader() {
 #ifdef _WIN32
     HMODULE m = LoadLibraryW(L"vulkan-1.dll");
@@ -40,7 +61,18 @@ PFN_vkGetInstanceProcAddr vulkan_loader() {
 }
 }  // namespace
 
-int refresh_probe_main() {
+int refresh_probe_main(const char* out) {
+    g_out = out;
+#ifdef __ANDROID__
+    // the game's process ends with the answer (its SDL activity is not run again in this process)
+    _exit(refresh_probe_run());
+#else
+    return refresh_probe_run();
+#endif
+}
+
+namespace {
+int refresh_probe_run() {
     const PFN_vkGetInstanceProcAddr gipa = vulkan_loader();
     if (!gipa) return fail("the Vulkan loader was not found");
     xr::Session s;
@@ -113,10 +145,12 @@ int refresh_probe_main() {
     }
     // (streamed: the headset is streamed, by the runtime's and the headset's names, openxr_session.cpp; the launcher's
     // Detect Headset sets Streaming optimal from it, docs/VR_STREAMING.md)
-    std::printf("vr-refresh-probe: current=%.2f offered=%s choosable=%d streamed=%d\n", double(s.refresh_rate()),
-                offered.c_str(), s.refresh_rate_choosable() ? 1 : 0, s.streamed() ? 1 : 0);
-    std::fflush(stdout);
+    char line[512];
+    std::snprintf(line, sizeof line, "current=%.2f offered=%s choosable=%d streamed=%d", double(s.refresh_rate()),
+                  offered.c_str(), s.refresh_rate_choosable() ? 1 : 0, s.streamed() ? 1 : 0);
+    answer(line);
     return done(0);
 }
+}  // namespace
 
 }  // namespace vr

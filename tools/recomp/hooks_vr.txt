@@ -18,3 +18,9 @@
 026FD1DC  # hdMsgWindow_updateWaitInput: VR, a page at its end shows all its letters (the white stuck at a colour change)
 026FCC10  # hdMsgWindow_updateOpen: VR diagnostics, a message window's typing going back to the start
 026FCEE0  # hdMsgWindow_updateStop: VR, a page's stop takes no A in its first steps (the page still turning white)
+02517DEC  # dCcS::ChkShield: VR first person, a hit on Link is on his shield only where it meets the tracked shield's front
+027F8974  # dOvlpFadeRenderer_c::draw: VR draws the snapshot fades' picture (the Song of Passing's day/night change) into the UI layer (shown double in the eyes)
+0272CAE0  # the snapshot's render with a matrix: VR draws the spinning fade's picture (d_ovlp_fade2) into the UI layer
+0272CF9C  # the snapshot's blur: VR draws the blurring fade's picture (d_ovlp_fade4) into the UI layer
+02053188  # daArrow_c::_draw: VR draws the nocked arrow as Link's (the hands layer: it flickered against the bow)
+0241D5F0  # daPy_lk_c::changeRopeSwingProc: VR first person, the rope Link just jumped off is not caught again

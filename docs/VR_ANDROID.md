@@ -97,7 +97,7 @@ In the VR build the app opens on the VR launcher, the same program as the deskto
 - **Not on Android:** the OpenXR runtime section (the headset's runtime is the only one), the game program and
   game-folder fields (the General tab shows the game folder and whether the game is in it), "Open the settings
   folder".
-- **Install game:** extracting a Cemu archive (`.wua`) or a disc image (`.wud`, `.wux` with its keys) works as on the
+- **Extract Game:** extracting a Cemu archive (`.wua`) or a disc image (`.wud`, `.wux` with its keys) works as on the
   desktop, with these differences:
   - `wwhd-extract` is in the APK as `libwwhd-extract-driver.so` (`android/build_native.sh VR=1`), in the app's
     native-library folder: the one place Android lets an app run a program. SDL has no processes on Android (its

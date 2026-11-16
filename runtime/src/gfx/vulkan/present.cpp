@@ -20,6 +20,9 @@
 #include "shaders.h"
 #include "settings.h"
 #include "mods/climb.h"
+#ifdef WWHD_VR
+#include "../../vr/vr.h"  // (vr::desktop_view: the desktop window's VR View)
+#endif
 #include "mods/mods.h"  // MoveHud: the run/swim boost's bar (draw_mod_overlay)
 #include "overlay/guest_hud.h"
 #include "gfx/display_modes.h"
@@ -864,8 +867,125 @@ static void add_gamepad_backdrop(std::vector<ComposeQuad>& quads,VkExtent2D targ
  }
  insert_backdrop_bars(quads,index,bars);
 }
+#ifdef WWHD_VR
+// (2026-11-12, the user's choice) the desktop window's VR View while the headset plays, SteamVR's choices
+// (vr.desktopView): the left eye, the right eye, both side by side, or nothing; with vr.desktopViewFill each eye's
+// picture fills its part of the window, scaled about its centre and its edges cropped, instead of fitting it with
+// black bars. Only the window's quads: the headset's pictures are not touched
+// (2026-11-12) both eyes, left / right dominant (vr.desktopView 4 / 5), as SteamVR's VR View: one picture of the union
+// of the two eyes' fields, each eye's picture placed where its own field lies in it (so the picture is wider than one
+// eye's). The dominant eye drawn whole; where the eyes overlap the other one blended over it at kOtherEye; the other
+// eye's own outer strip, beyond the dominant eye's field, shown at full strength (the picture evenly bright)
+constexpr float kOtherEye = 0.3f;
+gfx::Box clip_to(const gfx::Box& a, const gfx::Box& b) {
+ const float x0 = std::max(a.x, b.x), y0 = std::max(a.y, b.y);
+ const float x1 = std::min(a.x + a.w, b.x + b.w), y1 = std::min(a.y + a.h, b.y + b.h);
+ return {x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0)};
+}
+std::vector<ComposeQuad> dominant_view_quads(Screen& screen,VkExtent2D target,int& filter,bool rightDominant,bool fill) {
+ const auto mono = screen_quads_mono(screen,target,filter);
+ ComposeQuad eyeQuad;
+ bool found = false;
+ for (const auto& q : mono) if (q.image == screen.scan.get()) { eyeQuad = q; found = true; break; }
+ if (!found || !stereoRight.scan || eyeQuad.box.w <= 0 || eyeQuad.box.h <= 0) return mono;
+ vr::Fov f[2];
+ if (!vr::eye_field(0, f[0]) || !vr::eye_field(1, f[1])) {
+  // (no eye fields: the symmetric projection) both pictures over each other, in the same place
+  f[0] = f[1] = vr::Fov{};
+ }
+ const int dom = rightDominant ? 1 : 0, other = 1 - dom;
+ auto t = [](float a) { return std::tan(a); };
+ const float L = t(std::min(f[0].left, f[1].left)), R = t(std::max(f[0].right, f[1].right));
+ const float U = t(std::max(f[0].up, f[1].up)), D = t(std::min(f[0].down, f[1].down));
+ // pixels per tangent: the dominant eye's picture as the mono layout fits it
+ const float sx = eyeQuad.box.w / (t(f[dom].right) - t(f[dom].left)), sy = eyeQuad.box.h / (t(f[dom].up) - t(f[dom].down));
+ const float W = sx * (R - L), H = sy * (U - D);
+ if (!(W > 0) || !(H > 0)) return mono;
+ const float tw = float(target.width), th = float(target.height);
+ const float k = fill ? std::max(tw / W, th / H) : std::min(tw / W, th / H);
+ const float ox = (tw - k * W) * 0.5f, oy = (th - k * H) * 0.5f;
+ auto boxOf = [&](int e) {
+  return gfx::Box{ox + k * sx * (t(f[e].left) - L), oy + k * sy * (U - t(f[e].up)),
+                  k * sx * (t(f[e].right) - t(f[e].left)), k * sy * (t(f[e].up) - t(f[e].down))};
+ };
+ const gfx::Box window{0, 0, tw, th}, domBox = boxOf(dom), otherBox = boxOf(other);
+ std::vector<ComposeQuad> result;
+ ComposeQuad q = eyeQuad;
+ // the dominant eye, whole
+ q.image = dom ? stereoRight.scan.get() : screen.scan.get();
+ q.box = domBox; q.alpha = 1; q.clipped = true; q.clip = clip_to(domBox, window);
+ result.push_back(q);
+ // the other eye: its strips outside the dominant eye's picture at full strength, its overlap blended in
+ q.image = other ? stereoRight.scan.get() : screen.scan.get();
+ q.box = otherBox;
+ const gfx::Box ov = clip_to(otherBox, domBox);
+ const gfx::Box strips[4] = {
+  {otherBox.x, otherBox.y, std::max(0.0f, ov.x - otherBox.x), otherBox.h},                                   // left
+  {ov.x + ov.w, otherBox.y, std::max(0.0f, otherBox.x + otherBox.w - (ov.x + ov.w)), otherBox.h},           // right
+  {ov.x, otherBox.y, ov.w, std::max(0.0f, ov.y - otherBox.y)},                                               // above
+  {ov.x, ov.y + ov.h, ov.w, std::max(0.0f, otherBox.y + otherBox.h - (ov.y + ov.h))}};                       // below
+ for (const auto& s : strips) {
+  const gfx::Box c = clip_to(s, window);
+  if (c.w < 0.5f || c.h < 0.5f) continue;
+  q.alpha = 1; q.clip = c; result.push_back(q);
+ }
+ if (const gfx::Box c = clip_to(ov, window); c.w >= 0.5f && c.h >= 0.5f) {
+  q.alpha = kOtherEye; q.clip = c; result.push_back(q);
+ }
+ return result;
+}
+std::vector<ComposeQuad> desktop_view_quads(Screen& screen,VkExtent2D target,int& filter,int view,bool fill) {
+ if (view == 3) return {};  // off: the window black, nothing composed
+ if (view == 4 || view == 5) return dominant_view_quads(screen,target,filter,view == 5,fill);
+ const bool both = view == 2;
+ VkExtent2D part = target;
+ if (both) part.width = std::max(1u,target.width/2);
+ const auto mono = screen_quads_mono(screen,part,filter);
+ // the eye picture's box in its part, the centre the fill scales about
+ gfx::Box eyeBox{0,0,float(part.width),float(part.height)};
+ for (const auto& q : mono) if (q.image == screen.scan.get()) { eyeBox = q.box; break; }
+ const float k = fill && eyeBox.w > 0 && eyeBox.h > 0
+     ? std::max(float(part.width)/eyeBox.w, float(part.height)/eyeBox.h) : 1.0f;
+ const float ex = eyeBox.x + eyeBox.w*0.5f, ey = eyeBox.y + eyeBox.h*0.5f;
+ const float px = float(part.width)*0.5f, py = float(part.height)*0.5f;
+ std::vector<ComposeQuad> result;
+ for (int eye = 0; eye < (both ? 2 : 1); ++eye) {
+  const bool right = both ? eye == 1 : view == 1;
+  const float offset = float(eye) * float(part.width);
+  for (auto q : mono) {
+   if (right && q.image == screen.scan.get() && stereoRight.scan) q.image = stereoRight.scan.get();
+   if (k != 1.0f) {
+    q.box = {px + (q.box.x - ex)*k, py + (q.box.y - ey)*k, q.box.w*k, q.box.h*k};
+    if (q.clipped) q.clip = {px + (q.clip.x - ex)*k, py + (q.clip.y - ey)*k, q.clip.w*k, q.clip.h*k};
+   }
+   q.box.x += offset;
+   if (q.clipped) q.clip.x += offset;
+   if (both || k != 1.0f) {
+    // kept to its part of the window (both eyes: each its own half; filled: the window)
+    const gfx::Box area{offset,0,float(part.width),float(part.height)};
+    if (!q.clipped) { q.clipped = true; q.clip = area; }
+    else {
+     const float x0 = std::max(q.clip.x, area.x), y0 = std::max(q.clip.y, area.y);
+     const float x1 = std::min(q.clip.x + q.clip.w, area.x + area.w), y1 = std::min(q.clip.y + q.clip.h, area.y + area.h);
+     q.clip = {x0, y0, std::max(0.0f, x1 - x0), std::max(0.0f, y1 - y0)};
+    }
+   }
+   result.push_back(q);
+  }
+ }
+ return result;
+}
+#endif
 std::vector<ComposeQuad> screen_quads(Screen& screen,VkExtent2D target,int& filter) {
- // XR: the window mirrors the left eye; the headset gets both (vr_vulkan.cpp)
+ // XR: the window mirrors the left eye (or as vr.desktopView chooses: desktop_view_quads); the headset gets both
+ // (vr_vulkan.cpp)
+#ifdef WWHD_VR
+ if (&screen == &R.tv && stereo::frame.mode == stereo::XR) {
+  bool fill = false;
+  const int view = vr::desktop_view(fill);
+  if (view != 0 || fill) return desktop_view_quads(screen,target,filter,view,fill);
+ }
+#endif
  if (&screen != &R.tv || !stereo::packed()) {
   auto quads=screen_quads_mono(screen,target,filter);add_gamepad_backdrop(quads,target);return quads;
  }

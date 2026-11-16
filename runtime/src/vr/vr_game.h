@@ -41,6 +41,18 @@ bool hides_held_object(uint32_t actor);
 void weapon_drawing(uint32_t actor);
 // before the original daPy_Execute: what VR changed for Link's draw only is put back before his logic runs
 void link_executing(uint32_t link, Cpu* cpu);
+// the start of a 30 Hz logic step, the pad read and before any actor runs (interp.cpp's fpcEx_Handler hook): B leaves
+// command mode (a partner controlled) as the game's own return button does
+void logic_step_starting();
+// the display time of the frame being built (ns, the runtime's clock: the camera's own prediction, display_time) and the
+// headset's refresh period (ns); false outside a VR session (interp.cpp's display-time blend)
+bool frame_display_time(int64_t& displayNs, int64_t& periodNs);
+// dCcS::ChkShield's answer for an attack's collider (atInf) on another's (tgInf), dCcD_GObjInf addresses: 1 on the
+// tracked shield's front (blocked), 0 not, -1 the game's own (third person, no tracked shield, not Link's body)
+int shield_check(uint32_t atInf, uint32_t tgInf);
+// daPy_lk_c::changeRopeSwingProc (0241D5F0), before the original: true when the rope Link's body touches is the one he
+// let go of within the last 1.5 s in first person (not caught again: the rope's jump always takes him off it)
+bool rope_catch_blocked(Cpu* cpu, uint32_t link);
 // end of input::read(): the controllers' buttons and sticks as the GamePad's, swings as the sword button
 void filter_pad(input::PadState& s);
 // the VR menu (docs/VR_MENU.md): open (the left stick's click toggles it), and the pause it holds: true before a
@@ -79,6 +91,15 @@ bool keep_bow_hand(uint32_t link);
 // while a parry's finishing cut waits for the player's own swing (VR first person; docs/VR_CONTROLS.md, "Parry
 // attacks"); the game calls them again each step, so the cut follows the swing, or the timeout, or no cut on landing
 bool parry_cut_wait();
+// (docs/VR_HANDS_LAYER_PLAN.md) the view Link's hands are drawn as their own layer in: first person play
+// (the hands layer on this frame, or force: a check run, WWHD_VR_HANDS_SKIP) in first-person play
+bool hands_layer_view(bool force = false);
+// (interp_fx.cpp, the sword trail's draw) the vertical slash's trail left out in first person
+bool sword_trail_hidden();
+uint32_t link_body_model();  // (diagnostics) Link's body model, 0: none
+// (the night sky's stars, interp.cpp dKyr_drawStar) the eye the head-tracked view of camera `cam` was last drawn
+// from (camera_draw's CameraOverride), if it was this pass or the one before; false: the game's own view
+bool drawn_head_eye(uint32_t cam, uint64_t pass, float out[3]);
 // daPy_lk_c::setSpecialBattle (023EC370, the parry's prompt) and changeSpecialBattle (023E5400, the parry's start): in VR
 // first person the locked-on enemy's parry window is widened for the call (earlier, later, farther; docs/VR_CONTROLS.md,
 // "Parry attacks"). Returns the enemy (0: nothing widened); parry_unwiden puts its own values back after the call
@@ -103,5 +124,10 @@ bool blur_head_turn(float a[6]);
 // the game's depth of field (interp_fx.cpp hook_027824A8, docs/VR_SCREEN_EFFECTS.md): true while its blur is not drawn
 // in the headset (vr.depthOfField off)
 bool depth_of_field_off();
+// the sun's lens flare (interp.cpp hook_02570210): true while it is not drawn in the headset (vr.lensFlare off)
+bool lens_flare_off();
+// the draw distance (aspect.cpp stereo_clipper): the share of the game's culling distance drawn in the headset
+// (vr.drawDistance), 1 outside a VR session
+float draw_distance();
 
 }  // namespace vr::game

@@ -8,12 +8,16 @@
 namespace gfxvk::vr_framesynth {
 void set_active(bool) {}
 bool active() { return false; }
+bool last_depth(int, Surface*&, uint32_t&, float&, float&, bool&) { return false; }
+bool last_tangents(int, float&, float&, float&, float&) { return false; }
 void note_camera(int, const uint32_t*, const unsigned char*, size_t) {}
 void record(VkCommandBuffer) {}
 void release_images() {}
 void forget_views() {}
 const char* status() { return "off"; }
 bool carrying() { return false; }
+void set_held(bool, const char*) {}
+bool held() { return false; }
 }  // namespace gfxvk::vr_framesynth
 #else
 
@@ -70,7 +74,20 @@ struct Noted {
     std::map<std::pair<Surface*, uint32_t>, uint32_t> depths;  // the depth targets the eye's camera draws drew into
     float nearZ = 0, farZ = 0;                                  // the planes of the last camera draw (projection units)
     bool planes = false;
+    float projA = 0, projB = 0;  // (frame generation) the camera projection's p[10], p[11] (projection units)
+    bool halfZ = false;          // (and its depth range: 0..1, else -1..1)
+    float sx = 0, cx = 0, sy = 0, cy = 0;  // (and its p[0], p[2], p[5], p[6]: the field of view it was drawn with)
 };
+// (frame generation, last_depth) each eye's scene depth and projection as the last record() found them
+struct LastDepth {
+    Surface* depth = nullptr;
+    uint32_t slice = 0;
+    float projA = 0, projB = 0;
+    bool halfZ = false;
+    bool valid = false;
+    float sx = 0, cx = 0, sy = 0, cy = 0;
+};
+LastDepth g_last[2];
 Noted g_noted[2];
 
 VkDescriptorSetLayout g_setLayout = VK_NULL_HANDLE;
@@ -317,8 +334,31 @@ bool sampleable_depth(const Surface* s) {
 }  // namespace
 
 void set_active(bool on) { g_active.store(on, std::memory_order_relaxed); }
+bool last_depth(int eye, Surface*& depth, uint32_t& slice, float& projA, float& projB, bool& halfZ) {
+    if (eye < 0 || eye > 1 || !g_last[eye].valid) return false;
+    const LastDepth& l = g_last[eye];
+    depth = l.depth, slice = l.slice, projA = l.projA, projB = l.projB, halfZ = l.halfZ;
+    return true;
+}
+bool last_tangents(int eye, float& left, float& right, float& up, float& down) {
+    if (eye < 0 || eye > 1 || !g_last[eye].valid) return false;
+    const LastDepth& l = g_last[eye];
+    if (!(l.sx > 0) || !(std::fabs(l.sy) > 0) || !std::isfinite(l.cx) || !std::isfinite(l.cy)) return false;
+    // clip x = sx x + cx z, w = -z: ndc x = sx t - cx at the tangent t = x / -z; the picture's left and right edges are
+    // ndc -1 and +1. y the same with sy, cy; the game draws through a viewport of negative height, clip y up being the
+    // picture's top (vr_framesynth.h motion_scale)
+    left = (l.cx - 1.0f) / l.sx, right = (l.cx + 1.0f) / l.sx;
+    up = (1.0f + l.cy) / l.sy, down = (l.cy - 1.0f) / l.sy;
+    return up > down && right > left;
+}
 bool active() { return g_active.load(std::memory_order_relaxed) && !g_failed; }
 
+// (2026-11-12) each eye noted at least once a frame: set by note_camera once it has noted a depth target and the planes,
+// cleared by record. With one draw in kNoteEvery sampled per thread, some frames had no sampled camera draw at all and
+// went out without depth while the frames around them had it: about 800 switches between depth and none in two minutes
+// of a headset run at Capped 90, each changing the runtime's reprojection of that frame (the view wobbled at a steady
+// frame rate)
+std::atomic<bool> g_notedThisFrame[2] = {};
 void note_camera(int eye, const uint32_t* regs, const unsigned char* block, size_t size) {
     if (!active() || eye < 0 || eye > 1 || !block) return;
     // one camera draw in kNoteEvery per drawing thread (2026-11-05, asked for: depth must not add to the drawing threads'
@@ -327,7 +367,7 @@ void note_camera(int eye, const uint32_t* regs, const unsigned char* block, size
     // camera's planes) or a count (the eye's most-drawn depth target), so a sample keeps both: about 20 a frame
     constexpr unsigned kNoteEvery = 32;
     static thread_local unsigned sampled = 0;
-    if (sampled++ % kNoteEvery != 0) return;
+    if (sampled++ % kNoteEvery != 0 && g_notedThisFrame[eye].load(std::memory_order_relaxed)) return;
     float p[16];
     if (!stereo::find_camera_projection(block, size, p)) return;
     Latte::LATTE_PA_CL_CLIP_CNTL clip;
@@ -338,7 +378,11 @@ void note_camera(int eye, const uint32_t* regs, const unsigned char* block, size
     std::lock_guard<std::mutex> l(g_noteMutex);
     Noted& n = g_noted[eye];
     if (pass.depth) ++n.depths[{pass.depth, pass.depthSlice}];
-    if (planes) n.nearZ = nearZ, n.farZ = farZ, n.planes = true;
+    if (planes) {
+        n.nearZ = nearZ, n.farZ = farZ, n.planes = true, n.projA = p[10], n.projB = p[11], n.halfZ = clip.get_DX_CLIP_SPACE_DEF();
+        n.sx = p[0], n.cx = p[2], n.sy = p[5], n.cy = p[6];
+    }
+    if (pass.depth && n.planes) g_notedThisFrame[eye].store(true, std::memory_order_relaxed);
 }
 
 void record(VkCommandBuffer cmd) {
@@ -349,11 +393,32 @@ void record(VkCommandBuffer cmd) {
         noted[1] = std::move(g_noted[1]);
         g_noted[0] = {};
         g_noted[1] = {};
+        g_notedThisFrame[0].store(false, std::memory_order_relaxed);
+        g_notedThisFrame[1].store(false, std::memory_order_relaxed);
     }
     g_carrying.store(false, std::memory_order_relaxed);
     if (!active() || R.renderPasses || !ensure_layout()) return;
     auto& xs = vr::session();
-    const bool synthesis = xs.has_synthesis_swapchains();
+    const bool synthesis = xs.has_synthesis_swapchains() && !held();  // (held: as with it off, set_held)
+    // (frame generation) each eye's depth target (the one most of its camera draws drew into; a multiview eye 1: eye 0's
+    // layer twin) and the camera's projection, for vr_genframe, whatever is sent to the runtime
+    for (int eye = 0; eye < 2; ++eye) {
+        LastDepth& l = g_last[eye];
+        l = {};
+        Surface* d = nullptr;
+        uint32_t sl = 0, best = 0;
+        for (const auto& [k, count] : noted[eye].depths)
+            if (count > best) best = count, d = k.first, sl = k.second;
+        if (!d && eye == 1) {
+            Surface* d0 = nullptr;
+            uint32_t s0 = 0, b0 = 0;
+            for (const auto& [k, count] : noted[0].depths)
+                if (count > b0) b0 = count, d0 = k.first, s0 = k.second;
+            if (d0 && d0->layerTwin) d = d0->layerTwin, sl = s0;
+        }
+        const Noted& np = noted[eye].planes ? noted[eye] : noted[0];
+        if (d && sampleable_depth(d) && np.planes) l = {d, sl, np.projA, np.projB, np.halfZ, true, np.sx, np.cx, np.sy, np.cy};
+    }
     if (!synthesis && !xs.depth_submission()) return;
     // the planes: the camera's (game units) in metres
     const Noted& np = noted[0].planes ? noted[0] : noted[1];
@@ -447,6 +512,19 @@ void forget_views() {
 
 const char* status() { return g_status.c_str(); }
 bool carrying() { return g_carrying.load(std::memory_order_relaxed); }
+namespace {
+std::atomic<bool> g_held{false};
+}
+void set_held(bool held, const char* why) {
+    if (g_held.exchange(held, std::memory_order_relaxed) == held) return;
+    if (held)
+        LOG("[vr frame synthesis] held: %s; the runtime synthesizes only at half the refresh rate, so it is not used (the "
+            "refreshes between the game's frames are filled instead)",
+            why ? why : "the frame rate chosen is under half the refresh rate (Capped 30 at 90 or 120 Hz)");
+    else
+        LOG("[vr frame synthesis] used again (%s)", why ? why : "the frame rate is half the refresh rate or more");
+}
+bool held() { return g_held.load(std::memory_order_relaxed); }
 
 }  // namespace gfxvk::vr_framesynth
 #endif  // WWHD_VR

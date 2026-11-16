@@ -169,3 +169,70 @@ Nothing here is built or run yet. To check, in order:
 - [FramePort: Steam Frame runtime reference](https://frameport.app/docs/frame-runtime/)
 - [gHacks: Valve open-sources Lepton](https://www.ghacks.net/2026/09/20/valve-open-sources-lepton-its-android-compatibility-layer-for-the-steam-frame/)
 - the Lepton log of 2026-10-30 (docs/VR_ANDROID.md, "Steam Frame - Lepton")
+
+## Steam Frame - Native defaults from the Quest work (2026-11-11, settings format 23)
+
+The user's choice, before a Frame log: the Quest 3's GPU savings that fit the Frame (docs/VR_PERFORMANCE.md,
+docs/VR_FRAME_RATE.md, docs/VR_UPSCALING.md, docs/VR_FOVEATION.md).
+
+- **90 Hz with Capped 30 FPS** (each frame exactly three refreshes) by default (`vr.frameRate` steady30); format 23
+  moves a saved 90 Hz with Auto Mode to it once.
+- **CAS** (contrast adaptive sharpening, once a game frame) is Auto's pick on every standalone headset, the Frame
+  included, in place of SGSR1. SGSR1 stays a choice.
+- **Draw distance 0.7** (`vr.drawDistance`), as a Quest.
+- Already on the Frame: foveated rendering Medium (shading rate maps; Turnip, the log says whether it is offered), held
+  clears, render targets without the mutable-format flag (bandwidth compression), anisotropic filtering 2x.
+- Not the Frame's: the GPU level trade and Meta's dynamic resolution query (Meta's runtime), lens flare off and ambient
+  occlusion off (Quest only for now).
+
+## Audit against other Steam Frame ports and Mesa (2026-11-11)
+
+Sources: Valve's Steam Frame partner pages (engines/unreal, engines/custom, input, vrpreferences, debugging,
+compat/perf_criteria), Mesa's Turnip source (tu_device.cc, tu_cmd_buffer.cc, docs/features.txt, MR 30905), an on-device
+vulkaninfo/OpenXR probe (github.com/simplysanatori/moonlight-xr-steam-frame, docs/probe), AstroQuest-Frame, OpenFrame,
+VideoFrameVR, the Godot foveation issues (godotengine/godot #124141, PR #124811).
+
+**Fixed:**
+- **The shading rate map is two layers, one per view** (`foveation.cpp`). Turnip programs the rate buffer as layered
+  whatever the view's layerCount (`tu7_emit_subpass_shading_rate`: `.layered = true`, `array_pitch` the layer's size), so
+  the right eye of a multiview pass read past a one-layer map; Valve's Unreal page: VRS with multiview "will result in a
+  black screen". Two identical layers and a 2D-array view are valid everywhere (a multiview pass's attachment may have
+  as many layers as views).
+- **Capped 30 FPS falls back to the half cap at an actual rate that is not a multiple of 30** (`interp_pacing.h
+  vr_mode_resolved`). SteamVR on the Frame gives one refresh rate a session (its per-app setting, 72 Hz by default); an
+  app cannot ask for 90 through XR_FB_display_refresh_rate. At 72 Hz the default is then 36 fps (two refreshes each) and
+  the log says why.
+
+**Checked, fine:** Turnip's shading rate texel is exactly 8x8 (min = max), max fragment 4x4, R8_UINT only: our texel
+choice clamps 16 into the device's range (8 here). The runtime is SteamVR/OpenXR 2.18 (not Monado); it offers
+XR_FB_display_refresh_rate, XR_META_recommended_layer_resolution, XR_EXT_frame_synthesis and the XR_FB/META foveation
+set, not XR_EXT_performance_settings (our CPU/GPU level hints are then skipped, logged) nor
+XR_KHR_composition_layer_cylinder. Controllers: `/interaction_profiles/valve/frame_controller_valve` (ours).
+
+**Open, for a Frame log:**
+- `VK_LAYER_VALVE_fdm_injection` (an implicit layer on the device, undocumented) may add a fragment density map, which
+  must not meet our shading rate map in one pass. A/B with `VK_LOADER_LAYERS_DISABLE=*fdm_injection*` and with SteamVR's
+  per-app Foveated Rendering off.
+- The refresh rate: set per app in SteamVR (`steam.app.<id>.preferredRefreshRate`, or `vrpreferences.json`
+  `steam_frame.preferMinRefreshRate` in a Steam package) to 90 for Capped 30 FPS's even three refreshes.
+- Shading rate maps' cost on Turnip (whether it keeps tiled rendering): compare `WWHD_VK_FOVEATION_LEVEL=0` and 2.
+- The map is centred on each eye picture, not on its lens (off-axis fields of view); same on a Quest.
+- Dynamic resolution (off by default) caps the eyes at 0.75 of the Headset resolution and leaves foveation off below it.
+- Steam Frame - Lepton (Android) gets the Quest's defaults only where `quest_headset()` covers it.
+
+## More Quest changes on Steam Frame - Native (2026-11-14, settings format 29)
+
+The user's choice, from a comparison of the Quest work since 2026-11-08 with Native (most of the Quest's crash and
+black-square fixes already applied there):
+- **Foveation Low** (Medium before), as a Quest since format 27: a Quest 3S player saw Medium's picture pixelated.
+  A saved Medium takes Low; another level chosen stays.
+- **Edge smoothing (FXAA) in the CAS pass** on (`vr.casFxaa`), as a Quest: CAS is Native's Auto upscaler. A saved off
+  (the old default) takes on; it can be turned off again in F1 > VR or the launcher.
+- **Anisotropic filtering 8x** (2x before), as a Quest since 2026-11-12 (`settings.cpp aniso_max_ratio`;
+  `WWHD_ANISO_MAX=n` still sets it).
+- **The desktop window not drawn while a VR session runs** (`vrvk::skip_window_tv`, Android-only before): it is not
+  seen in the headset, and on the Quest its picture had more pixels than both eyes. The eyes are recorded in `swap()`,
+  the path a PC takes when its window has no image ready. `WWHD_VR_DESKTOP_WINDOW=1` keeps presenting it.
+
+Built for Windows only here (no ARM Linux toolchain on this PC; the window change and the defaults are compiled only
+into the Native build); not run on a Frame.

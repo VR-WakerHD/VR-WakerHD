@@ -1572,3 +1572,60 @@ one-entry memo by the version (no work added there). `WWHD_VK_REPLAY_TARGETS_KEY
 period (9.9 % in the first run above), 2.6 % uneven, 11 of 14 ten-second windows at 89 to 90 fps, two at about 80
 (the fights); the player found it better. Stats and the profiler were off in that run and on in the others, so the
 share of each change is not separated.
+
+
+## Quest 3: GPU clock, draw distance, expensive effects (2026-11-11)
+
+A Quest 3 player's log at Headset resolution 0.70: the GPU 100 % busy at 44-58 ms a frame, the CPU's render thread
+about 13 ms of it. Three changes for the GPU, after AstroQuest's README (github.com/evertec82/AstroQuest, a Quest 3
+port that measured them):
+
+### GPU clock
+
+- In a VR session a Quest 3 holds the GPU at level 4 (545 MHz) at most. Level 5 (599 MHz) needs Meta's dynamic
+  resolution **or** one processor level traded for the GPU; level 6 (640 MHz) needs **both** (Meta's "CPU and GPU
+  levels"; AstroQuest saw level 5 granted for whole sessions with dynamic resolution).
+- **Dynamic resolution:** `XR_META_recommended_layer_resolution`, asked once a frame for the projection layer
+  (`openxr_session.cpp`, after the layer is built). The answer is logged, not followed: the eye pictures stay at the
+  Headset resolution. Log: `[vr] dynamic resolution query: ...`, then `the system recommends WxH ...` when it changes.
+- **The trade:** `com.oculus.trade_cpu_for_gpu_amount` = 1 in `android/app/src/vr/AndroidManifest.xml`: the CPU's top
+  falls from 1.92 to 1.65 GHz (14 %). The render thread's ~13 ms a frame becomes ~15, far below the GPU's 40+; it
+  would matter only near 50 fps. To drop it: remove the line (a new build), level 5 stays through dynamic resolution.
+  logcat: `CreateClient: Value of tradeCpuForGpu is 1`.
+- **The GPU's level asked for:** Sustained High once a session (`cpu_boost`, `[vr] GPU level: ...`), as AstroQuest
+  does. The levels are ceilings: heat or Battery Saver lowers them.
+
+### Draw distance (`vr.drawDistance`)
+
+The game's culling far plane (`mDoLib_clipper::setup`, hooked as `stereo_clipper` in `aspect.cpp`) at that share in a
+VR session: actors, the islands' scenery, grass and trees past it are culled (fopAcM_cullingCheck, daBg_Draw and
+J3DUClipper all use it). The projection's far plane is not touched (depth precision unchanged). 0.7 on a Quest, 1.0
+elsewhere; 0.4-1.0, launcher Graphics and F1 > VR ("Draw distance"), applies at once. Log: `[vr] draw distance:
+culling to N of the game's M units`. (AstroQuest's nearest equivalent, the game's simpler models at a third of their
+distances, took 20.1 -> 17.0 ms a frame.)
+
+When it applies is the game's own state, not a time or a fixed number (`vr_game.cpp draw_distance`): only while the
+game's camera is its normal play camera (`aspect::gameplay_camera`) and Link is not looking through the telescope or a
+Picto Box. Events, cutscenes, menus, those views and the frames the game switches between cameras keep the game's own
+culling. The cut is always the share of the far plane the game passes in that call (`aspect.cpp stereo_clipper`), never
+in front of its near plane, so it scales with the game's own distance changes (20000 <-> 400000 units in the telescope).
+The telescope's first and last frames had gone black with a fixed 70 % cut (a Quest 3 player's video, 2026-11-12).
+
+### Expensive effects
+
+- **Lens flare (`vr.lensFlare`):** dKyr_drawLenzflare (`interp.cpp hook_02570210`) returns early: its rays, rings and
+  glow are large transparent quads over much of both eyes near the sun. Off on a Quest, on elsewhere; the sun is drawn
+  either way. Log: `[vr] lens flare: not drawn in the headset`.
+- **Anisotropic filtering:** 2x instead of 4x on a standalone headset (`settings.cpp aniso_max_ratio`; `WWHD_ANISO_MAX`
+  overrides it). A Quest 8x again since 2026-11-12 (the user's choice: a Quest 3S player found the picture blurry with
+  every upscaler, with the GPU busy half of the time at 30 fps); the Steam Frame keeps 2x.
+- Already off in the headset: bloom, screen blur, heat haze, depth of field blur; ambient occlusion off on a Quest.
+
+### Render targets keep the GPU's compression (2026-11-11)
+
+Every game surface image was created with `VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT` and no format list
+(`surfaces.cpp create_surface_image`, also `motion_pass.cpp`, `texture_pack_vk.cpp`), though every view of it is in
+its own format (an alias in another format is a surface of its own, copied across). A mutable image without a format
+list loses Adreno's bandwidth compression (UBWC; AstroQuest's README: "without it Turnip has to store every colour
+image uncompressed"), so each render target's reads and writes went at full size. The flag is gone; a future view in
+another format needs it back with a `VkImageFormatListCreateInfo` (validation: VUID-VkImageViewCreateInfo-image-01762).

@@ -32,7 +32,12 @@ inline const bool kLockAlways = [] { const char* e = std::getenv("WWHD_VK_LOCK_A
 inline bool g_secondThreadActive = false;
 inline bool lock_always() { return kLockAlways; }
 // a second thread prepares draws now (or the locks are forced on)
-inline bool second_thread_active() { return g_secondThreadActive || kLockAlways; }
+// (docs/VR_HANDS_LAYER_PLAN.md) Link's span on the scene's thread: from its start until it is joined (its register
+// forwarding stops at his bracket's end, before it is done drawing: the locks stay on until the join)
+inline std::atomic<bool> g_handsThreadActive{false};
+inline bool second_thread_active() {
+    return g_secondThreadActive || kLockAlways || g_handsThreadActive.load(std::memory_order_relaxed);
+}
 // the render thread, before starting and after joining the second thread
 inline void set_second_thread_active(bool on) { g_secondThreadActive = on; }
 

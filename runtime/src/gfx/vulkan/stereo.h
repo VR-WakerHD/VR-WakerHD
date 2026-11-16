@@ -152,6 +152,14 @@ void front_used(Surface* s);                     // a surface a draw uses (eithe
 void front_change(Surface* s, const char* what); // a surface's state about to change (either thread)
 void front_frame_end(uint32_t draws);  // (frame end) next frame's split: this frame's longest stretch into the same targets
 void front_log(double frames);  // (diagnostics, every 600 frames)
+// (docs/VR_HANDS_LAYER_PLAN.md, render thread) Link's span: his bracket's draws on this thread while the render thread
+// draws on (draw.cpp)
+bool hands_span_begin();
+void hands_span_end();
+bool hands_span_draw(uint32_t prim, uint32_t count, uint32_t indexType, uint32_t indexAddr, uint32_t baseVertex,
+                     uint32_t instances);
+void hands_span_note(const uint32_t* words, bool depth, uint32_t maxLevels, Surface* s);  // (this thread, in his span)
+void hands_span_join_emit();
 }  // namespace scene_thread
 // (stage S6, render thread) the second drawing thread's held streams, and their emission after the scene's thread's span
 // (S6.1: not used yet). False if a stream had to be emitted command by command (not wholly POD)
@@ -273,6 +281,15 @@ bool stereo_screen_target(uint32_t width, uint32_t height);
 Surface* ui_layer_image();
 // (the frame dumps) the UI layer's image as the last frame with UI left it, or null
 Surface* ui_layer_drawn_last();
+Surface* hands_layer_drawn(int eye);
+// (docs/VR_HANDS_LAYER_PLAN.md, Link's span) his draws' held streams (stereo.cpp), and their emission into the renderer's
+DeferredCommands* stereo_hands_stream(int eye);
+void stereo_hands_emit();
+// (draw.cpp, render thread) Link's span on the scene's thread finished and its commands emitted, if one is pending:
+// before a submission, the swap, a part, and the screen passes that read his depth
+void hands_thread_join_emit();
+// (draw.cpp hands_layer) the eye's depth with Link's draws and the eye's depth now (the world's): false if none this frame
+bool hands_layer_depths(int eye, Surface*& link, Surface*& world);  // (draw.cpp hands_layer: the eye's hands image this frame; null: none drawn)
 // (diagnostics, WWHD_VK_TARGET_STATS) ms spent flushing eye 1's held commands since the last reset
 double stereo_flush_ms(bool reset);
 // s's allocation is a Half SBS (halfWidth) or top-and-bottom (halfHeight) eye of the guest's size;

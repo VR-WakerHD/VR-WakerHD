@@ -5,6 +5,7 @@
 
 namespace interp {
 uint64_t logic_steps();      // saved/restored 30 Hz scenario clock
+uint64_t pass_count();       // every pass of the per-frame function (per-pass bookkeeping)
 // the camera process camera_draw (024FFC40) drew last (0: none yet): eye +0xDC, center +0xE8, up +0xF4,
 // fovy +0xD4 (touch_talk.cpp projects shop items with it)
 uint32_t last_camera();

@@ -21,14 +21,24 @@ public final class VrLauncherActivity extends SDLActivity {
 
     @Override public void loadLibraries() {
         super.loadLibraries();
-        // where Android lets the app run a program: the launcher's Install game tab runs wwhd-extract from here
+        // where Android lets the app run a program: the launcher's Extract Game tab runs wwhd-extract from here
         SDLActivity.nativeSetenv("WWHD_NATIVE_LIB_DIR", getApplicationInfo().nativeLibraryDir);
+        // (2026-11-12) from the "game files missing" screen (GameMissingActivity): open on the Extract Game tab
+        if (getIntent() != null && getIntent().getBooleanExtra(GameMissingActivity.EXTRA_OPEN_EXTRACT, false))
+            SDLActivity.nativeSetenv("WWHD_LAUNCHER_TAB", "install");
     }
 
     /** From the launcher (its SDL thread): the game, with these arguments; then the launcher closes. */
     public void launchGame(String[] args) {
         startActivity(new Intent(this, WwhdActivity.class).putExtra(EXTRA_ARGS, args));
         runOnUiThread(this::finish);
+    }
+
+    /** From the launcher's Detect Headset (its worker thread): the game activity with --vr-refresh-probe, which reads
+     *  the headset's refresh rate in a short session, writes it to the file the arguments name and ends; the launcher
+     *  stays open behind it and reads that file (2026-11-12, Quest 3 / 3S). */
+    public void probeRefreshRate(String[] args) {
+        startActivity(new Intent(this, WwhdActivity.class).putExtra(EXTRA_ARGS, args));
     }
 
     /** From the launcher: the app's setup screens (choose the game files, prepare the game). */

@@ -21,6 +21,38 @@ it reprojects head translation as well as rotation. This document records what e
   turns it on is not documented ([AppSW](https://developers.meta.com/horizon/documentation/native/android/mobile-asw/)).
 - Timewarp and reprojection are the runtime's own; nothing of ours replaces or competes with them.
 
+## Held at Capped 30 on 90 and 120 Hz (2026-11-13)
+
+The runtime synthesizes one frame between two real ones only, so the game must draw at exactly half the refresh rate
+(Meta: "render at half rate from the actual display refresh rate, for example 36 compared to 72 FPS"; 45 at 90 Hz).
+Used with Capped 30 at 90 Hz, it raised the chosen 30 to 45: a Quest 3 player's log (90 Hz, Capped 30, frame synthesis
+on) had 45 forced in every scene, about 24 fps drawn, the GPU at 90-99 %, the game logic slowed and 85 % of frames with
+uneven game time. Now (`vr_framesynth::set_held`, from `vr_vulkan.cpp` each frame) while the frame rate chosen is
+Capped 30 at a refresh rate 30 divides above 60 Hz (90, 120), frame synthesis is held: the frames carry nothing for it,
+the motion pass pauses (`motion_pass::set_needed`), and the chosen 30 is kept. At 72 and 80 Hz Capped 30 is already
+drawn at half (36, 40: `vr_mode_resolved`), so frame synthesis runs there as before. The log: `[vr frame synthesis] held:
+...` and `used again ...` on each change. 30 fps with frame synthesis would need a 60 Hz headset mode.
+
+## No refresh filling while the runtime synthesizes (2026-11-14, untested in a headset)
+
+Refresh filling (`planned_repeats`: the last game frame sent again on the refreshes between game frames at 30/45 fps)
+pauses while the frame just shown carried both eyes' motion vectors (`vr_framesynth::carrying()`): at 72 Hz Capped 30
+(drawn at 36) and Capped 45 at 90 Hz, its plain frames would take the refreshes the runtime synthesizes. Depth only never
+carries, so PC SteamVR keeps its fills. Steady 30 at 90 or 120 Hz holds frame synthesis (above; `vr.frameSynthesis`
+auto or on alike: the session's synthesis swapchains decide), so its 30 is never raised to 45, its frames carry nothing
+and every refresh between them is filled. The log: `[vr] refresh filling: on (frame synthesis held: ...)`, `on (no frame
+synthesis)` or `paused ...`, at the first decision and each change (docs/VR_MOVING_OBJECTS_PLAN.md, "Separate small fix").
+
+**Auto Mode running slow (2026-11-14, untested in a headset).** In Auto Mode, frames carrying motion vectors pace the game
+at half the refresh rate (45 at 90 Hz). When the game cannot hold that (more than 2.5 refreshes a frame, under 36 fps at
+90 Hz, for 1 s), one synthesized frame cannot fill the gap: frame synthesis is held as at Steady 30 and refresh filling
+fills the refreshes (`update_auto_synth_hold` in `vr_vulkan.cpp`, after each game frame). It is used again after 5 s at 2.2
+refreshes a frame or less (41 fps at 90 Hz); held again within 10 s of that, the next wait doubles (up to 60 s), since the
+motion pass (paused while held) costs time again once used. The VR menu and the second after it are not judged. Only
+where the session has frame synthesis swapchains (a Quest, the Steam Frame with it on): PC VR is unchanged. The log:
+`[vr] Auto Mode frame synthesis hold: on (the game at N fps ...)` / `off (...)`, with `[vr frame synthesis] held: Auto
+Mode, ...` and `[vr] refresh filling: on (frame synthesis held ...)`.
+
 ## The data (from the specs and Meta's XrSpaceWarp sample)
 - One struct per projection **view** (eye): `XrFrameSynthesisInfoEXT` or `XrCompositionLayerSpaceWarpInfoFB`, with a
   motion vector subimage, a depth subimage, `minDepth`/`maxDepth` (0, 1), `nearZ`/`farZ` (positive metres; infinite
@@ -41,7 +73,7 @@ it reprojects head translation as well as rotation. This document records what e
 |---|---|---|
 | `auto` | `XR_EXT_frame_synthesis`, else `XR_FB_space_warp`, else depth | depth (`XR_KHR_composition_layer_depth`) |
 | `on` | the same | frame synthesis where offered, else depth |
-| `off` (**the default on every build**, the user's choices of 2026-11-03 and 2026-11-04: PC VR; the Steam Frame, Native and Lepton, until it is tested there: a player's run with it smeared and tore, and QuakeVR's Frame port ships it off after artifacts; Quest and other Android devices. A Quest test build of 2026-11-04 had `auto` by default; settings format 15 moves the `auto` it saved back to `off`) | nothing new | nothing new |
+| `off` (**the default on PC VR and the Steam Frame**, the user's choices of 2026-11-03 and 2026-11-04: PC VR; the Steam Frame, Native and Lepton, until it is tested there: a player's run with it smeared and tore, and QuakeVR's Frame port ships it off after artifacts. A Quest test build of 2026-11-04 had `auto` by default; settings format 15 moved the `auto` it saved back to `off`. **On a Quest the default is `auto` since 2026-11-13** (the user's choice, after a Quest 3 player's run with it on felt good to them: about 21 fps drawn and shown about twice as smooth, the GPU 86-98% busy, head-to-picture delay 70-120 ms); settings format 28 moves an `off` saved with the old default to `auto`) | nothing new | nothing new |
 
 By runtime extension enumeration only. A failure to make the swapchains turns the feature off; the eyes are untouched.
 The log: `[vr] frame synthesis: ... chosen: ...` at start, `[vr frame synthesis] <what the frames carry>` on change.

@@ -130,6 +130,14 @@ Logged: `[interp] VR frame rate auto: streamed optimal (...)` or `wired optimal 
 Detect Headset keeps Auto Mode on both (streamed: Streaming optimal on and frame interpolation for VR on; wired:
 Streaming optimal off). `interp_pacing_test` checks both profiles. Not yet tried in a headset.
 
+## Head movement smoothing (2026-11-13)
+
+`vr.headSmoothing` (off by default; for any headset, wired or streamed, and independent of Streaming optimal; applies
+at once). Since 2026-11-14 it sits next to Smooth Camera while Turning: the launcher's Comfort section and F1 > VR >
+Turning and movement (it was under Streaming optimal). At 45 or 36 fps, the refreshes
+between the game's frames get the last frame warped by the eyes' movement since it was drawn, by its depth, so near
+things no longer step as you look around (docs/FRAME_INTERPOLATION_IMPLEMENTATION.md, "Head movement smoothing").
+
 ## Depth for Virtual Desktop (2026-11-05)
 
 `vr.vdxrDepth` (off by default; under Streaming optimal in the launcher's Graphics tab and F1 > VR; applies at the next
@@ -153,3 +161,27 @@ into the runtime's half-size depth image). During the frame, `vr_framesynth::not
 counts the depth target from one camera draw in 32 per drawing thread (it had been every camera draw, 600 and more a
 frame, each with a shared lock). With Streaming optimal or Depth for Virtual Desktop off, or on another runtime, none of
 it runs (`vr_framesynth::active()` false: one branch per camera draw).
+
+## Turn smoothing on a streamed headset (2026-11-13)
+
+Reported over Virtual Desktop on Wi-Fi: the stick-turn ghosting that Smooth Camera while Turning (`vr.turnSmoothing`)
+fixed on a wired headset came back. The turned frames' angles were taken from the runtime's predicted display times,
+which move with the network, so they came out uneven. On a streamed headset with Streaming optimal, each turned frame is
+now turned by whole refreshes from its game frame (`vr_vulkan.cpp` `turn_step_clock`; `WWHD_VR_TURN_STEP_CLOCK=1/0`
+decides for a test start). Logged: `[vr] turn smoothing's frames turned by ...`. The frames are still sent, one per
+refresh as before. Virtual Desktop's Synchronous Spacewarp should be off (not automatic) with turn smoothing: its own
+frames don't follow the stick. Not yet tried in a headset.
+
+## Virtual Desktop's smoothing: one refresh kept, and logged (2026-11-14)
+
+While Virtual Desktop's Synchronous Spacewarp runs, VDXR reports the frame period as two refreshes (its open source,
+`frame.cpp`). The game's timing in refreshes now uses the headset's refresh rate (`Session::refresh_period`), not that
+period. That covers:
+- Turn smoothing's whole-refresh steps above, and its clamps;
+- the streamed display-time checks and streamed detection;
+- the "a refresh late" and evenness checks;
+- the kept-alive frame timer.
+
+The game also logs when the runtime's smoothing starts and stops, and its share every 10 s
+(`[vr] the runtime's frame smoothing ...`), so a player's log shows whether jitter lines up with it.
+docs/VR_STREAMING_AUDIT.md, finding 12. Not yet run in a headset.

@@ -146,4 +146,11 @@
     <string name="setup_paused_screen">Paused: preparing model shaders needs this screen</string>
     <string name="setup_paused_screen_detail">It goes on by itself while setup is on the screen.</string>
     <string name="setup_models_game_open">Close the game first (Settings › Quit Game); preparing model shaders then goes on here.</string>
+    <!-- the game started with no game files (GameMissingActivity) -->
+    <string name="game_missing_title">Game files not found</string>
+    <string name="game_missing_vr">The Wind Waker HD is not extracted on this headset yet. Extract your game disc first: choose Extract game disc, then pick your .wud, .wux or .wua file.</string>
+    <string name="game_missing_setup">The Wind Waker HD is not set up on this device yet. Extract your game disc first: open setup and choose your game files.</string>
+    <string name="game_missing_extract">Extract game disc</string>
+    <string name="game_missing_open_setup">Open setup</string>
+    <string name="game_missing_close">Close</string>
 </resources>

@@ -344,3 +344,24 @@ conducting animations turn it round in Link's hand. Now its length axis (its own
 chosen once while held) pointing back against the controller's aim turns it half round about the hand, so it always
 points forward. Logged: `[vr] Wind Waker: its length is its axis N`, `turned back to point forward`. Not yet tried in
 the headset.
+
+**The beat hand: three fixed bands (2026-11-14).** Asked for: "there should just be 3 positions for the left hand: Out
+middle and In, and when the hand is in either of those positions it should stay in the mode that hand position sets and
+not change until the hand moves ... evenly distributed across your left hands reach". The beat had been the wand's zone
+logic: a circle round a centre that eased after the resting hand and was taken again after 4 s still in a direction, so
+a held beat turned back to 4/4 by itself. Now (`vr_baton.h` `BatonBeatZones`) the beat hand is read only across the
+body, from the head, in a frame turned to the head's heading when the song began: three side-by-side bands, each
+2 x `vr.batonHandReach` wide (24 cm at the default 12 cm). The middle band is centred 20 cm out to the hand's own side,
+in front of its shoulder: 4/4. Out (left of it, for the left hand) is 3/4; In (across the body) is 6/4; for a
+left-handed player the right hand mirrors this (out 6/4, in 3/4). Nothing re-centres or eases; a band is left only 2 cm
+past its edge; a hand that loses tracking keeps its band. Up and down are not read from the beat hand (the right stick's
+up and down still reach the game). Not yet tried in the headset.
+
+**Start the song by itself (2026-11-14, `vr.batonAutoStart`, on by default).** Asked for: "when the player loads in to
+windwaker or resets the song, allows it to wait 1.5s and then have the song note tracking process start". The game
+counts a song's beats only once its first note is played (HD `procTactWait`: "the first input starts the beat"); a new
+beat or the end of a measure puts it back to waiting. In first person, after 1.5 s (45 steps) waiting with no note,
+`vr_game.cpp` `baton_auto_start` sets what the first note sets: the measure's beats left (`m3624`, +0x6A7C) to the
+conductor's beat (`mTact.mBeat`) and the frames to the next beat (`m35A0`, +0x69F8) to a full beat, so the metronome
+sounds and the note held then is taken as the first. A note played sooner starts it as always. Launcher: Controls,
+Wind Waker; in game: F1 > VR. Logged: `[vr] Wind Waker: the song started by itself`. Not yet tried in the headset.

@@ -46,8 +46,28 @@ void disable(const char* why);
 bool disabled();
 void conflict(const Surface* s);  // (the atlas's thread) disable, the surface logged
 
+// (docs/VR_HANDS_LAYER_PLAN.md) Link's span: his draws recorded on the scene's thread while the render thread draws on;
+// its commands reach the GPU after the render thread's of that time (emitted at the join). A surface his thread used or
+// changed must then not be changed by the render thread meanwhile, nor one his thread changed be used by it: either
+// order cannot be put right, so his span is switched off for the session (logged). Outside a span: one test
+inline std::atomic<uint64_t> g_handsOverlap{0};
+inline std::atomic<bool> g_handsSpanOff{false};  // (a conflict: Link's span off for the session)
+constinit inline thread_local bool handsThreadTls = false;  // (the scene's thread while it draws Link's span)
+void hands_conflict(const Surface* s, const char* what);  // (draw.cpp)
+inline void hands_mark(Surface* s, const char* what, bool change) {
+    const uint64_t h = g_handsOverlap.load(std::memory_order_acquire);
+    if (!h || !s) [[likely]] return;
+    if (handsThreadTls) {
+        s->handsUse = h;
+        if (change) s->handsChange = h;
+        return;
+    }
+    if (draw_threads::on_draw_thread()) return;  // (the atlas's and eye 1's threads keep their own rules)
+    if (s->handsChange == h || (change && s->handsUse == h)) hands_conflict(s, what);
+}
 // a surface the atlas's thread uses (a target, a texture)
 inline void used(Surface* s) {
+    hands_mark(s, "used", false);
     if (switches::kSceneFront && s) [[unlikely]] scene_thread::front_used(s);  // (docs/VR_SCENE_THREADS.md, S7)
     const uint64_t o = id();
     if (!o || !s || !on_atlas_thread()) return;
@@ -57,6 +77,7 @@ inline void used(Surface* s) {
 // a surface's state is about to change (upload, layout, contents, image)
 inline void before_change(Surface* s, const char* what) {
     if (!per_thread::possible()) return;  // (no draw thread this session: nothing to mark)
+    hands_mark(s, what, true);
     // (docs/VR_SCENE_THREADS.md, stage S7) the second drawing thread before the render thread's part: marked and checked
     // as the atlas's thread and the scene are
     if (switches::kSceneFront) [[unlikely]] {

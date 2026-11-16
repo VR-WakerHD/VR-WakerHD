@@ -2,6 +2,7 @@
 #include "../../exception_report.h"
 #include "loader.h"
 #include "compile_journal.h"
+#include "crash_track.h"
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
@@ -227,6 +228,25 @@ void install() {
 }
 }  // namespace quest_rendering_guard
 
+// (crash_track.h, off unless WWHD_VK_CRASH_TRACK=1) the destroys of pipelines, buffers and image views recorded with
+// their frame, for the crash log's use-after-free check
+namespace {
+PFN_vkDestroyPipeline rawDestroyPipeline;
+PFN_vkDestroyBuffer rawDestroyBuffer;
+PFN_vkDestroyImageView rawDestroyImageView;
+VKAPI_ATTR void VKAPI_CALL tracked_destroy_pipeline(VkDevice d, VkPipeline p, const VkAllocationCallbacks* a) {
+  crash_track::note_destroyed(crash_track::kPipeline, uint64_t(reinterpret_cast<uintptr_t>(p)));
+  rawDestroyPipeline(d, p, a);
+}
+VKAPI_ATTR void VKAPI_CALL tracked_destroy_buffer(VkDevice d, VkBuffer b, const VkAllocationCallbacks* a) {
+  crash_track::note_destroyed(crash_track::kBuffer, uint64_t(reinterpret_cast<uintptr_t>(b)));
+  rawDestroyBuffer(d, b, a);
+}
+VKAPI_ATTR void VKAPI_CALL tracked_destroy_view(VkDevice d, VkImageView v, const VkAllocationCallbacks* a) {
+  crash_track::note_destroyed(crash_track::kImageView, uint64_t(reinterpret_cast<uintptr_t>(v)));
+  rawDestroyImageView(d, v, a);
+}
+}  // namespace
 void load_device_functions(VkDevice device, bool khrDynamicRendering, bool renderPasses) {
 #define WWHD_VK_LOAD(name) \
   if (!(name = observe<&name>(reinterpret_cast<PFN_##name>(vkGetDeviceProcAddr(device, #name))))) missing(#name);
@@ -239,6 +259,11 @@ void load_device_functions(VkDevice device, bool khrDynamicRendering, bool rende
     vkCreateGraphicsPipelines = journal_graphics;
     vkCreateShaderModule = journal_create_module;
     vkDestroyShaderModule = journal_destroy_module;
+  }
+  if (crash_track::enabled()) {
+    rawDestroyPipeline = vkDestroyPipeline, vkDestroyPipeline = tracked_destroy_pipeline;
+    rawDestroyBuffer = vkDestroyBuffer, vkDestroyBuffer = tracked_destroy_buffer;
+    rawDestroyImageView = vkDestroyImageView, vkDestroyImageView = tracked_destroy_view;
   }
   graphicsPipelines = vkCreateGraphicsPipelines;
   computePipelines = vkCreateComputePipelines;

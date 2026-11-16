@@ -1,3 +1,5 @@
+#include <array>
+#include <algorithm>
 // SPDX-License-Identifier: MPL-2.0
 // The GameCube player model converter (runtime/src/gcmodel) from the command line, for checks on a computer:
 //   gcmodel_tool convert Link.arc permanent_3d.pack Link.szs   the converted Link.szs (the report on stdout)
@@ -106,7 +108,64 @@ static int synth(const char* packPath, const char* outPath) {
     return 0;
 }
 
+// (VR, 2026-11-15) every model of Link.bfres with its bones (bind pose, world translation), to read an item's geometry
+static int parts(const char* packPath) {
+    std::vector<uint8_t> pack;
+    if (!load(packPath, pack)) return 1;
+    const auto szs = gcmodel::link_szs(pack);
+    const auto files = gcmodel::sarc_read(gcmodel::yaz0_decode(szs));
+    for (auto& p : gcmodel::describe(files.at("Link.bfres"))) {
+        printf("model %s: %zu bones, %zu shapes\n", p.name.c_str(), p.bones.size(), p.shapes.size());
+        for (size_t i = 0; i < p.bones.size(); i++)
+            printf("  bone %zu %-16s parent %2d  world %9.3f %9.3f %9.3f\n", i, p.bones[i].name.c_str(), p.bones[i].parent,
+                   p.bones[i].world[0], p.bones[i].world[1], p.bones[i].world[2]);
+        for (auto& sh : p.shapes) printf("  shape %-20s bone %d skin %d\n", sh.name.c_str(), sh.bone, sh.skin);
+    }
+    return 0;
+}
+namespace gcmodel {
+std::vector<std::pair<std::string, std::vector<std::array<double, 3>>>> shape_points(const std::vector<uint8_t>&, const std::string&);
+}
+static int extents(const char* packPath, const char* model) {
+    std::vector<uint8_t> pack;
+    if (!load(packPath, pack)) return 1;
+    const auto files = gcmodel::sarc_read(gcmodel::yaz0_decode(gcmodel::link_szs(pack)));
+    for (auto& [sn, pts] : gcmodel::shape_points(files.at("Link.bfres"), model)) {
+        double lo[3] = {1e30, 1e30, 1e30}, hi[3] = {-1e30, -1e30, -1e30}, sum[3] = {0, 0, 0};
+        for (auto& p : pts)
+            for (int k = 0; k < 3; k++) lo[k] = std::min(lo[k], p[k]), hi[k] = std::max(hi[k], p[k]), sum[k] += p[k];
+        printf("shape %s: %zu points; x %.2f..%.2f  y %.2f..%.2f  z %.2f..%.2f; centre %.2f %.2f %.2f\n", sn.c_str(), pts.size(),
+               lo[0], hi[0], lo[1], hi[1], lo[2], hi[2], sum[0] / pts.size(), sum[1] / pts.size(), sum[2] / pts.size());
+        // the points at the far +X end (the muzzle) and their centre
+        double cx = 0, cy = 0, cz = 0; int n = 0;
+        for (auto& p : pts) if (p[0] > hi[0] - 0.5) cx += p[0], cy += p[1], cz += p[2], ++n;
+        if (n) printf("   +X end (within 0.5): %d points, centre %.2f %.2f %.2f\n", n, cx / n, cy / n, cz / n);
+        // (WWHD_POINTS=y0,y1: every point with Y in that range)
+        if (const char* pv = std::getenv("WWHD_POINTS")) {
+            double a0 = 0, a1 = 0;
+            std::sscanf(pv, "%lf,%lf", &a0, &a1);
+            for (auto& p : pts)
+                if (p[1] >= a0 && p[1] < a1) printf("   point %7.2f %7.2f %7.2f\n", p[0], p[1], p[2]);
+        }
+        // (WWHD_SLICE=y0,y1,step: the shape's cross-section in bands of Y: its X and Z ranges)
+        if (const char* sl = std::getenv("WWHD_SLICE")) {
+            double a0 = -14, a1 = 14, st = 2;
+            std::sscanf(sl, "%lf,%lf,%lf", &a0, &a1, &st);
+            for (double y0 = a0; y0 < a1; y0 += st) {
+                double xl = 1e30, xh = -1e30, zl = 1e30, zh = -1e30;
+                int m = 0;
+                for (auto& p : pts)
+                    if (p[1] >= y0 && p[1] < y0 + st)
+                        xl = std::min(xl, p[0]), xh = std::max(xh, p[0]), zl = std::min(zl, p[2]), zh = std::max(zh, p[2]), ++m;
+                if (m) printf("   y %6.2f..%6.2f: %3d points, x %6.2f..%6.2f  z %6.2f..%6.2f\n", y0, y0 + st, m, xl, xh, zl, zh);
+            }
+        }
+    }
+    return 0;
+}
 int main(int argc, char** argv) {
+    if (argc == 4 && !strcmp(argv[1], "extents")) return extents(argv[2], argv[3]);
+    if (argc == 3 && !strcmp(argv[1], "parts")) return parts(argv[2]);
     if (argc == 4 && !strcmp(argv[1], "synth")) return synth(argv[2], argv[3]);
     if (argc != 5 || strcmp(argv[1], "convert")) return usage();
     std::vector<uint8_t> arc, pack, out;

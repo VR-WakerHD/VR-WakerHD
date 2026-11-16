@@ -64,8 +64,10 @@ bool ao_hires_enabled() { return settings().hires.load(std::memory_order_relaxed
 void set_ao_hires(bool v) { settings().hires.store(v,std::memory_order_relaxed); LOG("[gfx] AO full-size depth %s",v?"on":"off"); }
 // Anisotropic filtering (the user's choices, 2026-11-08): on by default in VR, where the ground and sea blurred at
 // low angles, flat off as before. In VR on a PC 16x; on a standalone headset (Quest, Steam Frame - Lepton and -
-// Native, always VR) 4x (aniso_max_ratio): most of 16x's sharpness for a fraction of its texture fetches on an Adreno
-// GPU that already limits the frame rate. VR and flat keep their own choice (the Graphics menu sets the one in use;
+// Native, always VR) 2x (aniso_max_ratio; 4x until 2026-11-11, lowered with the other GPU savings there): the ground's
+// worst blur at low angles gone for a fraction of 16x's texture fetches on an Adreno GPU that already limits the frame
+// rate. A Quest 8x since 2026-11-12 (the user's choice: a Quest 3S player found the picture blurry with every upscaler,
+// and its GPU was busy half of the time at 30 fps); the Steam Frame keeps 2x. VR and flat keep their own choice (the Graphics menu sets the one in use;
 // settings.ini "anisoVR" and "aniso"), so an "aniso" saved under the old default does not turn VR's off. WWHD_ANISO=0/1
 // sets both; WWHD_ANISO_MAX=2..16 the ratio
 namespace {
@@ -90,7 +92,12 @@ uint32_t aniso_max_ratio() {
             const int v = std::atoi(e);
             if (v >= 2) return uint32_t(v >= 16 ? 16 : v >= 8 ? 8 : v >= 4 ? 4 : 2);
         }
-        return standalone_headset_build() ? 4u : 16u;
+#if defined(__ANDROID__)
+        if (quest_theater::device()) return 8u;  // (2026-11-12: a Quest 8x, sharper ground and walls at an angle)
+#elif defined(WWHD_STEAM_FRAME_NATIVE) || (defined(__linux__) && defined(__aarch64__))
+        return 8u;  // (Steam Frame - Native, 2026-11-14: as a Quest's, the user's choice; its Adreno 750 the stronger GPU)
+#endif
+        return standalone_headset_build() ? 2u : 16u;  // (2026-11-11: 4x -> 2x on a standalone headset, GPU)
     }();
     return r;
 }

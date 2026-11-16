@@ -1662,10 +1662,11 @@ static void pip_percent(const char* label, float value, float minimum, float max
 #ifdef WWHD_VR
 static const vr::upscale::Mode kUpscaleModes[] = {vr::upscale::Mode::Auto, vr::upscale::Mode::Off,
                                                   vr::upscale::Mode::Sgsr1, vr::upscale::Mode::SuperResolution,
-                                                  vr::upscale::Mode::Sgsr2, vr::upscale::Mode::Fsr1};
+                                                  vr::upscale::Mode::Sgsr2, vr::upscale::Mode::Fsr1,
+                                                  vr::upscale::Mode::Cas};
 static const char* const kUpscalers[] = {"Auto", "Off", "SGSR1 (Snapdragon Game Super Resolution)",
                                          "Quest Super Resolution", "SGSR2 (temporal, Snapdragon)",
-                                         "FSR 1 (AMD FidelityFX)"};
+                                         "FSR 1 (AMD FidelityFX)", "CAS (contrast adaptive sharpening)"};
 static int upscale_index(vr::upscale::Mode m) {
     for (int i = 0; i < int(std::size(kUpscaleModes)); ++i)
         if (kUpscaleModes[i] == m) return i;
@@ -1743,7 +1744,7 @@ void tab_vr() {
                 changed = true;
             }
             help("How each eye's picture is scaled up to the headset's resolution. Off by default on PC VR (Windows, Linux), Auto on standalone headsets. Auto picks the best this device "
-                 "offers: Quest Super Resolution on a Quest (the headset's compositor upscales and sharpens), else SGSR1 "
+                 "offers: CAS on a standalone headset (Quest, Steam Frame: the game's own sharpening, once a frame), else SGSR1 "
                  "where the picture is upscaled (the Steam Frame, a PC). Never two at once (each sharpens). Choices a "
                  "device does not offer fall back to the plain scaling; the line below says what is in use. SGSR2 (by choice only): Qualcomm's temporal "
                  "upscaler, using the game's motion vectors and the previous frames for more detail and steadier edges; "
@@ -1753,6 +1754,14 @@ void tab_vr() {
             if (c.upscaler == vr::upscale::Mode::Sgsr1 || c.upscaler == vr::upscale::Mode::Auto) {
                 changed |= ImGui::SliderFloat("SGSR1 sharpness", &c.upscaleSharpness, 1.0f, 2.0f, "%.2f");
                 help("SGSR1's edge sharpening: 1 soft, 2 Qualcomm's default.");
+            }
+            if (c.upscaler == vr::upscale::Mode::Cas || c.upscaler == vr::upscale::Mode::Auto) {
+                changed |= ImGui::SliderFloat("CAS sharpness", &c.casSharpness, 0.0f, 1.0f, "%.2f");
+                changed |= ImGui::Checkbox("Edge smoothing (FXAA)", &c.casFxaa);
+                help("Smooths stair-stepped edges before CAS sharpens (not across the edges it smoothed). About 0.5-1 ms "
+                     "of the GPU a frame; on by default on a Quest. Applies at once.");
+                help("CAS (contrast adaptive sharpening; Auto on a Quest): 0 soft, 1 strongest, 0.5 the default. "
+                     "Drawn once a frame, cheaper than Quest Super Resolution at every refresh.");
             }
             if (c.upscaler == vr::upscale::Mode::Fsr1) {
                 changed |= ImGui::SliderFloat("FSR 1 sharpening (stops softer)", &c.fsrSharpness, 0.0f, 2.0f, "%.2f");
@@ -1815,6 +1824,22 @@ void tab_vr() {
         changed |= ImGui::Checkbox("Hide Link's arms", &c.hideArms);
         help("First person: his arms are not drawn, his hands (and whatever is in them) are. With Hide Link's body as "
              "well, only the hands are left.");
+        changed |= ImGui::Checkbox("Shadows on Link", &c.shadowsOnLink);
+        help("Off (the default for now): no shadows are drawn on Link, his hands and what they hold (his own shadow on the "
+             "ground stays). On: shadows fall on him, but distant shadows can wrongly land on him with the hands layer. "
+             "Applies at once.");
+        changed |= ImGui::Checkbox("Free shield rotation", &c.shieldFreeRotation);
+        help("On (the default): the shield turns with your hand, rolling and twisting with the wrist. Off: it stays "
+             "upright, flush with the body, and only turns to where the controller points.");
+        {
+            bool look = c.moveDirection == vr::MoveDirection::Head;
+            if (ImGui::Checkbox("Move where you look", &look)) {
+                c.moveDirection = look ? vr::MoveDirection::Head : vr::MoveDirection::LeftHand;
+                changed = true;
+            }
+            help("On (the default): pushing the left stick forward walks Link the way your head faces. Off: he walks the "
+                 "way the left controller points, so you can look around while you walk.");
+        }
         // (below Hide Link's arms since 2026-11-10, asked for: "move the settings turn view with spin attack below hide
         // links arms")
         changed |= ImGui::Checkbox("Turn the view in spin attacks", &c.spinCamera);
@@ -1858,6 +1883,20 @@ void tab_vr() {
             }
             help("The soft dark shading under characters and objects and in corners. Off, its pass is skipped (less GPU "
                  "time for each eye) and the picture looks flatter; the sun's shadows stay. Applies at once.");
+            bool noFlare = !c.lensFlare;
+            if (ImGui::Checkbox("Disable lens flare", &noFlare)) {
+                c.lensFlare = !noFlare;
+                changed = true;
+            }
+            help("The sun's rays, rings and glow laid over the picture when you look near the sun. The sun itself stays. "
+                 "Off by default on a Quest. Applies at once.");
+            int distance = int(c.drawDistance * 100.0f + 0.5f);
+            if (ImGui::SliderInt("Draw distance", &distance, 40, 100, "%d%%")) {
+                c.drawDistance = distance / 100.0f;
+                changed = true;
+            }
+            help("How far away things are drawn, as a share of the game's own distance: characters, scenery, grass and "
+                 "trees farther than that are not drawn (less GPU time). 70% by default on a Quest. Applies at once.");
         }
         changed |= ImGui::Checkbox("Start in VR", &c.enabled);
         help("Takes effect at the next start (--vr / --no-vr choose for one start). Needs an OpenXR runtime\n"
@@ -1874,13 +1913,22 @@ void tab_vr() {
             changed |= ImGui::SliderFloat("Snap angle", &c.snapDegrees, 10, 90, "%.0f degrees", ImGuiSliderFlags_AlwaysClamp);
         else
             changed |= ImGui::SliderFloat("Turn speed", &c.smoothDegreesPerSecond, 20, 360, "%.0f degrees/s", ImGuiSliderFlags_AlwaysClamp);
+        changed |= ImGui::Checkbox("Smooth Camera while Turning", &c.turnSmoothing);
+        help("On (the default): while the view turns at 30 or 45 fps, the headset's refreshes between the game's frames show "
+             "the last one turned on, so stick turns are as smooth as head turns. Off: the view's turn steps at the frame rate. "
+             "Virtual Desktop: set its Synchronous Spacewarp off (not automatic), or it can replace these frames with its own, "
+             "which don't follow the stick.");
+        changed |= ImGui::Checkbox("Steady hands while turning", &c.handsLayer);
+        help("On (the default): with Smooth Camera while Turning, Link's hands, sword, shield and what he holds are sent to the "
+             "headset as a layer of their own, so they stay steady while the world turns. Only at 30 and 45 fps; nothing "
+             "runs at a real 90. Off: his hands turn with the world. Applies at once.");
+        changed |= ImGui::Checkbox("Head movement smoothing", &c.headSmoothing);
+        help("Off by default (experimental). At 45 or 36 fps (below the headset's refresh rate), every refresh between the "
+             "game's frames gets the last frame moved by how far your eyes moved, using its depth, so near things (Link's "
+             "arms, the sword, close walls) no longer step back and forth as you look around. For any headset, wired or "
+             "streamed; it does not need Streaming optimal. Nothing at the full refresh rate. Applies at once.");
         changed |= ImGui::SliderFloat("Body turns after", &c.bodyFollowDegrees, 10, 90, "%.0f degrees", ImGuiSliderFlags_AlwaysClamp);
         help("Standing still in first person, Link turns to face where you look once your head turns this far from his body.");
-        bool hand = c.moveDirection == vr::MoveDirection::LeftHand;
-        if (ImGui::Checkbox("Move where the left controller points", &hand)) {
-            c.moveDirection = hand ? vr::MoveDirection::LeftHand : vr::MoveDirection::Head;
-            changed = true;
-        }
         changed |= ImGui::SliderFloat("Movement speed", &c.moveSpeed, 0.2f, 1, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
         help("The left stick scaled before the game reads it: lower walks more slowly.");
         changed |= ImGui::Checkbox("Left-handed (sword in the left hand)", &c.leftHanded);
@@ -1961,9 +2009,14 @@ void tab_vr() {
         changed |= ImGui::SliderFloat("Your arm length", &c.realArmLength, 0.3f, 1.0f, "%.2f m", ImGuiSliderFlags_AlwaysClamp);
         help("Shoulder to the middle of your fist, arm straight. With the world sized to Link it sets the world scale.");
         changed |= ImGui::SliderFloat("Stick dead zone", &c.stickDeadZone, 0, 0.6f, "%.2f", ImGuiSliderFlags_AlwaysClamp);
-        changed |= ImGui::Checkbox("Wind Waker: conduct with your hands too", &c.batonHands);
-        changed |= ImGui::SliderFloat("Wind Waker: hand reach", &c.batonHandReach, 0.05f, 0.4f, "%.2f m", ImGuiSliderFlags_AlwaysClamp);
-        help("Each hand held up, down, left or right of where it was when conducting began: the wand's hand (the sword hand) plays the notes, at 85 % of the reach, read at the wand's tip, or a quick flick that way (its trigger holds the middle note); the other hand the beat.");
+        heading("Wind Waker");
+        changed |= ImGui::Checkbox("Start the song by itself", &c.batonAutoStart);
+        help("First person: 1.5 s after you raise the Wind Waker, change the beat or finish a measure, the song starts as if you had played its first note. Off: it starts with your first note.");
+        changed |= ImGui::Checkbox("Conduct with your hands too", &c.batonHands);
+        changed |= ImGui::SliderFloat("Hand reach", &c.batonHandReach, 0.05f, 0.4f, "%.2f m", ImGuiSliderFlags_AlwaysClamp);
+        changed |= ImGui::SliderFloat("Song screen size", &c.batonUiSize, 0.3f, 1.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+        help("While you play a song: the bar of notes and the song's message at this share of their size, as if farther away.");
+        help("The wand's hand (the sword hand) plays the notes with 8 cm strokes up, down, left or right (its trigger holds the middle note); the other hand sets the beat by where it is across your body: out, middle or in, three bands each twice the reach wide.");
         heading("Menus and HUD");
         const char* screens[] = {"While its menus are open", "Always", "Off"};
         int screen = int(c.gamepadScreen);
@@ -1987,7 +2040,7 @@ void tab_vr() {
         changed |= ImGui::SliderFloat("Title and file select distance", &c.menuZoomOut, 1, 4, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
         changed |= ImGui::SliderFloat("Cutscene distance", &c.cutsceneZoomOut, 1, 3, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
         changed |= ImGui::SliderFloat("Cutscene and dialogue text distance", &c.textZoomOut, 1, 3, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
-        changed |= ImGui::SliderFloat("Telescope eyepiece size", &c.telescopeSize, 0.4f, 1.4f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
+        changed |= ImGui::SliderFloat("Telescope eyepiece size", &c.telescopeSize, 0.3f, 1.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
         changed |= ImGui::SliderFloat("Picto Box viewfinder size", &c.pictoBoxSize, 0.5f, 1.0f, "%.2fx", ImGuiSliderFlags_AlwaysClamp);
         help("The Picto Box's frame and zoom gauge, smaller around the centre of the view. A photo is what is inside the frame.");
         changed |= ImGui::SliderFloat("Cutscene and dialogue text height", &c.textHeight, -0.5f, 0.5f, "%+.2f", ImGuiSliderFlags_AlwaysClamp);
@@ -2018,6 +2071,15 @@ void tab_vr() {
             if (ImGui::RadioButton(label, std::fabs(c.renderScale - p) < 0.001f)) { c.renderScale = p; changed = true; }
         }
         if (uint32_t w = 0, h = 0; vr::picture_size(w, h)) note("Eye pictures now %ux%u.", w, h);
+        {
+            static const char* const kFoveation[] = {"Off", "Low", "Medium", "High"};
+            int f = std::clamp(c.foveation, 0, 3);
+            if (ImGui::Combo("Foveated rendering", &f, kFoveation, 4)) {
+                c.foveation = f;
+                changed = true;
+            }
+            help("The edges of each eye drawn at less detail (where the lenses blur them anyway), for less GPU work: Low, Medium, High. Only on GPUs that support it (Quest); applies at once.");
+        }
         help(vr::kPcVrBuild
                  ? "The size each eye is drawn at, of the size the headset asks for: 1x copies it as drawn (sharpest for "
                    "its cost), above 1x smooths edges and costs more. In VR this replaces the internal resolution. "

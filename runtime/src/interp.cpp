@@ -256,7 +256,10 @@ static void apply_vr_frame_mode() {
     // auto: unlocked or half, as auto_rate_step decided at the last step's end
     const bool wasAuto = g_auto_on;
     g_auto_on = mode == pacing::kVrAuto;
-    if (g_auto_on && !wasAuto) g_auto = {};
+    if (g_auto_on && !wasAuto) {
+        g_auto = {};
+        pacing::auto_rate_settle(g_auto);  // (just picked: the first 3 s not judged)
+    }
     // (docs/VR_STREAMING.md) the streamed waits too only with Streaming optimal: off, Auto is wired optimal throughout
     // (asked for, 2026-11-05: "when auto mode is selected and streaming optimal isn't you should get the wired optimal")
     g_auto.streamed = g_vr_stream_rates.load(std::memory_order_relaxed);
@@ -271,9 +274,9 @@ static void apply_vr_frame_mode() {
     }
     if (g_auto_on) mode = g_auto.half ? pacing::kVrHalf : pacing::kVrFull;
     if (g_vr_mode.exchange(mode) != mode || g_auto_on != wasAuto) {
-        char why[96] = "";
+        char why[160] = "";
         if (g_auto_on && mode == pacing::kVrHalf && g_auto.lastShare >= 0)
-            snprintf(why, sizeof why, " (auto: unlocked drew %.0f%% of its in-between frames)", 100.0 * g_auto.lastShare);
+            snprintf(why, sizeof why, " (auto: unlocked drew %.0f%% of its in-between frames; the full rate tried again in %lld s)", 100.0 * g_auto.lastShare, (long long)((g_auto.tryAt - g_auto.steps) / 30));
         char capped[160] = "";
         const int hz = g_vr_hz.load(std::memory_order_relaxed);
         if (const int cap = pacing::vr_mode_cap(mode, hz)) {
@@ -281,7 +284,9 @@ static void apply_vr_frame_mode() {
             const int drawn = pacing::cap_fps_vr_mode(fps(), hz, mode, streamed);
             char how[96] = "";
             // (pacing::vr_even_fps) at half the rate, a lower one the headset shows evenly; else said when it is uneven
-            const bool evenPick = mode == pacing::kVrHalf && drawn != pacing::vr_drawable_fps(cap, streamed);
+            // (Capped 30 FPS at a rate that is not a multiple of 30: the half cap, pacing::vr_mode_resolved)
+            const int resolved = pacing::vr_mode_resolved(mode, hz);
+            const bool evenPick = resolved == pacing::kVrHalf && drawn != pacing::vr_drawable_fps(cap, streamed);
             if (drawn != cap)
                 snprintf(how, sizeof how, ", drawn at %d fps (%s)", drawn,
                          drawn == 30 ? "frame interpolation off"
@@ -289,7 +294,10 @@ static void apply_vr_frame_mode() {
                          : pacing::even_on_display(drawn, hz) ? "no schedule for its own rate"
                                                                : "no schedule for its own rate; shown unevenly");
             snprintf(capped, sizeof capped, "capped at %d fps (%s the headset's %d Hz)%s", cap,
-                     mode == pacing::kVrFull ? "all of" : mode == pacing::kVrHalf ? "half" : "for", hz, how);
+                     mode == pacing::kVrFull ? "all of" : resolved == pacing::kVrHalf ? "half" : "for", hz, how);
+            if (resolved != mode)
+                LOG("[interp] Capped 30 FPS needs the headset at a multiple of 30 Hz (90, 120); at %d Hz it is capped at "
+                    "half instead (%d fps), every frame a whole number of refreshes", hz, cap);
             // (a streamed headset shown unevenly: the stream's encoder gets frames on some refreshes only, seen as lag over
             // Wi-Fi; docs/VR_STREAMING.md)
             if (g_vr_streamed.load(std::memory_order_relaxed) && !pacing::even_on_display(drawn, hz))
@@ -604,11 +612,15 @@ float g_t40 = 1.0f;
 pacing::Fractions40 g_frac40;
 // blend fraction of this pass: 1/(N+1) on a logic pass, (k+1)/(N+1) on blended hold pass k, 1 on
 // the record pass, an exact step and without interpolation (40 fps logic passes: Fractions40)
-float pass_t() {
-    if (!enabled()) return 1.0f;
+static float planned_pass_t() {
     if (fps45()) return pacing::pass_fraction_45(g_hold ? g_phase : 0, g_step_n, g_exact_step);
     if (g_step40 && !g_hold) return g_t40;
     return pacing::pass_fraction(g_hold ? g_phase : 0, g_step_n, g_exact_step);
+}
+static float display_blend(float planned);  // (below: the display-time blend, VR)
+float pass_t() {
+    if (!enabled()) return 1.0f;
+    return display_blend(planned_pass_t());
 }
 // At 40 fps the logic pass of a step without an in-between frame also records its step (g_record_logic):
 // - after a record pass it is a blended record pass: drawn blended (pass_t()), and what it draws is
@@ -1533,7 +1545,17 @@ extern "C" void hook_027F55FC(Cpu* c) {
     if (!enabled() || off || g_ptcl_model_draw || (!g_hold && !g_record_logic && g_exact_step)) {
         // (an exact frame: Link's arms still at the controllers this frame, frame_correct; with interpolation off
         // the job thread's UBO update would draw the exact matrices again, so not then)
-        if (enabled() && !off) {
+        // (VR, 2026-11-12: with interpolation off too, a steady 30 fps (Steady 30, a Quest's default): the body hiding,
+        // the head and the arms at the controllers are all frame_correct's, and a headset run at 30 fps showed Link's
+        // body; every run of the day that stayed at 30 fps had it shown, every one that reached 45 or 90 hid it. The
+        // UBO update that would undo it is skipped for the model as with interpolation on: hook_027F5018)
+#ifdef WWHD_VR
+        // (WWHD_VR_BODY30=0: not at 30 fps, as before, for comparison)
+        static const bool vrCorrect = [] { const char* e = getenv("WWHD_VR_BODY30"); return !(e && *e == '0'); }();
+#else
+        const bool vrCorrect = false;
+#endif
+        if ((enabled() || vrCorrect) && !off) {
             const uint32_t m = c->r[3], j = ld32(m + kMdlJoints);
             const uint32_t x = j ? ld32(j + kJntMtx) : 0, cnt = j ? ld16(j + kJntNum) : 0;
             if (x && cnt && cnt <= kMaxJoints && draw_turned(c, m, x, cnt, (const uint32_t*)ppc_ptr(x), 1.0f)) return;
@@ -1671,15 +1693,41 @@ extern "C" void hook_027F55FC(Cpu* c) {
 extern "C" void hook_027F5018(Cpu* c) {
     using namespace interp;
     const uint32_t model = c->r[3];
+#ifdef WWHD_VR
+    // (diagnostics, docs/VR_HANDS_LAYER_PLAN.md: "[vr body] (10 s)") Link's body's UBO updates: skipped (the hidden body
+    // drawn ahead by draw_turned stands) or run (drawn again from his unhidden joints: the body shows)
+    static uint64_t bodySkipped = 0, bodyRun = 0;
+    static auto bodySince = std::chrono::steady_clock::now();
+    const bool isBody = model && model == vr::game::link_body_model();
+#endif
     {
         std::lock_guard<std::mutex> lk(g_ubo_mu);
+#ifndef WWHD_VR
         if (!enabled()) g_ubo_done.clear();  // switched off since viewCalc
+#else
+        // (VR: draw_turned also runs with interpolation off, and each of its UBO updates done ahead is matched by this
+        // one being skipped. A model whose skipped update never came, a count left over, is not skipped twice)
+        if (g_ubo_done.size() > 256) g_ubo_done.clear();
+#endif
         auto it = g_ubo_done.find(model);
         if (it != g_ubo_done.end()) {
             if (--it->second == 0) g_ubo_done.erase(it);
+#ifdef WWHD_VR
+            if (isBody) ++bodySkipped;
+#endif
             return;
         }
     }
+#ifdef WWHD_VR
+    if (isBody) ++bodyRun;
+    if (const auto now = std::chrono::steady_clock::now(); now - bodySince >= std::chrono::seconds(10)) {
+        if (bodySkipped || bodyRun)
+            LOG("[vr body] (10 s): Link's body's UBO updates %llu skipped (hidden kept), %llu run (drawn again unhidden)",
+                (unsigned long long)bodySkipped, (unsigned long long)bodyRun);
+        bodySkipped = bodyRun = 0;
+        bodySince = now;
+    }
+#endif
     f_027F5018_orig(c);
 }
 
@@ -1810,6 +1858,81 @@ static uint64_t g_paced_possible = 0, g_paced_holds = 0, g_paced_steps = 0, g_pa
 // on the console). (It was 33.333 ms, which drifted against the grid's 33.367 ms: issue #164.) In VR the grid is on
 // the headset's clock (gx2::lock_vsync_to_display): 33.333 ms at 90 Hz
 static std::chrono::nanoseconds paced_step() { return std::chrono::nanoseconds(2 * gx2::vsync_period_ns()); }
+
+// The display-time blend (VR; docs/FRAME_INTERPOLATION_IMPLEMENTATION.md, change 1; asked for, 2026-11-12, after PC VR
+// players found interpolation off smoother). The pacer gives each pass a planned fraction (pass_fraction: 1/3, 2/3, 1 at
+// 90 fps), right only while every frame reaches the headset on its planned refresh. One that misses is shown a refresh
+// late with the world where it should have been a refresh earlier, and the frames after it carry the lag: the world
+// moves unevenly while the head (reprojected) stays smooth, the jitter players reported. Here a pass's fraction comes
+// from when its frame will be shown: its predicted display time (the camera's own, vr::game::frame_display_time)
+// against a timeline of the display times at which each logic step is drawn exactly. The timeline advances one logic
+// step (paced_step) a step and follows the frames' own estimates slowly (kFollow a pass), so a steady offset, a
+// runtime's latency, never shows; a sudden lateness does, and the late frame shows the world where it belongs when it
+// is shown. Clamped to [0, 1] (between the two steps blended: never extrapolated); applied only when the frame is at
+// least half a frame off its plan (small noise in the predicted times changes nothing); the record pass and an exact
+// step stay exact (the next step blends from what the record pass draws). Once a pass (all its blends see one
+// fraction). Off by default (below); WWHD_VR_DISPLAY_BLEND=1 turns it on
+static float display_blend(float planned) {
+#ifdef WWHD_VR
+    // (off by default since its first headset run, 2026-11-12: "fps seems worse". The predicted display time it reads
+    // jumps by a frame whenever the number of swaps queued changes, which the head pose's reprojection hides but the
+    // world does not: 10-20 % of the in-between frames were moved by up to two frames that were not late.
+    // WWHD_VR_DISPLAY_BLEND=1 turns it on, for testing)
+    static const bool off = [] { const char* e = getenv("WWHD_VR_DISPLAY_BLEND"); return !(e && *e == '1'); }();
+    if (off || planned >= 1.0f || record_pass() || g_exact_step) return planned;
+    static uint64_t cachedPass = ~0ull;
+    static float cachedPlanned = -1, cachedT = 0;
+    if (cachedPass == g_passes && cachedPlanned == planned) return cachedT;
+    cachedPass = g_passes;
+    cachedPlanned = planned;
+    cachedT = planned;
+    int64_t display = 0, period = 0;
+    if (!::vr::game::frame_display_time(display, period)) return planned;
+    const int64_t step = int64_t(paced_step().count());
+    if (step <= 0) return planned;
+    // the timeline: the display time at which the step blended from (the one before the current) is drawn exactly
+    static int64_t exactBefore = 0;
+    static uint64_t timelineStep = 0;
+    static bool seeded = false;
+    const uint64_t now = logic_steps();
+    const int64_t estimate = display - int64_t(double(planned) * double(step));
+    if (seeded && now != timelineStep) exactBefore += int64_t(now - timelineStep) * step;
+    timelineStep = now;
+    const int64_t err = estimate - exactBefore;
+    // (a jump of more than two steps: a pause, a load, the session's start: taken at once)
+    if (!seeded || err > 2 * step || err < -2 * step) {
+        exactBefore = estimate;
+        seeded = true;
+        return planned;
+    }
+    constexpr double kFollow = 0.05;  // the share of the frames' own estimate the timeline takes each pass
+    exactBefore += int64_t(double(err) * kFollow);
+    const float t = std::clamp(float(double(display - exactBefore) / double(step)), 0.0f, 1.0f);
+    const int fps = std::max(1, output_fps());
+    const float halfFrame = float(0.5 * 1e9 / double(fps) / double(step));
+    static uint64_t corrected = 0, passes = 0;
+    static float worst = 0;
+    static uint64_t loggedAt = 0;
+    ++passes;
+    if (std::fabs(t - planned) >= halfFrame) {
+        cachedT = t;
+        ++corrected;
+        worst = std::max(worst, std::fabs(t - planned));
+    }
+    if (now >= loggedAt + 300) {  // (10 s)
+        if (corrected)
+            LOG("[interp] display-time blend (10 s): %llu of %llu in-between frames drawn at their display time, not "
+                "their plan (at most %.2f of a step off)", (unsigned long long)corrected, (unsigned long long)passes,
+                double(worst));
+        loggedAt = now;
+        corrected = passes = 0;
+        worst = 0;
+    }
+    return cachedT;
+#else
+    return planned;
+#endif
+}
 // the passes of a step wait for the grid's vsyncs and together take the whole step: 2 ms of slack
 static std::chrono::nanoseconds paced_budget() { return paced_step() + std::chrono::milliseconds(2); }
 // Even frame delivery (interp_pacing.h EvenSchedule): the renderer holds a frame that is ready
@@ -2039,13 +2162,34 @@ static void auto_rate_after_step(int holds, int capacity) {
     if (!g_auto_on || !g_vr_hz.load(std::memory_order_relaxed) || !interp_on()) return;
     // judged only in gameplay (pacing::auto_rate_settle): out of it the choice and its waits stand still
     static bool inPlay = false;
-    if (!aspect::gameplay_camera()) {
+    // (VR, 2026-11-14: the VR menu pauses the game; the second after it closes the game is still getting back up to
+    // speed, and Auto, judging it, went to 45 fps right after Auto was picked there (a headset run's log). The menu now
+    // counts as out of gameplay: Auto waits kAutoSettle steps after it closes, as after a load)
+    bool vrMenu = false;
+#ifdef WWHD_VR
+    vrMenu = vr::game::menu_open();
+#endif
+    if (!aspect::gameplay_camera() || vrMenu) {
         inPlay = false;
         return;
     }
     if (!inPlay) {
         inPlay = true;
         pacing::auto_rate_settle(g_auto);
+    }
+    {  // a new stage: Auto's waits start again (pacing::auto_rate_new_stage)
+        static char lastStage[9] = {};
+        char st[9] = {};
+        const uint32_t name = GD(0x1046F0B0) + 0x5134;  // dComIfGp's current stage name (GameInfo +0x5134)
+        for (int i = 0; i < 8; i++) st[i] = char(ld8(name + i));
+        if (st[0] && std::strncmp(st, lastStage, 8) != 0) {
+            if (lastStage[0]) {
+                pacing::auto_rate_new_stage(g_auto);
+                LOG("[interp] VR frame rate auto: new stage %s: tries of the full rate start again from %lld s", st,
+                    (long long)(g_auto.backoff / 30));
+            }
+            std::memcpy(lastStage, st, 9);
+        }
     }
     static pace_clock::duration fullLogic{}, fullHold{};
     const bool wasHalf = g_auto.half;
@@ -2679,6 +2823,9 @@ extern "C" void hook_025DE788(Cpu* c) {
     uint32_t execute_fn = c->r[3];
     if(!interp::g_hold_frame)guestmods::maphud::begin_logic(c,1.0/30.0);  // one 30 Hz logic step
     if (!interp::g_hold_frame) mods::instant_text_step();  // instant text (mods/instant_text.cpp)
+#ifdef WWHD_VR
+    if (!interp::g_hold_frame) vr::game::logic_step_starting();  // (B leaves command mode)
+#endif
     dsweep::before_execute(c);  // the setup's actor sweep (WWHD_DSWEEP): its actors do not run their logic
     f_025DE788_orig(c);
     dsweep::after_execute(c);
@@ -3005,13 +3152,261 @@ extern "C" void f_02574144_orig(Cpu* c);
 extern "C" void f_0256F1C4_orig(Cpu* c);
 extern "C" void f_02570210_orig(Cpu* c);
 extern "C" void f_02571B1C_orig(Cpu* c);
-extern "C" void hook_02574144(Cpu* c) { with_drawn_camera(c, f_02574144_orig, "stars"); }
+// (VR, 2026-11-14, a headset video: "the stars skybox is shrunk down to a cone and follow Link ... on the boat they
+// are right behind you hovering over you") dKyr_drawStar places its stars around the game camera's eye (camera +0xDC)
+// and keeps only those its projection (mDoLib_projectViewport 025F1018) puts inside the flat screen, away from the
+// moon. In VR the view is the head's: the game camera's own eye, which the stars were put around, is behind and over
+// him (first person) and the flat screen is a small part of the headset's view and of the sky around it. While
+// the head drew the view, the stars are put around the head's eye, and every star is kept but those near the moon,
+// by the angle from it (its screen distance turned to an angle with the view's own projection): the whole sky.
+// WWHD_VR_STARS_SKY=0: the game's own
+#ifdef WWHD_VR
+namespace {
+thread_local bool t_vrStars = false;  // inside dKyr_drawStar, its stars around the head's eye
+float g_vrStarEye[3];
+float g_vrMoonDir[3];
+bool g_vrMoonKnown = false;
+float g_vrMoonCos = 1.0f;  // a star whose direction's cosine to the moon's is above it: not drawn (near the moon)
+float g_vrStarScreen[2];   // a point inside the flat screen
+bool vr_stars_on() {
+    static const bool on = [] {
+        const char* e = getenv("WWHD_VR_STARS_SKY");
+        const bool v = !(e && *e == '0');
+        LOG("[vr] night sky stars: %s", v ? "around the head, the whole sky (WWHD_VR_STARS_SKY=0: the game's own)"
+                                          : "the game's own (WWHD_VR_STARS_SKY=0)");
+        return v;
+    }();
+    return on;
+}
+void stars_vr(Cpu* c) {
+    const uint32_t cam = ld32(GD(0x1046F0B0) + 0x5AF8);  // dComIfGp_getCamera(0), the camera the stars are put around
+    float eye[3];
+    if (!vr_stars_on() || !cam || !vr::game::drawn_head_eye(cam, interp::pass_count(), eye)) {
+        f_02574144_orig(c);
+        return;
+    }
+    uint32_t saved[3];
+    for (int k = 0; k < 3; k++) {
+        saved[k] = ld32(cam + 0xDC + 4 * k);
+        stf32(cam + 0xDC + 4 * k, eye[k]);
+        g_vrStarEye[k] = eye[k];
+    }
+    // a point inside the flat screen: the middle of dKyr_drawStar's own limits (.rodata ScreenMinimum, ScreenMaximumX/Y)
+    const float lo = (float)ldf32(GD(0x1004FCAC)), hx = (float)ldf32(GD(0x1004F634)), hy = (float)ldf32(GD(0x1004F7CC));
+    g_vrStarScreen[0] = 0.5f * (lo + hx);
+    g_vrStarScreen[1] = 0.5f * (lo + hy);
+    g_vrMoonKnown = false;
+    g_vrMoonCos = 1.0f;
+    t_vrStars = true;
+    f_02574144_orig(c);
+    t_vrStars = false;
+    for (int k = 0; k < 3; k++) st32(cam + 0xDC + 4 * k, saved[k]);
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        LOG("[vr] night sky stars: around the head's eye %.0f %.0f %.0f; the moon %s, stars within %.1f degrees of it "
+            "left out; screen limits %.0f..%.0f x %.0f", eye[0], eye[1], eye[2], g_vrMoonKnown ? "known" : "not seen",
+            std::acos(std::min(1.0f, g_vrMoonCos)) * 57.2958f, lo, hx, hy);
+    }
+}
+float vr_len3(const float v[3]) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
+}  // namespace
+// (interp_reticle.cpp hook_025F1018) true: the projection was answered for dKyr_drawStar in VR
+bool interp_vr_star_project(Cpu* c, void (*orig)(Cpu*)) {
+    if (!t_vrStars) return false;
+    const uint32_t src = c->r[3], dst = c->r[4];
+    float d[3];
+    for (int k = 0; k < 3; k++) d[k] = (float)ldf32(src + 4 * k) - g_vrStarEye[k];
+    const float len = vr_len3(d);
+    constexpr float kFar = -1.0e7f;  // the moon's screen point, far off the screen: every star's distance from it passes
+    if (src == GD(0x10475A68) + 0xB44) {  // the moon (g_env_light.mMoonPos): its direction, and the angle kept off it
+        g_vrMoonKnown = len > 1e-3f;
+        if (g_vrMoonKnown)
+            for (int k = 0; k < 3; k++) g_vrMoonDir[k] = d[k] / len;
+        // dKyr_drawStar's distance limit off the moon on the flat screen (MoonDistanceGain * fade^2 + MoonDistanceBase,
+        // fade = 1 - min(fovy / WideFovy, 1)), as an angle: the view's projection's pixels per unit of tangent, measured
+        // by projecting two points 0.1 apart in tangent along the view's up (view +0x1E4, rows: right, up, back)
+        const uint32_t view = ld32(GD(0x1046F0B0) + 0x5FA4);
+        if (g_vrMoonKnown && view) {
+            const float fovy = (float)ldf32(view + 0xD4), wide = (float)ldf32(GD(0x1004F6EC));
+            float fade = wide > 0 ? std::min(fovy / wide, 1.0f) : 1.0f;
+            fade = 1.0f - fade;
+            const float limit = (float)ldf32(GD(0x1004F6BC)) * fade * fade + (float)ldf32(GD(0x1004F55C));
+            const uint32_t m = view + 0x1E4;
+            float up[3], back[3];
+            for (int k = 0; k < 3; k++) {
+                up[k] = (float)ldf32(m + 16 + 4 * k);
+                back[k] = (float)ldf32(m + 32 + 4 * k);
+            }
+            uint32_t keep[3];
+            for (int k = 0; k < 3; k++) keep[k] = ld32(src + 4 * k);
+            float s[2][2];
+            for (int j = 0; j < 2; j++) {
+                for (int k = 0; k < 3; k++)
+                    stf32(src + 4 * k, g_vrStarEye[k] - 1000.0f * back[k] + (j ? 100.0f * up[k] : 0.0f));
+                orig(c);
+                s[j][0] = (float)ldf32(dst);
+                s[j][1] = (float)ldf32(dst + 4);
+            }
+            for (int k = 0; k < 3; k++) st32(src + 4 * k, keep[k]);
+            const float px = std::hypot(s[1][0] - s[0][0], s[1][1] - s[0][1]) / 0.1f;  // pixels per unit of tangent
+            if (px > 1.0f && std::isfinite(px) && limit > 0) g_vrMoonCos = std::cos(std::atan(limit / px));
+        }
+        stf32(dst, kFar);
+        stf32(dst + 4, kFar);
+        stf32(dst + 8, 0.5f);
+        return true;
+    }
+    // a star: inside the screen, or on the moon's point when near the moon (its distance 0: left out)
+    bool nearMoon = false;
+    if (g_vrMoonKnown && len > 1e-3f) {
+        const float cosA = (d[0] * g_vrMoonDir[0] + d[1] * g_vrMoonDir[1] + d[2] * g_vrMoonDir[2]) / len;
+        nearMoon = cosA > g_vrMoonCos;
+    }
+    stf32(dst, nearMoon ? kFar : g_vrStarScreen[0]);
+    stf32(dst + 4, nearMoon ? kFar : g_vrStarScreen[1]);
+    stf32(dst + 8, 0.5f);
+    return true;
+}
+#else
+bool interp_vr_star_project(Cpu*, void (*)(Cpu*)) { return false; }
+#endif
+static void stars_draw(Cpu* c) {
+#ifdef WWHD_VR
+    stars_vr(c);
+#else
+    f_02574144_orig(c);
+#endif
+}
+extern "C" void hook_02574144(Cpu* c) { with_drawn_camera(c, stars_draw, "stars"); }
+// (VR, 2026-11-15, a player's report: "Moon or the Sun, they turn with your head movements") dKyr_drawSun builds the
+// sun's and the moon's squares 8000 units out from the view's own right and up (the inverse of the view's rotation,
+// view +0x1E4: rows right, up, back), then turns them about the view's line by an angle from the camera's heading
+// (camera +0xDC eye to +0xE8 centre) against the sprite's: on the TV the sun's rays turn slowly as the camera pans. In
+// VR the view is the head's: the squares took every tilt of the head (the moon's crescent tilted with it) and the
+// angle every turn of it (they spun as you looked round). While they are built: the view's rotation faces the sprite
+// from the eye with the world's up (no tilt), and the camera looks at the sprite (the angle the game's own for
+// looking straight at it). Both put back after. WWHD_VR_SUN_FACING=0: the game's own
+#ifdef WWHD_VR
+namespace {
+bool vr_sun_facing_on() {
+    static const bool on = [] {
+        const char* e = getenv("WWHD_VR_SUN_FACING");
+        const bool v = !(e && *e == '0');
+        LOG("[vr] sun and moon: %s", v ? "face the eye with the world's up, no turn with the head (WWHD_VR_SUN_FACING=0: the game's own)"
+                                       : "the game's own, turned with the head (WWHD_VR_SUN_FACING=0)");
+        return v;
+    }();
+    return on;
+}
+struct SunStats { int draws = 0, skipped = 0; double tilt = 0, tiltMax = 0, spin = 0, spinMax = 0; } g_sunStats;
+std::chrono::steady_clock::time_point g_sunStatsSince = std::chrono::steady_clock::now();
+void sun_vr(Cpu* c) {
+    const uint32_t gi = GD(0x1046F0B0);
+    const uint32_t cam = ld32(gi + 0x5AF8), view = ld32(gi + 0x5FA4), pos = c->r[4];
+    float eye[3];
+    // (only while the head drew the view, as the stars: flat play and the headset's menus keep the game's own)
+    if (!vr_sun_facing_on() || !cam || !view || !pos || !vr::game::drawn_head_eye(cam, interp::pass_count(), eye)) {
+        f_0256F1C4_orig(c);
+        return;
+    }
+    const uint32_t m = view + 0x1E4;
+    float R[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) R[r][k] = (float)ldf32(m + 16 * r + 4 * k);
+    float d[3];
+    for (int k = 0; k < 3; k++) d[k] = (float)ldf32(pos + 4 * k) - eye[k];
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    auto finite3 = [](const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); };
+    if (!(len > 1.0f) || !finite3(d) || !finite3(R[0]) || !finite3(R[1]) || !finite3(R[2])) {
+        g_sunStats.skipped++;
+        f_0256F1C4_orig(c);
+        return;
+    }
+    for (int k = 0; k < 3; k++) d[k] /= len;
+    // the square's back (towards the viewer, as the view's own back row): from the sprite to the eye; for the one
+    // behind the head (the moon opposite the sun on some stages) the other way, as the view's back would have it
+    const float fwdDot = -(d[0] * R[2][0] + d[1] * R[2][1] + d[2] * R[2][2]);  // (the head's forward is -back)
+    float b[3] = {-d[0], -d[1], -d[2]};
+    if (fwdDot < 0)
+        for (float& v : b) v = -v;
+    // right = up x back, with the world's up; straight overhead, the view's right made square to the back
+    float r[3] = {b[2], 0.0f, -b[0]};  // (0,1,0) x b
+    float rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+    if (rl < 1e-3f) {
+        const float t = R[0][0] * b[0] + R[0][1] * b[1] + R[0][2] * b[2];
+        for (int k = 0; k < 3; k++) r[k] = R[0][k] - t * b[k];
+        rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        if (!(rl > 1e-4f)) {
+            g_sunStats.skipped++;
+            f_0256F1C4_orig(c);
+            return;
+        }
+    }
+    for (float& v : r) v /= rl;
+    const float u[3] = {b[1] * r[2] - b[2] * r[1], b[2] * r[0] - b[0] * r[2], b[0] * r[1] - b[1] * r[0]};  // back x right
+    // (diagnostics) the head's tilt the view had: its up against the world's up about its line, and the spin angle's
+    // input taken out (the camera's heading against the sprite's)
+    {
+        const float* vr_ = R[0];
+        const float* vu = R[1];
+        const double tilt = std::atan2(double(vr_[1]), double(vu[1])) * 57.2958;
+        const float cx = (float)ldf32(cam + 0xE8) - (float)ldf32(cam + 0xDC),
+                    cz = (float)ldf32(cam + 0xE8 + 8) - (float)ldf32(cam + 0xDC + 8);
+        double spin = (std::atan2(double(cx), double(cz)) - std::atan2(double(d[0]), double(d[2]))) * 57.2958;
+        while (spin > 180) spin -= 360;
+        while (spin < -180) spin += 360;
+        g_sunStats.draws++;
+        g_sunStats.tilt += std::fabs(tilt);
+        g_sunStats.tiltMax = std::max(g_sunStats.tiltMax, std::fabs(tilt));
+        g_sunStats.spin += std::fabs(spin);
+        g_sunStats.spinMax = std::max(g_sunStats.spinMax, std::fabs(spin));
+    }
+    // the view's translation kept for the same offset: the inverse places the square at -R^T t from its point; with the
+    // new rotation R', t' = R' R^T t gives the same
+    const float t[3] = {R[0][3], R[1][3], R[2][3]};
+    float o[3];
+    for (int k = 0; k < 3; k++) o[k] = R[0][k] * t[0] + R[1][k] * t[1] + R[2][k] * t[2];  // R^T t
+    const float* rows[3] = {r, u, b};
+    uint32_t savedView[12], savedCentre[3];
+    for (int i = 0; i < 12; i++) savedView[i] = ld32(m + 4 * i);
+    for (int k = 0; k < 3; k++) savedCentre[k] = ld32(cam + 0xE8 + 4 * k);
+    for (int row = 0; row < 3; row++) {
+        for (int k = 0; k < 3; k++) stf32(m + 16 * row + 4 * k, rows[row][k]);
+        stf32(m + 16 * row + 12, rows[row][0] * o[0] + rows[row][1] * o[1] + rows[row][2] * o[2]);
+    }
+    // the camera looking at the sprite: its heading the sprite's (centre = its eye + the sprite's direction)
+    for (int k = 0; k < 3; k++) stf32(cam + 0xE8 + 4 * k, (float)ldf32(cam + 0xDC + 4 * k) + 1000.0f * d[k]);
+    f_0256F1C4_orig(c);
+    for (int i = 0; i < 12; i++) st32(m + 4 * i, savedView[i]);
+    for (int k = 0; k < 3; k++) st32(cam + 0xE8 + 4 * k, savedCentre[k]);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - g_sunStatsSince > std::chrono::seconds(10)) {
+        if (g_sunStats.draws || g_sunStats.skipped)
+            LOG("[vr] sun and moon (10 s): %d draws faced the eye with the world's up (%d left as the game's); the "
+                "head's tilt taken out %.1f degrees on average, %.1f at most; the spin's camera turn taken out %.1f on "
+                "average, %.1f at most", g_sunStats.draws, g_sunStats.skipped,
+                g_sunStats.draws ? g_sunStats.tilt / g_sunStats.draws : 0.0, g_sunStats.tiltMax,
+                g_sunStats.draws ? g_sunStats.spin / g_sunStats.draws : 0.0, g_sunStats.spinMax);
+        g_sunStats = {};
+        g_sunStatsSince = now;
+    }
+}
+}  // namespace
+#endif
+static void sun_draw(Cpu* c) {
+#ifdef WWHD_VR
+    sun_vr(c);
+#else
+    f_0256F1C4_orig(c);
+#endif
+}
 // dKyr_drawSun(view, &sun packet +0x98, ...) from the sun packet's draw
 extern "C" void hook_0256F1C4(Cpu* c) {
     const uint32_t sun = sun_packet();
     if (sun && c->r[4] == sun + 0x98) {
         static SkyHistory history;
-        with_drawn_camera(c, f_0256F1C4_orig, "sun/moon", {{c->r[4], 1}}, &history);
+        with_drawn_camera(c, sun_draw, "sun/moon", {{c->r[4], 1}}, &history);
         return;
     }
     static bool logged = false;
@@ -3024,6 +3419,14 @@ extern "C" void hook_0256F1C4(Cpu* c) {
 // dKyr_drawLenzflare(view, &sunlenz packet +0xA4 (9 positions), ...) from the sunlenz packet's draw;
 // its rays start at the sun's position
 extern "C" void hook_02570210(Cpu* c) {
+#ifdef WWHD_VR
+    // (vr.lensFlare off: the default on a Quest, docs/VR_PERFORMANCE.md "Expensive effects") not drawn in the headset
+    if (vr::game::lens_flare_off()) {
+        static bool logged = false;
+        if (!logged) logged = true, LOG("[vr] lens flare: not drawn in the headset (vr.lensFlare off)");
+        return;
+    }
+#endif
     const uint32_t sun = sun_packet(), lenz = lenz_packet();
     static SkyHistory history;
     if (sun && lenz && c->r[4] == lenz + 0xA4) with_drawn_camera(c, f_02570210_orig, "lens flare", {{c->r[4], 9}, {sun + 0x98, 1}}, &history);

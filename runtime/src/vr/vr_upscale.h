@@ -28,8 +28,8 @@
 
 namespace vr::upscale {
 
-// vr.upscaler: auto, off, sgsr1, superResolution, dlss, sgsr2, fsr1
-enum class Mode : int { Auto = 0, Off = 1, Sgsr1 = 2, SuperResolution = 3, Dlss = 4, Sgsr2 = 5, Fsr1 = 6 };
+// vr.upscaler: auto, off, sgsr1, superResolution, dlss, sgsr2, fsr1, cas
+enum class Mode : int { Auto = 0, Off = 1, Sgsr1 = 2, SuperResolution = 3, Dlss = 4, Sgsr2 = 5, Fsr1 = 6, Cas = 7 };
 
 struct Caps {
     bool superResolution = false;  // the runtime offers XR_FB_composition_layer_settings (Meta's compositor)
@@ -45,6 +45,7 @@ struct Choice {
     bool dlss = false;  // (DLSS itself was started at the start; this says it is the upscaler in use)
     bool sgsr2 = false;  // (with sgsr1 also set: the fallback for an eye without motion this frame)
     bool fsr1 = false;
+    bool cas = false;  // (2026-11-11) contrast adaptive sharpening, the renderer's own, once a game frame
     const char* why = "";  // for the log and the settings' status line
 };
 
@@ -77,13 +78,24 @@ inline Choice choose(Mode mode, const Caps& caps, float scale) {
         if (caps.shaderPass) { c.fsr1 = true; c.why = "FSR 1 (chosen; AMD FidelityFX EASU + RCAS, upscaling only)"; }
         else c.why = "FSR 1 chosen, but the renderer cannot draw its passes here: off";
         return c;
+    case Mode::Cas:
+        if (caps.shaderPass) { c.cas = true; c.why = "CAS (chosen; contrast adaptive sharpening, once a game frame)"; }
+        else c.why = "CAS chosen, but the renderer cannot draw its pass here: off";
+        return c;
     case Mode::Dlss:  // (no longer offered: a saved "dlss" runs as Auto)
     case Mode::Auto:
     default:
         // the compositor's upscale first (no cost to the app's frame); DLSS where the settings file turned it on (no
         // menu offers it; never two upscalers); else SGSR1 wherever the eye picture is upscaled (the Steam Frame, a
         // PC); else the blit
-        if (caps.superResolution) { c.superResolution = true; c.why = "Quest Super Resolution (auto: Meta's runtime)"; }
+        // (2026-11-11) on a standalone headset (a Quest, the Steam Frame) CAS, the renderer's own sharpening once a game
+        // frame: on a Quest before Super Resolution (the compositor's, about 0.7 ms of the GPU at every refresh: three a
+        // frame at 30 fps on 90 Hz; AstroQuest's choice, measured too cheap to see), on the Frame in place of SGSR1
+        if (caps.standalone && caps.shaderPass) {
+            c.cas = true;
+            c.why = caps.superResolution ? "CAS (auto: a Quest; the renderer's own sharpening once a frame)"
+                                         : "CAS (auto: standalone headset; the renderer's own sharpening once a frame)";
+        } else if (caps.superResolution) { c.superResolution = true; c.why = "Quest Super Resolution (auto: Meta's runtime)"; }
         else if (caps.dlss) { c.dlss = true; c.why = "DLSS (auto: turned on in the settings file)"; }
         else if (caps.shaderPass && scale > 1.05f) {
             c.sgsr1 = true;

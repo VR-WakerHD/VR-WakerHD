@@ -684,6 +684,41 @@ std::vector<PartInfo> describe(const std::vector<uint8_t>& linkBfres) {
     return out;
 }
 
+// (VR tool, 2026-11-15) one model's vertex positions per shape, in model space (the bind pose): an item's geometry
+std::vector<std::pair<std::string, std::vector<std::array<double, 3>>>> shape_points(const std::vector<uint8_t>& linkBfres,
+                                                                                     const std::string& model) {
+    Bfres f;
+    f.d = linkBfres;
+    std::vector<std::pair<std::string, std::vector<std::array<double, 3>>>> out;
+    for (auto& [n, fm] : f.group(f.section(0))) {
+        if (n != model) continue;
+        const auto bones = hd_skeleton(f, fm);
+        const size_t vbl = f.rel(fm + 16);
+        for (auto& [sn, so] : f.group(f.rel(fm + 20))) {
+            const int skin = f.u8(so + 0x16);
+            const Bone& bone = bones.at(f.u16(so + 0x10));
+            const size_t vb = vbl + f.u16(so + 0x12) * 0x20, al = f.rel(vb + 0x10), bl = f.rel(vb + 0x18);
+            const uint32_t cnt = f.u32(vb + 8);
+            int off = -1;
+            for (int k = 0; k < f.u8(vb + 4); k++)
+                if (f.str(f.rel(al + k * 12)) == "_p0") off = f.u16(al + k * 12 + 6);
+            std::vector<std::array<double, 3>> pts;
+            if (off >= 0) {
+                const int st = f.u16(bl + 0xC);
+                const size_t data = f.rel(bl + 0x14);
+                for (uint32_t i = 0; i < cnt; i++) {
+                    const size_t q = data + (size_t)i * st + off;
+                    Vec3 pp{f.f32(q), f.f32(q + 4), f.f32(q + 8)};
+                    const Vec3 w = skin ? pp : mat_apply(bone.world, pp);
+                    pts.push_back({w[0], w[1], w[2]});
+                }
+            }
+            out.push_back({sn, pts});
+        }
+    }
+    return out;
+}
+
 std::vector<uint8_t> assemble(const std::vector<uint8_t>& pack, const std::vector<uint8_t>& linkSzs, std::string& error) {
     try {
         return sarc_replace(pack, {{"Link.szs", linkSzs}});

@@ -128,6 +128,14 @@ DeferredCommands partBPreCommands{DeferredCommands::Limits{std::numeric_limits<s
                                                            std::numeric_limits<size_t>::max()}};
 PodCommands partBPrePodCommands{PodCommands::Limits{std::numeric_limits<size_t>::max(),
                                                     std::numeric_limits<size_t>::max()}};
+// (docs/VR_HANDS_LAYER_PLAN.md) Link's span: his draws' commands from the scene's thread, both eyes, held and emitted at
+// the join (hands_thread_join_emit), after the render thread's
+DeferredCommands handsCommands0{DeferredCommands::Limits{std::numeric_limits<size_t>::max(),
+                                                         std::numeric_limits<size_t>::max()}};
+PodCommands handsPods0{PodCommands::Limits{std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max()}};
+DeferredCommands handsCommands1{DeferredCommands::Limits{std::numeric_limits<size_t>::max(),
+                                                         std::numeric_limits<size_t>::max()}};
+PodCommands handsPods1{PodCommands::Limits{std::numeric_limits<size_t>::max(), std::numeric_limits<size_t>::max()}};
 DeferredCommands* held_stream(DeferredCommands& commands, PodCommands& pod, const char* what) {
     if (!commands.capturing()) {
         if (!commands.command_count()) commands.hold_in(&pod);
@@ -224,6 +232,11 @@ void disable(const char* why) {
     if (!g_disabled.exchange(true)) LOG("[vulkan stereo] sun atlas thread: off for this session (%s)", why);
 }
 bool disabled() { return g_disabled.load(); }
+void hands_conflict(const Surface* s, const char* what) {  // (atlas_overlap.h hands_mark)
+    if (!g_handsSpanOff.exchange(true))
+        LOG("[vr hands] Link's span: off for this session (surface %08X %ux%u%s, %s, by both threads in one span)", s->addr,
+            s->width, s->height, s->isDepth ? " depth" : "", what ? what : "?");
+}
 void conflict(const Surface* s) {
     if (!g_disabled.load())
         LOG("[vulkan stereo] sun atlas thread: surface %08X (%ux%u, %u slices, format %X%s%s) used after the render thread "
@@ -388,6 +401,14 @@ void stereo_atlas_join_held(AtlasEmit why) {
     if (atlas_thread::running()) join_atlas_thread(why);
     else stereo_atlas_emit_held(why);
 }
+DeferredCommands* stereo_hands_stream(int eye) {
+    return eye ? held_stream(handsCommands1, handsPods1, "Link's held commands (eye 1) cannot be emitted out of order")
+               : held_stream(handsCommands0, handsPods0, "Link's held commands (eye 0) cannot be emitted out of order");
+}
+void stereo_hands_emit() {
+    emit_held(handsCommands0);
+    emit_held(handsCommands1);
+}
 namespace {
 // (diagnostics) parts, and why each was emitted: its pass ended, or AtlasEmit's reasons (Flush, InOrder, Eye, Other, ...)
 uint64_t g_partHolds = 0, g_partJoins[int(AtlasEmit::Count) + 1] = {}, g_partRecordingJoins = 0;
@@ -544,6 +565,8 @@ void stereo_part_site_stats(uint64_t (&sites)[int(PartJoinSite::Count)]) {
     for (int i = 0; i < int(PartJoinSite::Count); ++i) sites[i] = g_partSites[i], g_partSites[i] = 0;
 }
 void stereo_part_hold() {
+    // (docs/VR_HANDS_LAYER_PLAN.md) Link's span on the scene's thread joined first: the part takes that thread
+    if (!draw_threads::on_draw_thread() && !partHolding) hands_thread_join_emit();
     // only from the renderer's own stream: nothing else held, no redirect active, eye 0 selected
     if (partHolding || !streaming() || stereoEye() != 0 || atlasHolding || sceneHolding || stereo_eye_segments() ||
         eye_thread::running() || draw_threads::on_draw_thread() || eye_deferred_commands() != nullptr)
