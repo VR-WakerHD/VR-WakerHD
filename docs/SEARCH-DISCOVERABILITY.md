@@ -65,11 +65,11 @@ The repository's main page and README never came up. The only page in the index 
 
 | Change | Cause it addresses | Status |
 |---|---|---|
-| README rewritten: "Wind Waker HD VR" in the title and first lines, the relationship to ZeldaWWHDRecomp, accurate status | 2, 4 | Done (published with the next release) |
-| Install, compatibility, Quest, features, FAQ, development pages | 2, 4 | Done (next release) |
-| `llms.txt`, `docs/project-info.json` | 2 (once crawled) | Done (next release) |
-| GitHub description with "Zelda", 19 topics | 2 | Proposed; needs the maintainer's approval |
-| GitHub Pages site with a sitemap, submitted to Google Search Console and Bing Webmaster Tools | 1 | Built (`site/`); needs Pages turned on and the submissions made by the maintainer |
+| README rewritten: "Wind Waker HD VR" in the title and first lines, the relationship to ZeldaWWHDRecomp, accurate status | 2, 4 | **Published 2026-11-20** |
+| Install, compatibility, Quest, features, FAQ, development pages | 2, 4 | **Published 2026-11-20** |
+| `llms.txt`, `docs/project-info.json` | 2 (once crawled) | **Published 2026-11-20** |
+| GitHub description with "Zelda", 19 topics, the website as the homepage | 2 | **Done 2026-11-20** |
+| GitHub Pages site with a sitemap, submitted to Google Search Console and Bing Webmaster Tools | 1 | **Live 2026-11-20** at https://vr-wakerhd.github.io/VR-WakerHD/; Search Console and Bing Webmaster Tools submissions still to do (the maintainer's accounts) |
 | Upstream cross-link request, mod-hub reply, news tips | 3 | Texts ready in [PROMOTION.md](PROMOTION.md); the maintainer posts them |
 
 ## Monthly search test
@@ -113,6 +113,7 @@ found".
 | 2026-11-20 | GitHub | 4, 5, 18, 22 | Yes for 4, 5, 22; no for 18 | 1st (4), 16th (5) | upstream port, randomizers | "Zelda" missing from the description |
 | 2026-11-20 | Google | all | not checked | | | |
 | 2026-11-20 | Bing | all | not checked | | | |
+| 2026-11-20 (after publishing) | GitHub | 4, 18, `topic:wind-waker` | Yes for 4 and the topic; not yet for "vr zelda" / 18 | 1st (4), 9th of 16 (topic) | | the new description was not in GitHub's search index yet |
 
 ### Monthly checklist
 
@@ -123,6 +124,11 @@ found".
 - [ ] Keep `llms.txt`, `docs/project-info.json` and the site's facts in step with the latest release.
 - [ ] Check new outside references (articles, listings, videos) and add them below.
 - [ ] Note any new competing Wind Waker VR project.
+
+**How the site is served.** GitHub Actions is turned off on the public repository, so the site is served by GitHub
+Pages from the `gh-pages` branch (four files and `.nojekyll`), not by `.github/workflows/pages.yml`. After changing
+`site/` on `main`, copy its files to `gh-pages` and push. If Actions is ever turned on, switch Pages' source to "GitHub
+Actions" and the workflow takes over.
 
 The workflow `.github/workflows/docs-check.yml` checks the documentation's links, the JSON, the sitemap and that the
 project's description matches across files on every change. It does not search the web.
