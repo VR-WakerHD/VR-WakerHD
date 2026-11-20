@@ -31,7 +31,6 @@ docs/FAQ.md
 docs/FEATURES.md
 docs/INSTALLATION.md
 docs/NR_BRIDGE_ANALYSIS.md
-docs/PROMOTION.md
 docs/QUEST.md
 docs/SEARCH-DISCOVERABILITY.md
 docs/VR_AIMING.md

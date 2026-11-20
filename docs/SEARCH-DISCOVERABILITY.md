@@ -70,7 +70,6 @@ The repository's main page and README never came up. The only page in the index 
 | `llms.txt`, `docs/project-info.json` | 2 (once crawled) | **Published 2026-11-20** |
 | GitHub description with "Zelda", 19 topics, the website as the homepage | 2 | **Done 2026-11-20**; "port", "mod" and "head tracking" added to the description that evening |
 | GitHub Pages site with a sitemap, submitted to Google Search Console and Bing Webmaster Tools | 1 | **Live 2026-11-20** at https://vr-wakerhd.github.io/VR-WakerHD/; Search Console and Bing Webmaster Tools submissions still to do (the maintainer's accounts) |
-| Upstream cross-link request, mod-hub reply, news tips | 3 | Texts ready in [PROMOTION.md](PROMOTION.md); the maintainer posts them |
 
 ## Monthly search test
 
@@ -141,4 +140,4 @@ project's description matches across files on every change. It does not search t
 |---|---|---|---|
 | | | | |
 
-See also: [PROMOTION.md](PROMOTION.md) · [back to the README](../README.md)
+See also: [back to the README](../README.md)

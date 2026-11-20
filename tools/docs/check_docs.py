@@ -15,7 +15,7 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 # the documents players and search engines read (the older technical docs are not held to this check)
 DOCS = ["README.md", "llms.txt", "LICENSE-VR.md", ".github/RELEASE_TEMPLATE.md"] + [
     "docs/" + f for f in ("INSTALLATION.md", "COMPATIBILITY.md", "QUEST.md", "FAQ.md", "FEATURES.md", "PLAYING.md",
-                          "BUILDING.md", "DEVELOPMENT.md", "PROMOTION.md", "SEARCH-DISCOVERABILITY.md",
+                          "BUILDING.md", "DEVELOPMENT.md", "SEARCH-DISCOVERABILITY.md",
                           "diagnosis/README.md")]
 REPO = "https://github.com/VR-WakerHD/VR-WakerHD"
 SITE = "https://vr-wakerhd.github.io/VR-WakerHD/"
