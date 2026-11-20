@@ -68,7 +68,7 @@ The repository's main page and README never came up. The only page in the index 
 | README rewritten: "Wind Waker HD VR" in the title and first lines, the relationship to ZeldaWWHDRecomp, accurate status | 2, 4 | **Published 2026-11-20** |
 | Install, compatibility, Quest, features, FAQ, development pages | 2, 4 | **Published 2026-11-20** |
 | `llms.txt`, `docs/project-info.json` | 2 (once crawled) | **Published 2026-11-20** |
-| GitHub description with "Zelda", 19 topics, the website as the homepage | 2 | **Done 2026-11-20** |
+| GitHub description with "Zelda", 19 topics, the website as the homepage | 2 | **Done 2026-11-20**; "port", "mod" and "head tracking" added to the description that evening |
 | GitHub Pages site with a sitemap, submitted to Google Search Console and Bing Webmaster Tools | 1 | **Live 2026-11-20** at https://vr-wakerhd.github.io/VR-WakerHD/; Search Console and Bing Webmaster Tools submissions still to do (the maintainer's accounts) |
 | Upstream cross-link request, mod-hub reply, news tips | 3 | Texts ready in [PROMOTION.md](PROMOTION.md); the maintainer posts them |
 
@@ -114,6 +114,8 @@ found".
 | 2026-11-20 | Google | all | not checked | | | |
 | 2026-11-20 | Bing | all | not checked | | | |
 | 2026-11-20 (after publishing) | GitHub | 4, 18, `topic:wind-waker` | Yes for 4 and the topic; not yet for "vr zelda" / 18 | 1st (4), 9th of 16 (topic) | | the new description was not in GitHub's search index yet |
+| 2026-11-20 (evening) | GitHub | 1-22 | Yes in 15 of 22 | **1st** for 3, 4, 5, 8, 12, 16, 17, 18, 19, 20, 22; 2nd for 13, 21; 3rd for 10 | upstream port and its mods, SwitchWakerHD, Android forks | missing for 1, 2, 6, 7, 9, 11, 14, 15: "mod", "port", "modifications", "head tracking", "games" were not in the description; "port", "mod" and "head tracking" added to it the same evening |
+| 2026-11-20 (evening) | AI web search | 5 (variant "Wind Waker HD VR open source"), the site's address | No | not found | the upstream port's mods README, decompilations, Dolphin VR, BetterVR | hours after publishing: not crawled yet |
 
 ### Monthly checklist
 
