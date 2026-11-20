@@ -1,0 +1,51 @@
+# VR-WakerHD
+
+> VR-WakerHD is an unofficial, open-source VR version of The Legend of Zelda: The Wind Waker HD (Wii U, 2013), built on
+> ZeldaWWHDRecomp, the native PC port (static recompilation) of the game. It adds an OpenXR VR mode: first person at
+> Link's eyes with 6DoF head tracking, motion controllers with Link's arms following them, a physical sword, a
+> shoulder item wheel and a wrist HUD. It runs on PC VR (Windows and Linux) and standalone on Meta Quest 3 and 3S. No
+> game is included: players need their own copy of the Wii U game, and setup builds it on their own device.
+
+Key facts:
+
+- Name: VR-WakerHD. Also called: ZeldaWWHD-VR (earlier name), Wind Waker HD VR, Wind Waker VR port.
+- Repository: https://github.com/VR-WakerHD/VR-WakerHD
+- Website: https://vr-wakerhd.github.io/VR-WakerHD/
+- Built on: ZeldaWWHDRecomp (https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp). That project is the flat-screen
+  native port; VR-WakerHD is a separate VR-focused project built on it, not the same project.
+- Not affiliated with Nintendo or with the ZeldaWWHDRecomp authors.
+- Not an emulator and not a VR injector: the game's code is recompiled to native code, and the VR is built into the
+  renderer and game logic.
+- VR API: OpenXR with the Vulkan renderer (XR_KHR_vulkan_enable2).
+- Platforms: Windows x86-64 (zip), Linux x86-64 (AppImage), Meta Quest 3 / 3S standalone (APK), Steam Frame / SteamOS
+  arm64 (AppImage, not yet confirmed on the device). No VR on macOS.
+- Runtimes tested: SteamVR (Windows, Linux), Monado (Linux), Meta Quest Link. Virtual Desktop and Air Link streaming
+  are experimental.
+- Headsets tested most: PlayStation VR2, Meta Quest 3 / 3S.
+- Status: experimental, in active development; latest release 0.5.1 (November 2026).
+- License: the VR mode is GPL-3.0-or-later with a credit term ("VR mode by VR-WakerHD"); the original port's code is
+  MPL-2.0.
+
+## Docs
+
+- [README](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/README.md): overview, features, platforms, credits, legal
+- [Installation](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/INSTALLATION.md): install from a release on Windows, Linux, SteamOS and Quest
+- [Features](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/FEATURES.md): first person, motion controls, sword, items, interface, comfort, graphics
+- [Compatibility](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/COMPATIBILITY.md): headsets, OpenXR runtimes and platforms, with test status
+- [Quest 3 / 3S guide](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/QUEST.md): standalone install, settings, performance
+- [Playing and controls](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/PLAYING.md): VR launcher, controller mapping, sword, item wheel
+- [FAQ and troubleshooting](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/FAQ.md)
+- [Building from source](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/BUILDING.md): Windows, Linux, Arch Linux
+- [Development](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/DEVELOPMENT.md): code layout, tests, the upstream project
+- [All VR settings](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/VR_SETTINGS.md)
+- [VR architecture](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/VR_ARCHITECTURE.md)
+
+## Releases
+
+- [All releases and downloads](https://github.com/VR-WakerHD/VR-WakerHD/releases)
+- [Tutorial and gameplay video](https://youtu.be/a98maOC3x24)
+
+## Optional
+
+- [Project information (JSON)](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/project-info.json)
+- [Upstream ZeldaWWHDRecomp README](https://github.com/VR-WakerHD/VR-WakerHD/blob/main/docs/UPSTREAM_README.md)

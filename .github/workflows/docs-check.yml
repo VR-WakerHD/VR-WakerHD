@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# VR mode by VR-WakerHD (https://github.com/VR-WakerHD/)
+# The public documentation and the site (docs/SEARCH-DISCOVERABILITY.md): links between the documents, images, the
+# JSON and sitemap, the site's metadata, and the project's name and description agreeing across files. Offline (no
+# web requests, no search engines); Python's standard library only.
+name: docs-check
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["README.md", "llms.txt", "LICENSE-VR.md", "docs/**", "site/**", ".github/RELEASE_TEMPLATE.md", "tools/docs/check_docs.py"]
+  pull_request:
+    paths: ["README.md", "llms.txt", "LICENSE-VR.md", "docs/**", "site/**", ".github/RELEASE_TEMPLATE.md", "tools/docs/check_docs.py"]
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the documentation and the site
+        run: python3 tools/docs/check_docs.py

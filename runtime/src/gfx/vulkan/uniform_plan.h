@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 VR-WakerHD (https://github.com/VR-WakerHD/). VR mode by VR-WakerHD:
 // credit required, see LICENSE-VR.md.
-// Which of a pipeline's uniform blocks are dynamic uniform buffers (QUEST3_IMPLEMENTATION_ROADMAP.md, 2.1; mobile GPUs
+// Which of a pipeline's uniform blocks are dynamic uniform buffers (docs/diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md, 2.1; mobile GPUs
 // only: mobile_gpu.h). Vulkan caps a pipeline layout's dynamic uniform buffers (maxDescriptorSetUniformBuffersDynamic);
 // Adreno reports 8 where NVIDIA reports 15, and the game's shaders bind up to 16 blocks and a support block a stage.
 // Everywhere else a pipeline over the cap binds every block as a plain uniform buffer; then eye 1 cannot replay eye 0's

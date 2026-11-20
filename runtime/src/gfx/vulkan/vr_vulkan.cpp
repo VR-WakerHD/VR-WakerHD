@@ -1000,7 +1000,7 @@ void log_stats() {
             (unsigned long long)ahead[4], (unsigned long long)ahead[0], (unsigned long long)aheadChanges);
         if (dynres::on()) LOG("[vr] %s", dynres::status().c_str());  // (docs/VR_DYNAMIC_RESOLUTION.md)
 #if defined(__linux__)
-        // (QUEST3_PERFORMANCE_AUDIT.md, memory) Android and Linux: the game's resident memory and its peak, and what
+        // (docs/diagnosis/QUEST3_PERFORMANCE_AUDIT.md, memory) Android and Linux: the game's resident memory and its peak, and what
         // the system still has free; a Quest 3 gives an app about 5.75 GiB, and Android ends an app that runs it short
         {
             auto field = [](const char* path, const char* key) -> long long {
@@ -1105,7 +1105,7 @@ VkResult create_instance(const VkInstanceCreateInfo& ci, VkInstance* out) {
     if (!g_tried) vr::load_settings();  // vr.enabled decides (with --vr / --no-vr / WWHD_VR) whether to try
     if (!g_tried && vr::wanted()) {
         g_tried = true;
-        // (STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md, "Valve's layers") SteamOS's launch wrapper on the Steam Frame adds its own
+        // (docs/diagnosis/STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md, "Valve's layers") SteamOS's launch wrapper on the Steam Frame adds its own
         // Vulkan layers to every game through VK_INSTANCE_LAYERS (VK_LAYER_VALVE_rpo, VK_LAYER_VALVE_fdm_injection, the
         // latter driven by Steam's per-game Foveated Rendering switch and FDM_DEBUG): logged, so a headset log says whether
         // they were in the process. Nothing is changed
@@ -1205,7 +1205,7 @@ void frame_begin() {
         return;
     }
     if (!g_started) session_started();
-    xs().declare_thread(vr::xr::Session::XrThread::RenderMain);  // (Android: once per session; QUEST3_PERFORMANCE_AUDIT.md)
+    xs().declare_thread(vr::xr::Session::XrThread::RenderMain);  // (Android: once per session; docs/diagnosis/QUEST3_PERFORMANCE_AUDIT.md)
     const auto waitStart = std::chrono::steady_clock::now();
     g_frame = xs().begin_frame(g_shouldRender);
     // (the camera's base: display_time; with the swap being executed now, render::swap from OP_SWAP: executed + 1)

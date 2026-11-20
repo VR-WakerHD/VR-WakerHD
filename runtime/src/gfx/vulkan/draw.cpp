@@ -4903,7 +4903,7 @@ const char* const multiviewWhyNames[kMvCount] = {"drawn for both eyes", "not now
 #endif
 };
 #ifdef WWHD_MOBILE_GPU_PATHS
-// (QUEST3_IMPLEMENTATION_ROADMAP.md, mixed passes) a two-eye image written one eye at a time recently (kMixHoldFrames) takes
+// (docs/diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md, mixed passes) a two-eye image written one eye at a time recently (kMixHoldFrames) takes
 // no multiview draws: a tiled GPU's passes then never write one image both ways in a frame (both layers in one pass, one
 // layer in another: the black squares on Quest 3 came with that mix, docs/VR_ANDROID.md). WWHD_VK_MULTIVIEW_NO_MIX=0 off
 const bool kMultiviewNoMix = [] {

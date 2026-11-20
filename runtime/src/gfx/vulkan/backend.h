@@ -63,7 +63,7 @@ struct Surface {
  uint32_t mvMissDraws=0; uint8_t mvMissWhat=0;
  uint32_t mvHeldDraws=0; uint8_t perEyeWhy=255, perEyeKind=0;
 #ifdef WWHD_MOBILE_GPU_PATHS
- // (QUEST3_IMPLEMENTATION_ROADMAP.md, mixed passes) the last render frame a draw wrote this eye 0 target's two-eye image
+ // (docs/diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md, mixed passes) the last render frame a draw wrote this eye 0 target's two-eye image
  // one eye at a time (not multiview); 0: never. draw.cpp multiview_draw keeps such images per eye for that frame and the
  // next, so a tiled GPU never sees one written both ways in a frame
  uint64_t perEyeFrame=0;

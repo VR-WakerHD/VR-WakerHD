@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# VR mode by VR-WakerHD (https://github.com/VR-WakerHD/)
+# The project's site (site/: one landing page, its sitemap and robots.txt) on GitHub Pages, at
+# https://vr-wakerhd.github.io/VR-WakerHD/. Needs Pages turned on with "GitHub Actions" as the source (repository
+# Settings > Pages). The page links to the docs on GitHub instead of copying them (no duplicate content).
+name: pages
+
+on:
+  push:
+    branches: ["main"]
+    paths: ["site/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Check the site first
+        run: python3 tools/docs/check_docs.py
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

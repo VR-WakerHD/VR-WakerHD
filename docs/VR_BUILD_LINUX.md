@@ -6,9 +6,8 @@ Apache-2.0, SHA-256 checked) for its headers. The game opens the distribution's 
 (`libopenxr_loader.so.1`, then `libopenxr_loader.so`), found through the normal library search path, so
 there is no hard-coded library directory and a build with VR starts without a loader.
 
-Status: the Linux build of VR has **not been compiled or run** in this work (it was built and tested on
-Windows). The code is portable (no Windows-only calls outside `#ifdef _WIN32`, `dlopen` for the loader);
-the commands below are the standard ones and need checking on a Linux machine.
+Status: the Linux VR build is built and played in the headset (Arch Linux / CachyOS, with SteamVR and with native
+Monado), and player releases ship as AppImages (x86-64, and arm64 for SteamOS). The loader is opened with `dlopen`.
 
 For Steam Frame - Native (Linux arm64 on SteamOS arm64, with its own loader next to the game) see
 [VR_STEAM_FRAME.md](VR_STEAM_FRAME.md).

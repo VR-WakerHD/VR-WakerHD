@@ -249,13 +249,13 @@ public:
     // move with the network; the frame-timing shift (vr_vulkan.cpp note_display) and Auto's return to the full rate are
     // left out there. WWHD_VR_STREAMED=1 or 0 forces it (no detection)
     bool streamed() const { return streamed_.load(std::memory_order_relaxed); }
-    // (QUEST3_PERFORMANCE_AUDIT.md) the calling thread declared XR-critical to the runtime, once per session and kind,
+    // (docs/diagnosis/QUEST3_PERFORMANCE_AUDIT.md) the calling thread declared XR-critical to the runtime, once per session and kind,
     // with XR_KHR_android_thread_settings (Android only, when the runtime offers it): the runtime then schedules it as
     // its kind (Meta's runtime: priority and the performance cores). The game thread, the render thread and the
     // end-frame thread call it; a no-op elsewhere
     enum class XrThread : int { GameMain = 0, RenderMain = 1, RenderWorker = 2 };
     void declare_thread(XrThread kind);
-    // (QUEST3_IMPLEMENTATION_ROADMAP.md) the CPU's performance level hinted to the runtime with XR_EXT_performance_settings
+    // (docs/diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md) the CPU's performance level hinted to the runtime with XR_EXT_performance_settings
     // (standalone builds, when offered): Boost while the game is stalled (loads, shaders: the render thread showing its
     // last frame again), back to Sustained High (the runtime's default) after. Render thread; a no-op elsewhere
     void cpu_boost(bool on);

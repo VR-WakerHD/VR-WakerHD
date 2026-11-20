@@ -42,7 +42,7 @@ inline bool env_default_on(const char* name) {
 // draws fall back (docs/VR_ANDROID.md, "Multiview falls back")
 // On again on a Quest (2026-11-03, the user's choice), with the Quest 3 audit's fixes for its fallback and its black
 // squares (mobile GPU builds: uniform_plan.h, the multiview twin within the cap, and draw.cpp's mixed-pass guard,
-// kMultiviewNoMix, on by default with it): QUEST3_IMPLEMENTATION_ROADMAP.md 2.1. Other Android devices stay off.
+// kMultiviewNoMix, on by default with it): docs/diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md 2.1. Other Android devices stay off.
 // WWHD_VK_MULTIVIEW=0 in env.txt turns it off on a Quest
 // (2026-11-04, the user's choice) Steam Frame - Lepton takes the Quest 3's standalone settings: on there too
 // (quest_theater::standalone_headset: a Quest or Lepton); phones stay off

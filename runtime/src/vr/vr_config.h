@@ -374,7 +374,7 @@ struct Config {
     int desktopView = 0;
     bool desktopViewFill = false;
     // SGSR1's edge sharpness, 1 (soft) .. 2 (Qualcomm's default); 1.5 on the Steam Frame (2026-11-03: 2 may halo the
-    // game's dark outlines; STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md section 6)
+    // game's dark outlines; docs/diagnosis/STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md section 6)
     float upscaleSharpness = kSteamFrameBuild ? 1.5f : 2.0f;
     // CAS's sharpness (vr.upscaler cas, the Quest's auto since 2026-11-11), 0 (soft) .. 1 (AMD's strongest); 0.5
     float casSharpness = 0.5f;

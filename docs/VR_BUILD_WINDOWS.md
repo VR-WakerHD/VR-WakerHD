@@ -1,7 +1,7 @@
 # VR mode: building on Windows
 
 VR is part of the normal Vulkan build (`WWHD_VR=ON` by default). It needs nothing beyond the
-[README's Windows build](../README.md#windows): CMake downloads the pinned Khronos OpenXR SDK
+[the Windows build in BUILDING.md](BUILDING.md#building-on-windows): CMake downloads the pinned Khronos OpenXR SDK
 (release-1.1.63, Apache-2.0, SHA-256 checked) and builds its loader, `openxr_loader.dll`, which is copied
 next to `wwhd.exe` (`WWHD_VR_BUILD_LOADER=ON` by default on Windows). The game opens the loader at run time,
 so a build with VR still starts without it.

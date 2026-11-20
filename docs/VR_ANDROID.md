@@ -294,7 +294,7 @@ log names fixed), so the images are never written both ways in a frame.
 
 ## Multiview's uniform limit and mixed passes (2026-11-03, mobile GPU builds only)
 
-From the Quest 3 audit (QUEST3_PERFORMANCE_AUDIT.md, QUEST3_IMPLEMENTATION_ROADMAP.md 2.1): compiled only into mobile GPU
+From the Quest 3 audit (diagnosis/QUEST3_PERFORMANCE_AUDIT.md, diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md 2.1): compiled only into mobile GPU
 builds (`mobile_gpu.h`: Android, arm64, or a desktop test build with `-DWWHD_TEST_MOBILE_GPU_PATHS=ON`); Windows and
 Linux on x64 keep their code. **Multiview is on by default on a Quest (standalone) again, with these fixes and the
 mixed-pass guard** (the user's choice, 2026-11-03; `stereo_switches.h` `multiview_default_on`: `quest_theater::device()`);

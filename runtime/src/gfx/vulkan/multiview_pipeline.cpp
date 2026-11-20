@@ -39,7 +39,7 @@ std::atomic<uint64_t> g_built{0}, g_failed{0};
 bool make(Job& job, std::string& error) {
     Pipeline& out = *job.out;
 #ifdef WWHD_MOBILE_GPU_PATHS
-    // (QUEST3_IMPLEMENTATION_ROADMAP.md 2.1) the twin's layout must fit the device's dynamic uniform buffer cap too: each
+    // (docs/diagnosis/QUEST3_IMPLEMENTATION_ROADMAP.md 2.1) the twin's layout must fit the device's dynamic uniform buffer cap too: each
     // per-view block holds two descriptors, so a pipeline near the cap (Adreno: 8) made a twin over it, an invalid layout
     // a driver need not reject. Over it the twin fails, and its draws stay per eye (kMvFailed), as the motion twins do
     {

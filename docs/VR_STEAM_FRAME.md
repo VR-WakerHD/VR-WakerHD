@@ -109,7 +109,7 @@ cmake --preset steam-frame-native && cmake --build --preset steam-frame-native
 ## Defaults and launch advice (2026-11-03)
 
 Defaults of the Steam Frame builds (Native and Lepton; a saved `settings.ini` value still wins), from
-STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md:
+diagnosis/STEAM_FRAME_VR_OPTIMIZATION_AUDIT.md:
 - **Frame synthesis off** (`vr.frameSynthesis=off`) until it is tested on the Frame: a player's run with it on smeared
   and tore; QuakeVR's Frame port ships it off after artifacts. `on` or `auto` in F1 > VR or the launcher still try it.
 - **Dynamic resolution profiles top out at the fixed 0.75x** (docs/VR_DYNAMIC_RESOLUTION.md); Custom can go higher.
