@@ -19,9 +19,50 @@ PC VR headsets through OpenXR (SteamVR, Meta Quest Link, Virtual Desktop, Monado
 
 [![The Legend of Zelda Wind Waker HD VR: (VR-WakerHD) Tutorial + Gameplay #1 (video on YouTube)](https://img.youtube.com/vi/a98maOC3x24/hqdefault.jpg)](https://youtu.be/a98maOC3x24)
 
-**[The Legend of Zelda Wind Waker HD VR: (VR-WakerHD) Tutorial + Gameplay! #1](https://youtu.be/a98maOC3x24)** (YouTube): how to
-play the Wind Waker HD VR port, with first-person gameplay in the headset. It shows the controls, the motion-controlled
-sword and the in-headset menus.
+**[The Legend of Zelda Wind Waker HD VR: (VR-WakerHD) Tutorial + Gameplay! #1](https://youtu.be/a98maOC3x24)** was made
+by [legaiaflame](https://www.youtube.com/@legaiaflame), who also tests VR-WakerHD and reports its bugs. The 52-minute
+video opens with a four-minute tutorial that shows every VR control in the headset, then plays VR-WakerHD from the
+Great Sea through Dragon Roost Cavern, the Forbidden Woods and the Tower of the Gods to the Master Sword, with real
+sword fights, boss battles and sailing.
+
+What the tutorial teaches, in order ([watch from 0:12](https://youtu.be/a98maOC3x24?t=12)):
+
+- **Settings:** click the left stick for the VR options menu (sliders, mods and cheats).
+- **Views:** click the right stick to switch between first person and third person.
+- **The HUD on your wrists:** turn your hands over to see your hearts and rupees.
+- **Ducking and crawling:** push the right stick down.
+- **Sword:** reach behind your right shoulder, hold the right grip and pull forward to draw it, then swing it yourself.
+- **Shield:** raise it to block attacks.
+- **Lock-on:** the left trigger targets an enemy. Hold and release B (Circle) for a spin attack.
+- **Item wheel:** hold the right trigger, pick an item with the right stick and let go to bring it out. (In the video,
+  reaching over the left shoulder with the grip brings back the last item; now it opens the item wheel too.)
+- **Bow:** hold the left grip to pull the string, release to shoot.
+- **Bombs:** throw them with a forward motion of your hand.
+- **Hookshot and boomerang:** aim by pointing your hand, fire with a trigger.
+- **Wind Waker:** wait a second, then conduct with your right hand (left, right, up, down, middle, or hold the right
+  trigger); move your left hand to the left to change the beat.
+- **Sailing** ([4:05](https://youtu.be/a98maOC3x24?t=245)): the four boat views, then sailing at full speed.
+
+Chapters (each link opens the video at that point):
+
+| Time | Chapter |
+|---|---|
+| [0:12](https://youtu.be/a98maOC3x24?t=12) | Tutorial: the VR features |
+| [4:05](https://youtu.be/a98maOC3x24?t=245) | Setting sail: the four boat views |
+| [6:06](https://youtu.be/a98maOC3x24?t=366) | Sailing at full speed |
+| [8:30](https://youtu.be/a98maOC3x24?t=510) | Dragon Roost Cavern |
+| [12:37](https://youtu.be/a98maOC3x24?t=757) | Boss: Gohma |
+| [17:37](https://youtu.be/a98maOC3x24?t=1057) | Forest Haven: the Great Deku Tree |
+| [18:55](https://youtu.be/a98maOC3x24?t=1135) | Forbidden Woods |
+| [27:43](https://youtu.be/a98maOC3x24?t=1663) | Boss: Kalle Demos |
+| [30:54](https://youtu.be/a98maOC3x24?t=1854) | Fairy Fountain |
+| [32:52](https://youtu.be/a98maOC3x24?t=1972) | Tower of the Gods |
+| [36:16](https://youtu.be/a98maOC3x24?t=2176) | Mini-boss: Darknut |
+| [39:48](https://youtu.be/a98maOC3x24?t=2388) | Boss: Gohdan, the Great Arbiter |
+| [45:21](https://youtu.be/a98maOC3x24?t=2721) | Hyrule Castle: the Master Sword awaits |
+
+(Recorded with an earlier version. 0.6.0 adds to it: only real swings of the sword count, and the bow can now switch
+between fire, ice and light arrows. See [Controls](docs/PLAYING.md) for the current controls.)
 
 ## What is VR-WakerHD?
 
