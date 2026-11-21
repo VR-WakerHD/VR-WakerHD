@@ -115,7 +115,7 @@ numbers are clamped to the ranges below.
 | `vr.swingMinTime` | 0.05 | 0 .. 0.3 s | time above the start speed before it counts |
 | `vr.swingCooldown` | 0.25 | 0 .. 1.5 s | after a swing, before the next can start |
 | `vr.hapticStrength` | 0.6 | 0 .. 1 | vibration on sword hits (0: off) |
-| `vr.cutsceneFollow` | 1 | 0/1 | events: game camera position + your head's rotation (0: flat, head-locked) |
+| `vr.cutsceneFollow` | 1 | 0/1 | events: game camera position + your head's rotation and movement (up to 0.5 m; 0: flat, head-locked) |
 | `vr.showBody` | 0 | 0/1 | draw Link's head too in first person |
 | `vr.trackedSword` | 1 | 0/1 | draw the sword at your hand (0: where Link's animation holds it) |
 | `vr.debugCollision` | 0 | 0/1 | reserved for the collision visualisation (not implemented yet) |
@@ -224,6 +224,9 @@ the sky) and Link "caught up" 40 m. Now (`Session::locate_views`):
   it lower; the reach grown to 1.45 m after 0.47 s took that as "back", and the view sank through the floor ("looks
   like he's falling through the level"). Upwards it grows as before, since that is how the tracker corrects an
   estimate that drifted down.
+- A last position more than 10 m from the tracking space's origin was never a head in the room, so a jump away from it
+  is taken at once. Sony's SteamVR driver reports the head about 43 m out (a fixed stand-in) until its tracking locks;
+  the jump to the real head was held for 10 s (2026-11-18), and the view turned with the head but did not move with it.
 - The view never goes under the ground Link stands on: at least 15 units (about 15 cm) above his feet, or half his
   eye height when that is lower (crawling), whatever the tracking says (`vr_camera.h` `hold_above_floor`). It catches
   what the jump rule cannot, such as an estimate sinking slower than a head moves. The 10 s summary logs
@@ -295,7 +298,7 @@ cutscenes and menus keep their own cameras in either mode. The click itself no l
 sword hand's stick click on Minus for right-handed play; a binding chosen in the launcher can put Minus on another
 action.
 
-While Link sails the King of Red Lions on the Great Sea, the click goes first person → third person → **the King of
+While Link sails the King of Red Lions on the Great Sea or in the Tower of the Gods, the click goes first person → third person → **the King of
 Red Lions' neck** → **Free Roam Camera** → first person. The neck view stands just over the figurehead's head (look down
 to see its eyebrows and head), facing ahead, with no HUD; there you look round as in first person, with your head or by turning with the right stick (smooth or
 snap, `vr.turn`). The Free Roam Camera starts above and behind the boat, with no HUD, no label and Link not drawn; the left trigger zooms it in towards
@@ -751,6 +754,12 @@ view, the left grip held makes the right stick the D-pad: pushed past half its r
 D-pad up, down, left or right, and the camera keeps still meanwhile. The right grip with the left stick stays the D-pad
 too. Not with the left hand at its shoulder (the item wheel's reach) or the wheel up. Logged: `[vr] boat: the left grip
 held, the right stick is the D-pad: ...`. Not yet tried in the headset.
+
+**Not with the bow (2026-11-20).** A player's video ("Bow plus Analog takes Cannon Out"): on the boat, in the default
+first-person view and the King of Red Lions view, the left grip held to draw the bow's string and the right stick
+pushed left or right (to turn) pressed D-pad left or right and took out the cannon or the grappling hook, and the view
+did not turn. While the bow is in Link's hand the left grip is its string, not a D-pad, and the right stick turns; the
+right grip's D-pad with the left stick is unchanged.
 
 **First person: the raised shield guards by itself when locked on (2026-11-10).** Asked for: "when the player raises his
 shield and is locked on to an enemy then the player should also be in guard mode; if there is no enemy then the player

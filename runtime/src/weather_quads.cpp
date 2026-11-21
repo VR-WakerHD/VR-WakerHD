@@ -58,7 +58,15 @@ WEATHER_QUAD_HOOK(0257F804)  // dKankyo_rain_Packet::renderSplashes
 WEATHER_QUAD_HOOK(0257FB4C)  // dKankyo_rain_Packet::renderStreaks
 WEATHER_QUAD_HOOK(02580870)  // dKankyo_snow_Packet::renderSplashes
 WEATHER_QUAD_HOOK(02580B98)  // dKankyo_snow_Packet::renderParticles
-WEATHER_QUAD_HOOK(02581060)  // dKankyo_star_Packet::setColor (its stars' draws)
+// dKankyo_star_Packet::setColor (its stars' draws); in VR one draw a colour when the stars were built here
+// (interp.cpp, docs/VR_STARS_BATCH_PLAN.md)
+extern "C" void f_02581060_orig(Cpu* c);
+bool interp_vr_star_set_color(Cpu* c, uint32_t packet, uint32_t colorIndex);
+extern "C" void hook_02581060(Cpu* c) {
+    weather_quads::Scope scope;
+    if (interp_vr_star_set_color(c, c->r[3], c->r[4])) return;
+    f_02581060_orig(c);
+}
 WEATHER_QUAD_HOOK(025817B0)  // dKankyo_poison_Packet::render
 WEATHER_QUAD_HOOK(02581C34)  // dKankyo_housi_Packet::render (the floating sparkles)
 WEATHER_QUAD_HOOK(025820F4)  // dKankyo_cloud_Packet::render (cloud shadows)

@@ -675,6 +675,18 @@ its drop, a barrel's search or a door's open; the game's own throw, arc and anim
 At most one every `kCarryThrowGap` (15) steps. A still throws as before. `[vr] carried: thrown by a throwing motion`
 logs it. Not yet tried in the headset.
 
+## The Deku Leaf's shield and the Skull Hammer's left hand (2026-11-20)
+
+From a player's headset video ("WWVR Deku and Hammer Issues"):
+
+- **Deku Leaf: right stick down raised the shield.** In first person right stick down is ZR, and holding the leaf ZR is
+  the game's guard: the shield came up in the left hand with the leaf still held. ZR is not given while the leaf is
+  out in first person (`leafOut`, with the other items that take the right stick).
+- **Skull Hammer: the left hand flipped round.** The game holds the hammer in Link's left hand, VR in the right. The
+  left hand kept the game's two-handed hold, so its turn was the run and turn animation's, and it flipped over as Link
+  moved and turned (both sticks pushed opposite ways). The hammer now joins the bow, the Hookshot and the Deku Leaf:
+  that hand is held rigidly to its controller (`bowHand` in `link_arms`), and turns only as your hand does.
+
 ## The Deku Leaf over the head while gliding (2026-11-03)
 
 Gliding (`daPyProc_FAN_GLIDE_e`, 0x93), Link's arms take the game's pose (as for carrying something overhead), so the

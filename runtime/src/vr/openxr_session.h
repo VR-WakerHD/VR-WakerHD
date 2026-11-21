@@ -140,6 +140,19 @@ public:
     // xrWaitFrame + xrBeginFrame; false when the session does not run. shouldRender: the runtime shows
     // this frame (otherwise end_frame without layers)
     bool begin_frame(bool& shouldRender);
+    // (docs/VR_RUNTIME_PACING_PLAN.md) xrWaitFrame for the next frame, ahead of its begin_frame (which takes it; with
+    // none waited it waits itself). A no-op while one is waited. One thread at a time
+    bool wait_frame();
+    bool frame_waited() const { return waited_.load(std::memory_order_acquire); }
+    // the waited frame's display time and when xrWaitFrame returned it (valid while frame_waited())
+    XrTime waited_display_time() const { return waitedTime_; }
+    std::chrono::steady_clock::time_point waited_at() const { return waitedAt_; }
+    // (vr_vulkan.cpp, the game's own hold on a runtime whose xrWaitFrame does not hold) the waited frame released later
+    void set_waited_at(std::chrono::steady_clock::time_point t) { waitedAt_ = t; }
+    // a runtime time on std::chrono::steady_clock (ns since its epoch), for each frame's deadline; 0: the runtime does
+    // not offer the conversion (XR_KHR_convert_timespec_time / XR_KHR_win32_convert_performance_counter_time)
+    int64_t to_steady_ns(XrTime t) const;
+    bool time_conversion() const { return timeConvExt_; }
     // swapchains: 0 left eye, 1 right eye, kPanel the GamePad panel (made by ensure_panel), kWheel the item wheel
     // (ensure_wheel; docs/VR_ITEM_WHEEL.md)
     static constexpr int kPanel = 2, kWheel = 3, kWrist = 4;  // kWrist: the wrist HUD (ensure_wrist; docs/VR_WRIST_HUD.md)
@@ -399,6 +412,14 @@ private:
     std::atomic<XrDuration> refreshPeriod_{11'111'111};
     std::atomic<float> refreshHz_{0};  // (the headset's rate read at the last xrWaitFrame; 0: not read)
     bool frameBegun_ = false;
+    // the frame xrWaitFrame returned, not yet begun (wait_frame writes, begin_frame reads after end_thread::wait)
+    bool timeConvExt_ = false;
+    PFN_xrVoidFunction timeConv_ = nullptr;
+    std::atomic<bool> waited_{false};
+    XrTime waitedTime_ = 0;
+    XrDuration waitedPeriod_ = 0;
+    bool waitedShouldRender_ = false;
+    std::chrono::steady_clock::time_point waitedAt_{};
     std::mutex trackingMutex_;  // the game thread's locate/sync against session teardown
     // each hand's last valid grip and aim poses, held through short tracking gaps (vr_tracking.h)
     PoseHold gripHold_[2], aimHold_[2];

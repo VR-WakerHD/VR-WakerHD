@@ -9,8 +9,10 @@ the ZeldaWWHDRecomp native port, for PC VR (OpenXR) and standalone Meta Quest 3 
 - **The view at Link's eyes**, in stereo 3D, with full 6DoF head tracking. Leaning is followed, and the world is scaled
   to Link's arms. Details: [VR_FIRST_PERSON_CAMERA.md](VR_FIRST_PERSON_CAMERA.md).
 - **Link turns to face where you look** when you stand still. Walking, he faces where he walks.
+- **True size** *(experimental)*: play at your own height instead of Link's. Your eyes are at your real height in his
+  world, so you stand taller than him, and only his hands are drawn, moving freely with your controllers.
 - **Third person** (right stick click) uses the game's own camera, turned by your head.
-- **Sailing views** on the Great Sea ([VR_SAILING_VIEWS.md](VR_SAILING_VIEWS.md)).
+- **Sailing views** on the Great Sea and in the Tower of the Gods ([VR_SAILING_VIEWS.md](VR_SAILING_VIEWS.md)).
 
 ## Motion controls
 

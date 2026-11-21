@@ -61,6 +61,8 @@
 #include "vr_ik.h"
 #include "vr_locomotion.h"
 #include "vr_swing.h"
+#include "vr_sword_motion.h"
+#include "vr_head_keep.h"
 #include "vr_sword.h"
 #include "vr_baton.h"
 #include "vr_item_wheel.h"
@@ -147,12 +149,16 @@ float link_frame_heading(uint32_t link) {
 // the models the game attaches to Link's hands besides mpEquipItemModel (found at run time by their roots on his
 // hand joints): the sword's hilt (with the blade, on his left hand) and the shield (on his right hand)
 constexpr uint32_t kHiltModel = 0xCF8, kShieldModel = 0xE80;
+// the Master Sword's sheath on his back (podms: PlayerModelState mpPodmsModel, +0xEC of the state at +0xD90; drawn with
+// a Master Sword equipped, 0x39/0x3A/0x3E). The Hero's Sword's sheath is part of his body model (cl)
+constexpr uint32_t kSheathModel = 0xE7C;
 // the Master Sword's glow (mpSwordModel1, item models at +0xD90, +0x3BE8): the game copies the blade's base matrix into
 // it each step (daPy_lk_c's setItemModel) and calculates it in Link's draw (updateDLSetLight); the light-saber emitter
 // of the Chance mode and the soup follows its joint
 constexpr uint32_t kSwordGlowModel = 0x4978;
 constexpr uint32_t kSwordTop = 0x3E4, kSwordRoot = 0x72CC, kSwordPrevTop = 0x72D8, kSwordPrevRoot = 0x72E4;
 constexpr uint32_t kAtCps = 0x7B1C, kCpsStride = 0x138, kCpsGeometry = 0x118, kAtVec = 0x7C;
+constexpr uint32_t kCpsRadius = 0x134;  // the capsule's radius (cM3dGCps at kCpsGeometry: start, end, ..., mRadius +0x1C)
 constexpr uint32_t kPlayCameraInfo = 0x4858, kCameraInfoSize = 0x34, kAttentionStatus = 0x08;
 constexpr uint32_t kCloseCameraStatus = 0x20;  // dCamAttnStts_00000020_e: Link's draw hides head, hair, hat
 constexpr float kStepSeconds = 1.0f / 30.0f;
@@ -335,6 +341,19 @@ constexpr float kSmoothTurnStale = 0.1f;  // seconds: a stick older than this (t
 std::chrono::steady_clock::time_point g_padReadAt{};
 RecenterGesture g_gesture;
 SwingDetector g_swing;
+// the sword hand's sword, measured at the headset's frame rate (docs/VR_SWORD_COMBAT_PLAN.md, stage 1)
+SwordMotion g_swordMotion;
+BladeSwing g_bladeSwing;  // (vr.swordPlayerOnly) real swings of the blade, not light movements (vr_sword_motion.h)
+int g_physicalBaseAtp = 1;
+int g_physicalHits = 0, g_attackHits = 0;
+// (2026-11-20, asked for: "make sure links voice plays with the swings too") Link's own voice at a physical swing's
+// start with vr.swordPlayerOnly, as the game's cuts give it: daPy_lk_c::voiceStart (02443880, the vtable's 0xE4), 0 a
+// normal cut's (procCutA_init's voiceStart(0)), 1 a finishing cut's; kVoiceGapSteps at least between two (a flurry
+// does not stack them; the game's own cuts come no faster)
+// daPy_lk_c::voiceStart 0x02443880: GC(0x02443880) at its call (the build map: a European game's address)
+constexpr uint64_t kVoiceGapSteps = 8;  // (0.27 s)
+int g_swingVoice = -1;                  // (the voice this swing's start asks for, link_executed; -1 none)
+uint64_t g_lastVoiceStep = 0;  // (diagnostics) targets hit in the current armed stretch / game attack  // the physical sword's attack power as the game set it (setNormalCutAtParam)
 SwingDetector g_offSwing;            // the off hand's swings (the boomerang's downward throw)
 FlapDetector g_leafFlap;             // the left hand's quick swings up or down (the Deku Leaf)
 uint64_t g_throwFrom = 0, g_throwTo = 0;  // logic steps during which an off-hand swing holds the boomerang's button
@@ -446,6 +465,7 @@ uint64_t g_hammerPressStep = ~0ull;
 bool g_hammerSkipped = true;
 Blade g_prevGameBlade;
 uint64_t g_prevBladeStep = ~0ull;
+double g_prevBladeTime = 0;  // (stage 3c) the sword's pose sample time g_prevGameBlade was posed at (SwordMotion)
 xr::InputState g_input;
 std::chrono::steady_clock::time_point g_lastInput{};
 // movement: the heading "forward" on the stick means (game convention), and the constant between the game's
@@ -1700,6 +1720,43 @@ void sync_input_locked(const Config& c) {
         const SwingEvent e = newPose ? g_swing.update(blade_from_grip(sword_base(in.hand[mainHand]), c), poseDt, g_bodyYaw)
                                      : SwingEvent{};
         if (e.started) g_ledger.begin_swing();
+        // (stage 1) the sword's pose at the pose's own time: its velocity, angular velocity and blade points' speeds
+        if (newPose && g_swordMotion.push(double(poseTime) * 1e-9, sword_pose_from_grip(sword_base(in.hand[mainHand]), c)) &&
+            g_swordMotion.count() >= 2) {
+            // a real swing: fast and far enough (BladeSwing), per headset frame
+            const SwordSample& last = g_swordMotion.latest();
+            const float sdt = float(last.time - g_swordMotion.sample(1).time);
+            BladeSwingConfig bk;
+            bk.speed = c.physicalSwordSpeed;
+            bk.distance = c.swordSwingDistance;
+            const BladeSwing::Event be = g_bladeSwing.update(SwordMotion::point_velocity(last, kArmAlong * c.bladeLength),
+                                                             rotate(last.pose.orientation, Vec3{0, 0, -1}), sdt, bk);
+            if (be.confirmed)
+                LOG("[vr] swing: a real %s (the blade %.2f m at up to %.1f m/s)", be.thrust ? "thrust" : "swing",
+                    double(be.travel), double(be.peak));
+        }
+        {
+            static auto last = std::chrono::steady_clock::now();
+            static uint64_t lastPushed = 0;
+            static float peakTip = 0, peakAngular = 0;
+            if (newPose && g_swordMotion.count() > 0) {
+                const BladeImpact t = SwordMotion::impact_at(g_swordMotion.latest(), c.bladeLength);
+                peakTip = std::max(peakTip, t.speed);
+                peakAngular = std::max(peakAngular, t.angularSpeed);
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last >= std::chrono::seconds(1)) {
+                if (c.swordDebug)
+                    LOG("[vr] sword motion (1 s): %llu samples, %.1f ms apart; the tip's fastest %.2f m/s, the sword's "
+                        "fastest turn %.0f degrees/s; %llu glitches, %llu gaps so far",
+                        (unsigned long long)(g_swordMotion.pushed() - lastPushed), double(g_swordMotion.mean_step() * 1000.0f),
+                        double(peakTip), double(peakAngular * 180.0f / kPi), (unsigned long long)g_swordMotion.glitches(),
+                        (unsigned long long)g_swordMotion.gaps());
+                lastPushed = g_swordMotion.pushed();
+                peakTip = peakAngular = 0;
+                last = now;
+            }
+        }
         // (diagnostics, play tests: thrusts and chops that never started a swing) once a second at most, the sword hand's
         // fastest movement while no swing ran, when it came within half of the start speed but not to it, and where
         // it went (body frame)
@@ -1771,7 +1828,14 @@ void sync_input_locked(const Config& c) {
             g_bThrust = g_bVertical = g_bHammer = g_bJump = g_bComboReset = false;
             LOG("[vr] parry: a swing began in the parry's window at step %llu: A", (unsigned long long)s);
         }
-        if (e.full && !(e.fullKind == SwingKind::Thrust && g_held.hammer)) {
+        // (the player-only sword, vr.swordPlayerOnly) first person with the sword: a full swing presses nothing; the
+        // tracked blade does the cutting (link_executed). Logged, as proof it ran
+        const bool playerOnly = c.swordPlayerOnly && first_person_play() && !g_held.hammer;
+        if (e.full && playerOnly)
+            LOG("[vr] swing: a full %s at step %llu: your blade cuts, no game attack (vr.swordPlayerOnly)",
+                e.fullKind == SwingKind::Thrust ? "thrust" : e.fullKind == SwingKind::Vertical ? "downward swing" : "side swing",
+                (unsigned long long)interp::logic_steps());
+        if (e.full && !playerOnly && !(e.fullKind == SwingKind::Thrust && g_held.hammer)) {
             const uint64_t s = interp::logic_steps();
             // (in a parry's move the swing finishes it, parry_cut_wait: no press of its own)
             // (not while a parry's A from the swing's start is being pressed: kept)
@@ -1935,7 +1999,7 @@ SailState sail_state() {
     s.riding = (ld32(play() + kPlayPlayerStatus0) & kShipRide) != 0;
     s.ship = ship && finite(ld_vec(ship + kPos));
     s.shipMode = s.ship ? ld8(ship + kShipCurMode) : 0xFF;
-    s.greatSea = !std::strcmp(stage_name(), "sea");
+    s.greatSea = boat_view_stage(stage_name());  // (the Great Sea, and the Tower of the Gods)
     s.playCamera = aspect::gameplay_camera();
     s.menu = gfx::display_gamepad_menu_open();
     s.zoomView = subject_zoom_view();
@@ -2082,7 +2146,7 @@ CameraOverride::CameraOverride(uint32_t cam) {
     xr::Views v;
     int ahead = 0;
     // the runtime moved the tracking space's origin (a recentre on the headset): recentre the game on it too
-    if (session().take_space_changed()) request_recenter();
+    if (session().take_space_changed()) request_recenter(), g_head.end_lean();  // (a cutscene's lean begins again)
     if (!game_views(display_time(&ahead), v, true)) return;
     // (diagnostics, 2026-11-12, "[vr] camera calls per frame (10 s)") the head pose each camera call of a frame locates:
     // located fresh at every call, a frame whose camera is set more than once is drawn with one call's pose and sent with
@@ -2384,6 +2448,7 @@ CameraOverride::CameraOverride(uint32_t cam) {
         // third person: the game's own camera (its follow, framing and collision), turned by the head relative to
         // where it looked when the view was switched (as in events); the head's position does not move it
         if (!g_head.game_camera() || conductingChanged) g_head.begin_game_camera(yaw_of(v.head.orientation));
+        g_head.end_lean();  // (a cutscene after this begins its head movement from where the head is then)
         const Vec3 up = ld_vec(cam + kCamUp);
         if (!finite(eye) || !finite(center) || !finite(up) || length(center - eye) < 1e-3f) return;
         head = g_head.game_camera_view(eye, center, up, v.head.orientation);
@@ -2515,12 +2580,19 @@ CameraOverride::CameraOverride(uint32_t cam) {
         // looked when the event began (a cut is a cut; no motion of the game camera is added to the head).
         // Menu scenes (title, file select) are seen from 50 % farther (vr.menuZoomOut) along the same line.
         if (!c.cutsceneFollow) return;
+        // Your head's movement is added too (2026-11-16, "the player can't move their head, they are locked into the
+        // view"): leaning in, to the side, up or down moves the view from the game's camera, at most kCutsceneLean
+        // metres (the set's edges stay out of sight), from where your head was when the event began
         if (!g_head.game_camera()) g_head.begin_game_camera(yaw_of(v.head.orientation));
+        if (!g_head.lean_begun()) g_head.begin_lean(v.head.position);
         const Vec3 up = ld_vec(cam + kCamUp);
         if (!finite(eye) || !finite(center) || !finite(up) || length(center - eye) < 1e-3f) return;
         const bool menu = camera_kind(false, stage_name()) == CameraKind::Menu;
         head = g_head.game_camera_view(eye, center, up, v.head.orientation);
         head.position = menu_eye(eye, center, menu ? c.menuZoomOut : c.cutsceneZoomOut);
+        constexpr float kCutsceneLean = 0.5f;
+        const Vec3 lean = g_head.game_camera_head_offset(eye, center, up, v.head.position, kCutsceneLean, world_scale());
+        if (finite(lean)) head.position = head.position + lean;
     }
     if (gameplay && !g_thirdPerson.load()) {
         static bool loggedNear = false;
@@ -2660,7 +2732,7 @@ const uint32_t kResetAtHit = GC(0x02516138);          // dCcD_GObjInf::ResetAtHi
 const uint32_t kNormalCutAtParam = GC(0x023E5B0C);    // daPy_lk_c::setNormalCutAtParam(link, cutType)
 const uint32_t kEnemyWeaponAtParam = GC(0x023ED2CC);  // daPy_lk_c::setEnemyWeaponAtParam(link, strong)
 const uint32_t kDeleteEquipItem = GC(0x023DC7AC);     // daPy_lk_c::deleteEquipItem(link, sound)
-constexpr uint32_t kCutRight = 3, kCutLeft = 4;       // procCutR_init / procCutL_init's cut types
+constexpr uint32_t kCutRight = 3, kCutLeft = 4, kCutThrust = 2;  // procCutR_init / procCutL_init's cut types; 2: procCutF's (CUT_TYPE_CUT_F)
 
 // ---- the Skull Hammer's swing (vr_sword.h, docs/VR_SKULL_HAMMER.md)
 constexpr uint32_t kFrameCtrlUnder = 0x5898;  // daPy_lk_c::mFrameCtrlUnder[0] (J3DFrameCtrl: mRate +0, mFrame +4)
@@ -2897,6 +2969,94 @@ void arrow_fall_step(uint32_t link) {
     stf32(f.arrow + kSpeedF, 0.0f);
 }
 
+// (stages 3 and 8, docs/VR_SWORD_COMBAT_PLAN.md) a new sword hit of the last collision check: the blade's speed where it
+// struck (vr_sword_motion.h: from the hit's place along the blade as the game saw it, the fastest that point moved in
+// the last kImpactWindow), its haptic pulse by that speed, a log line. cps: the attack capsule that hit
+constexpr float kImpactWindow = 0.1f;  // seconds (three logic steps: the sweep that made the hit and the step's wait)
+constexpr uint32_t kAtGObjRPrm = 0x54;   // dCcD_GObjInf mGObjAt.mRPrm: bit 1, the hit stopped by a shield (deflected)
+constexpr uint32_t kAtHitPos = 0x70;     // dCcD_GObjInf mGObjAt.mHitPos (cCcS sets it on a hit)
+constexpr uint32_t kAtAtp = 0x14;        // dCcD_GObjInf mAtp: the attack's power
+// ---- (2026-11-20, "sword hits no longer register") the hit pipeline traced, step by step, with the game's own data:
+// what our capsule attacked with, which actor's collider the game's collision (cCcS) matched it with, whether that
+// collider took the hit with our capsule as its attacker (the side the target reads: daTsuboDamage ChkTgHit /
+// GetTgHitObj()->GetAtType() & AT_TYPE_SWORD, d_a_tsubo_dmg.cpp), and over the next steps what became of the target:
+// its health (fopAc_ac_c health, 0x3A1) or its removal (broken, killed: its process id gone). One log line each
+constexpr uint32_t kActorPid = 0x4, kActorHealth = 0x3A1;  // (kActorName above: the profile name)
+constexpr uint32_t kObjStts = 0x44, kSttsActor = 0xC, kSttsPid = 0x10;  // dCcD_GObjInf mStts; dCcD_Stts actor, its pid
+constexpr uint32_t kObjTgRPrm = 0x1C, kObjTgHitObj = 0x20, kObjAtType = 0x10;  // mObjTg.mRPrm (bit 0: hit), mHitObj
+constexpr int kHitTraceSteps = 30;
+inline bool guest_ok(uint32_t a, uint32_t n) { return a && !(a & 3) && a >= 0x10000000u && a <= 0x50000000u - n; }
+struct HitTrace {
+    uint32_t actor = 0, pid = 0;
+    int health = 0, steps = 0;
+    uint16_t name = 0;
+};
+std::array<HitTrace, 8> g_hitTraces{};
+void trace_hit_begin(uint32_t cps, uint32_t obj, bool physical, int capsule) {
+    const uint32_t stts = guest_ok(obj, 0x48) ? ld32(obj + kObjStts) : 0;
+    const uint32_t actor = guest_ok(stts, 0x14) ? ld32(stts + kSttsActor) : 0;
+    const bool actorOk = guest_ok(actor, 0x3A4);
+    const uint32_t pid = actorOk ? ld32(stts + kSttsPid) : 0;
+    const uint16_t name = actorOk ? ld16(actor + kActorName) : 0;
+    const int health = actorOk ? int(int8_t(ld8(actor + kActorHealth))) : 0;
+    const bool tgHit = guest_ok(obj, 0x48) && (ld32(obj + kObjTgRPrm) & 1) != 0;
+    const bool byUs = guest_ok(obj, 0x48) && ld32(obj + kObjTgHitObj) == cps;
+    LOG("[vr hit] blade hit (%s, capsule %d): attack type %08X power %u -> the game matched it with collider %08X of "
+        "actor %08X (profile %04X, pid %u, health %d%s); that collider %s, %s",
+        physical ? "the physical sword" : "the game's attack", capsule, ld32(cps + kObjAtType), unsigned(ld8(cps + 0x14)),
+        obj, actor, unsigned(name), pid, health, actorOk && ld32(actor + kActorPid) == pid ? "" : ", not a live actor",
+        tgHit ? "marked hit" : "NOT marked hit", byUs ? "by our capsule" : "by another attack (or cleared)");
+    if (!actorOk || ld32(actor + kActorPid) != pid) return;
+    for (auto& t : g_hitTraces)
+        if (t.actor == actor && t.pid == pid) return;  // (traced already)
+    for (auto& t : g_hitTraces)
+        if (!t.actor) {
+            t = {actor, pid, health, 0, name};
+            return;
+        }
+}
+// once a logic step: what became of the hit targets
+void trace_hit_steps() {
+    for (auto& t : g_hitTraces) {
+        if (!t.actor) continue;
+        ++t.steps;
+        if (ld32(t.actor + kActorPid) != t.pid) {
+            LOG("[vr hit] target %08X (profile %04X): removed %d steps after the hit (broken, killed or picked up)",
+                t.actor, unsigned(t.name), t.steps);
+            t = {};
+            continue;
+        }
+        const int h = int(int8_t(ld8(t.actor + kActorHealth)));
+        if (h != t.health) {
+            LOG("[vr hit] target %08X (profile %04X): health %d -> %d, %d steps after the hit", t.actor, unsigned(t.name),
+                t.health, h, t.steps);
+            t.health = h;
+        }
+        if (t.steps >= kHitTraceSteps) {
+            LOG("[vr hit] target %08X (profile %04X): still there %d steps after the hit, health %d", t.actor,
+                unsigned(t.name), t.steps, h);
+            t = {};
+        }
+    }
+}
+
+void sword_hit_feedback(const Config& c, uint32_t cps, uint32_t target, int hand, bool physical) {
+    trace_hit_begin(cps, target, physical, int((cps - (g_link.link + kAtCps)) / kCpsStride));
+    const bool deflected = (ld32(cps + kAtGObjRPrm) & 1) != 0;
+    const Vec3 at = ld_vec(cps + kAtHitPos);
+    const float f = blade_fraction(g_held.wroteRoot, g_held.wroteTip, at);
+    const BladeImpact b = g_swordMotion.peak_impact(f * c.bladeLength, kImpactWindow);
+    ImpactHaptic h{c.hapticStrength, 0.06f};
+    if (c.swordImpactHaptics && b.valid) h = impact_haptic(b.speed, c.hapticStrength, deflected);
+    if (h.amplitude > 0 && running()) session().haptic(hand, h.amplitude, h.seconds);
+    ++(physical ? g_physicalHits : g_attackHits);
+    LOG("[vr] sword hit: target %08X, %.2f of the way to the tip, %.2f m/s there (%.0f%% across the blade, the sword "
+        "turning %.0f degrees/s), power %u, %s, %s; haptic %.2f for %.2f s", target, double(f), double(b.speed),
+        double(b.acrossShare * 100.0f), double(b.angularSpeed * 180.0f / kPi), unsigned(ld8(cps + kAtAtp)),
+        physical ? "the physical sword" : "the game's attack", deflected ? "deflected" : "not deflected",
+        double(h.amplitude), double(h.seconds));
+}
+
 void link_executed(uint32_t link, Cpu* cpu) {
     GameWorkTimer workTimer(GameWork::Execute);  // (docs/VR_PERFORMANCE.md: the VR work on the game thread)
     if (link) bomb_step(link);
@@ -3016,8 +3176,25 @@ void link_executed(uint32_t link, Cpu* cpu) {
             LOG("[vr] first person: the view's height held at his standing eye height, %.1f units", double(eye));
         }
         const bool posture = (proc >= 0x0D && proc <= 0x12) || (proc >= 0x2B && proc <= 0x3F);
-        if (std::isfinite(standEye) && !posture && !parry_move_proc(proc)) {
-            g_link.eyeHeightHeld.update(standEye, 6.0f, kStepSeconds, 0.35f);  // (eased back after a posture)
+        // True size (vr.trueSize): the standing view at your own eye height above his feet, not at his eyes. The
+        // anchor is the head's place at the recentre, so with the head's height there (floor-level space) the view is
+        // exactly as high above his feet as your eyes are above your floor. Postures still follow his eyes (below)
+        float standTarget = standEye;
+        if (c.trueSize) {
+            const float metres = true_size_eye_metres(g_head.calibrated() && session().stage_space(), c.posture,
+                                                      g_head.room().base.y, c.playerHeight);
+            standTarget = metres * world_scale();
+            static float logged = 0;
+            if (std::fabs(logged - standTarget) > 1.0f) {
+                logged = standTarget;
+                LOG("[vr] first person: True size, the view at %.2f m (%s) above Link's feet: %.1f units (his eyes: %.1f)",
+                    double(metres), g_head.calibrated() && session().stage_space() && c.posture == Posture::Standing &&
+                    metres == g_head.room().base.y ? "the headset's height above the floor" : "vr.playerHeight",
+                    double(standTarget), double(standEye));
+            }
+        }
+        if (std::isfinite(standTarget) && !posture && !parry_move_proc(proc)) {
+            g_link.eyeHeightHeld.update(standTarget, 6.0f, kStepSeconds, 0.35f);  // (eased back after a posture)
             g_link.heightFollow = false;
             g_link.heightAway = 0;
         } else if (parry_move_proc(proc)) {
@@ -3654,17 +3831,20 @@ void link_executed(uint32_t link, Cpu* cpu) {
         }
     }
 
+    trace_hit_steps();  // (the hit pipeline: what became of the targets hit)
     // hits of the last collision check: haptics, once per target and swing
     const int mainHand = dominant_side(c);
     for (int i = 0; i < 3; ++i) {
         const uint32_t cps = link + kAtCps + i * kCpsStride;
         if ((ld32(cps) & 1) && (ld32(cps + 4) & 1) && g_ledger.record(ld32(cps + 8)))
-            session().haptic(mainHand, c.hapticStrength, 0.06f);
+            sword_hit_feedback(c, cps, ld32(cps + 8), mainHand, false);
     }
     // the physical sword: while the hand swings, the attack's capsules armed along the tracked blade without the
     // game's attack (first person, the sword held for an attack, no attack of the game's own)
     bool physical = false, physicalBegan = false;
     uint32_t cutType = kCutRight;
+    // (vr.swordPlayerOnly) the tracked blade cuts locked on too, and follows it in a parry's finishing cut
+    const bool playerOnlySword = c.swordPlayerOnly && first_person_play() && !g_held.hammer;
     {
         const bool gameAttack = (ld32(link + kAtCps) & 1) != 0;
         const bool allowed = c.physicalSword && cpu && sword_gates() && g_sword.hits_allowed() && g_held.sword &&
@@ -3678,29 +3858,88 @@ void link_executed(uint32_t link, Cpu* cpu) {
                              // (nor locked on: the game's own moves do the cutting, each the one the swing names; the
                              // blade's ordinary cut was refused and deflected by Orca and guarding enemies: training
                              // test, 2026-11-04)
-                             !locked_on(link);
-        const PhysicalStep p =
-            g_physical.update(allowed, gameAttack, g_swing.phase() == SwingPhase::Active, g_ledger.swing(), kStepSeconds);
+                             (playerOnlySword || !locked_on(link));
+        // (and by the blade's own speed: vr.physicalSwordSpeed, vr_sword_motion.h blade_arm)
+        const bool handSwing = g_swing.phase() == SwingPhase::Active;
+        const BladeImpact blade = g_swordMotion.peak_impact(kArmAlong * c.bladeLength, kStepSeconds);
+        const BladeArm arm = blade_arm(blade.valid ? blade.speed : 0.0f, c.physicalSwordSpeed, handSwing, g_physical.armed());
+        // (vr.swordPlayerOnly) only real swings: fast and long enough (BladeSwing, sync_input_locked), each its own
+        // swing for the hit ledger, a back-swing too once it is a real one; the hand's swing and the blade's speed
+        // alone no longer arm it (a light movement of the hand did, and Link yelled: reported in the headset)
+        static uint32_t lastBladeId = 0;
+        const bool newBladeSwing = g_bladeSwing.id() != lastBladeId;
+        lastBladeId = g_bladeSwing.id();
+        if (playerOnlySword ? newBladeSwing && allowed && !gameAttack : allowed && !gameAttack && arm.newSwing)
+            g_ledger.begin_swing();
+        // (a parry's finishing cut waits for your swing, parry_cut_wait: a real swing of the blade counts as one)
+        if (playerOnlySword && g_bladeSwing.active() && g_parry.inMove) g_parry.lastSwing = std::max(g_parry.lastSwing, step);
+        const bool swinging = playerOnlySword ? g_bladeSwing.active() : handSwing || arm.fast;
+        const PhysicalStep p = g_physical.update(allowed, gameAttack, swinging, g_ledger.swing(), kStepSeconds);
         physical = p.armed;
         physicalBegan = p.began;
+        // (diagnostics, proof the sword was live) each armed stretch and each of the game's attacks: its steps and the
+        // targets it hit
+        {
+            static int armedSteps = 0, attackSteps = 0;
+            if (physical) ++armedSteps;
+            else if (armedSteps) {
+                LOG("[vr] physical sword: armed %d steps, %d targets hit", armedSteps, g_physicalHits);
+                armedSteps = 0;
+                g_physicalHits = 0;
+            }
+            if (gameAttack) ++attackSteps;
+            else if (attackSteps) {
+                LOG("[vr] the game's sword attack: %d steps, %d targets hit", attackSteps, g_attackHits);
+                attackSteps = 0;
+                g_attackHits = 0;
+            }
+        }
         if (physical) {
-            const Vec3 v = rotate(yaw_quat(-g_bodyYaw), g_swing.tip_velocity());  // +X: to the body's right
+            // the cut's side from the blade's motion where it was measured (a wrist swing moves the blade, not the
+            // hand), else the hand's
+            const Vec3 moving = blade.valid && blade.speed > g_swing.speed() ? blade.velocity : g_swing.tip_velocity();
+            const Vec3 v = rotate(yaw_quat(-g_bodyYaw), moving);  // +X: to the body's right
             cutType = v.x >= 0 ? kCutRight : kCutLeft;
+            // (a real thrust: the game's forward thrust's cut, procCutF's CUT_TYPE_CUT_F)
+            if (playerOnlySword && g_bladeSwing.thrust()) cutType = kCutThrust;
             g_physicalLink = link;
             for (int i = 0; i < 3; ++i) {
                 const uint32_t cps = link + kAtCps + i * kCpsStride;
                 st32(cps, ld32(cps) | 1u);
             }
         }
-        if (physicalBegan) LOG("[vr] physical sword: a swing cuts (%s) at step %llu", cutType == kCutRight ? "right" : "left",
-                               (unsigned long long)step);
+        // Link's voice: once a real swing, when the swing's peak speed reaches vr.swordVoiceSpeed (a swing cuts from
+        // vr.physicalSwordSpeed; a gentle real swing cuts without a yell). Its peak: the blade's measuring point over
+        // the swing so far (BladeSwing), or this step's blade
+        g_swingVoice = -1;
+        {
+            static uint32_t voicedSwing = 0;
+            const float peak = std::max(g_bladeSwing.peak(), blade.valid ? blade.speed : 0.0f);
+            const bool hard = c.swordVoiceSpeed <= 0 ? physicalBegan : peak >= c.swordVoiceSpeed;
+            const bool newSwing = g_bladeSwing.id() != voicedSwing || physicalBegan;
+            if (physical && playerOnlySword && hard && newSwing && g_bladeSwing.active() &&
+                (!g_lastVoiceStep || step >= g_lastVoiceStep + kVoiceGapSteps)) {
+                g_swingVoice = c.swordStrongHitSpeed > 0 && peak >= c.swordStrongHitSpeed ? 1 : 0;
+                g_lastVoiceStep = step;
+                voicedSwing = g_bladeSwing.id();
+                LOG("[vr] physical sword: a hard swing (the blade at %.1f m/s, the yell from %.1f): Link's voice", double(peak),
+                    double(c.swordVoiceSpeed));
+            }
+        }
+        if (physicalBegan)
+            LOG("[vr] physical sword: a swing cuts (%s) at step %llu: the blade at %.2f m/s, the hand %.2f m/s (%s)",
+                cutType == kCutThrust ? "a thrust" : cutType == kCutRight ? "right" : "left", (unsigned long long)step, double(blade.valid ? blade.speed : 0.0f),
+                double(g_swing.speed()), handSwing ? "the hand's swing" : "the blade's speed");
     }
     // the game's sword attack is set (or the physical sword's): its capsules follow the tracked blade
     const uint32_t cps0 = link + kAtCps;
     if (!(ld32(cps0) & 1) || !g_input.valid || !g_input.hand[mainHand].active || !aspect::gameplay_camera() ||
         g_thirdPerson.load() ||  // third person: the game's own sword collision
-        parry_move_proc(ld32(link + kCurProc))) {  // (a parry's finishing cut: the game's own, at the enemy's back)
+        // (a parry's finishing cut: the game's own, at the enemy's back; kept with vr.swordPlayerOnly too, asked for:
+        // "parry and spin and b attacks should stay")
+        parry_move_proc(ld32(link + kCurProc))) {
         g_prevBladeStep = ~0ull;
+        g_prevBladeTime = 0;
         return;
     }
     const Blade xrBlade = blade_from_grip(sword_base(g_input.hand[mainHand]), c);
@@ -3734,8 +3973,51 @@ void link_executed(uint32_t link, Cpu* cpu) {
             now.root = now.tip - normalize(now.tip - now.root) * length(g_held.tipLocal - g_held.headLocal);
     }
     if (!finite(now.root) || !finite(now.tip)) return;
-    const Blade before = g_prevBladeStep != ~0ull && step <= g_prevBladeStep + 2 ? g_prevGameBlade : now;
-    const Sweep s = sweep(before, now);
+    const bool haveBefore = g_prevBladeStep != ~0ull && step <= g_prevBladeStep + 2;
+    const Blade before = haveBefore ? g_prevGameBlade : now;
+    Sweep s = sweep(before, now);
+    // (stage 3c, docs/VR_SWORD_COMBAT_PLAN.md) the capsules along the swing's arc: the headset's poses between the two
+    // steps give the blades it passed through, and the 3 capsules are chosen to cover them (never worse than the one
+    // chord above on the measured points)
+    const double sampleTime = g_swordMotion.count() ? g_swordMotion.latest().time : 0.0;
+    // (WWHD_VR_SWORD_ARC=0: the one chord, as before stage 3c)
+    static const bool arcOn = [] {
+        const char* e = getenv("WWHD_VR_SWORD_ARC");
+        const bool on = !(e && *e == '0');
+        LOG("[vr] sword sweep along the arc: %s", on ? "on (WWHD_VR_SWORD_ARC=0 turns it off)" : "off (WWHD_VR_SWORD_ARC=0)");
+        return on;
+    }();
+    if (arcOn && haveBefore && g_prevBladeTime > 0 && sampleTime > g_prevBladeTime) {
+        const BladePath path = path_between(g_swordMotion, g_prevBladeTime, before, now, game_rotation(g_map), world_scale());
+        // (the capsules' radius as the game set it: cM3dGCps mRadius; the normal cut's 20 if unset)
+        const float radius = float(ldf32(link + kAtCps + kCpsRadius));
+        const SweepChoice ch = sweep_path(path, std::isfinite(radius) && radius > 0 && radius < 500 ? radius : 20.0f);
+        s = ch.sweep;
+        static uint64_t steps = 0, changed = 0, samples = 0;
+        static double oldOut = 0, newOut = 0;
+        static uint64_t oldMiss = 0, newMiss = 0;  // steps with part of the swept area outside the capsules
+        static auto since = std::chrono::steady_clock::now();
+        if (path.n > 2 && length(now.tip - before.tip) > 1.0f) {  // (moving: a still blade has nothing to sweep)
+            ++steps;
+            changed += ch.changed;
+            samples += uint64_t(path.n - 2);
+            oldOut += ch.before.outside;
+            newOut += ch.after.outside;
+            oldMiss += ch.before.outside > 0.5f;
+            newMiss += ch.after.outside > 0.5f;
+        }
+        if (std::chrono::steady_clock::now() - since >= std::chrono::seconds(10)) {
+            if (steps)
+                LOG("[vr] sword sweep (10 s): %llu moving steps, %.1f headset poses between steps on average, capsules "
+                    "moved onto the arc in %llu; part of the swept area outside the capsules in %llu steps with one "
+                    "chord, %llu along the arc (%.1f and %.1f units outside on average)",
+                    (unsigned long long)steps, double(samples) / double(steps), (unsigned long long)changed,
+                    (unsigned long long)oldMiss, (unsigned long long)newMiss, oldOut / double(steps), newOut / double(steps));
+            steps = changed = samples = oldMiss = newMiss = 0;
+            oldOut = newOut = 0;
+            since = std::chrono::steady_clock::now();
+        }
+    }
     for (int i = 0; i < 3; ++i) {
         const uint32_t cps = link + kAtCps + i * kCpsStride;
         st_vec(cps + kCpsGeometry, s.capsule[i].a);
@@ -3751,7 +4033,16 @@ void link_executed(uint32_t link, Cpu* cpu) {
     st_vec(link + kSwordPrevRoot, before.root);
     g_prevGameBlade = now;
     g_prevBladeStep = step;
+    g_prevBladeTime = sampleTime;
     if (!physical) return;
+    // (stage 3, vr.swordStrongHitSpeed) the power's multiplier from the blade's speed this step (three quarters of the
+    // way to the tip, the fastest in the last logic step), read while the lock is held (g_swordMotion is written
+    // under it, in sync_input_locked)
+    int powerScale = 1;
+    {
+        const BladeImpact b = g_swordMotion.peak_impact(0.75f * c.bladeLength, kStepSeconds);
+        powerScale = impact_attack_power(b.valid ? b.speed : 0.0f, c.swordStrongHitSpeed);
+    }
     // the physical sword's attack, entered into this step's collision as Link's own attacks are (daPy_Execute does
     // so for an armed attack before this hook runs; this one was armed after it). Game code: not under the lock
     lock.unlock();
@@ -3763,9 +4054,24 @@ void link_executed(uint32_t link, Cpu* cpu) {
         else if (attack == 1) guest_call(cpu, kNormalCutAtParam, {link, cutType});
         else {
             *cpu = saved;  // no weapon actor: no attack, as in the game
+            g_physicalBaseAtp = 0;  // (and no power of an earlier swing's written later)
             return;
         }
         for (int i = 0; i < 3; ++i) guest_call(cpu, kResetAtHit, {link + kAtCps + i * kCpsStride});
+        if (g_swingVoice >= 0) {
+            guest_call(cpu, GC(0x02443880), {link, uint32_t(g_swingVoice)});
+            LOG("[vr] physical sword: Link's voice (%s)", g_swingVoice ? "a finishing cut's: a hard swing" : "a cut's");
+        }
+        g_physicalBaseAtp = attack == 1 ? std::max<int>(1, ld8(link + kAtCps + kAtAtp)) : 0;
+        LOG("[vr hit] physical sword armed: %s, attack type %08X, power %u, capsule radius %.1f, entered into the "
+            "game's collision (cCcS::Set) and the grass check (mass)", attack == 2 ? "a picked-up weapon" : "the sword",
+            ld32(link + kAtCps + kObjAtType), unsigned(ld8(link + kAtCps + kAtAtp)),
+            double(ldf32(link + kAtCps + kCpsRadius)));
+    }
+    // a hard swing a finishing cut's power, twice the game's own (off: the game's own, written back as it set it)
+    if (g_physicalBaseAtp > 0) {
+        const int atp = g_physicalBaseAtp * powerScale;
+        for (int i = 0; i < 3; ++i) st8(link + kAtCps + uint32_t(i) * kCpsStride + kAtAtp, uint8_t(std::min(atp, 255)));
     }
     const uint32_t info = guest_call(cpu, kGameInfo);
     for (int i = 0; i < 3; ++i) {
@@ -4238,7 +4544,12 @@ static void filter_pad_controllers(input::PadState& s) {
             const Vec3 rel = rotate(conjugate(yaw_quat(g_bodyYaw)), left.grip.position - head.head.position);
             atShoulder = length(rel - Vec3{-0.15f, -0.08f, 0.12f}) < 0.25f;
         }
-        const bool on = boatCtl && g_gripLatch[0].closed && !atShoulder && !g_wheel.consumes_stick();
+        // (2026-11-20, a player's video, "Bow plus Analog takes Cannon Out": on the boat, the bow out, the left grip
+        // held to draw the string and the right stick pushed left or right to turn took out the cannon or the grappling
+        // hook, and the view did not turn) not while the bow is in his hand: the left grip is its string there, and the
+        // right stick turns. The right grip's D-pad (with the left stick) stays
+        const bool bowOut = g_link.link && g_link.valid && bow_in_hand(game_item(g_link.link));
+        const bool on = boatCtl && g_gripLatch[0].closed && !atShoulder && !g_wheel.consumes_stick() && !bowOut;
         BoatDpad d = BoatDpad::None;
         if (on) {
             d = boat_dpad(right.stickX, right.stickY);
@@ -4335,10 +4646,24 @@ static void filter_pad_controllers(input::PadState& s) {
     {
         const uint32_t l = g_link.link;
         const bool aimingItem = l && mods::camera_mouse::aiming_item(ld32(l + kCurProc));
+        // (2026-11-20, an audit asked for: "the fire, ice and light arrows need the same aiming as the normal arrows")
+        // the bow aimed: ZR is the game's Swap Modes there, not a crouch (daPy_lk_c's bow: spActionTrigger, the game's
+        // R, which this port has on ZR, changes the arrow on the bow to fire, ice or light: daArrow_c::changeArrowType).
+        // It was taken off with every aimed item, so first person could not change arrows (third person has ZR on the
+        // left grip). With the bow it stays
+        const bool bowAimed = aimingItem && g_link.valid && bow_in_hand(ld16(l + 0x69B0)) && !g_thirdPerson.load();
+        // (2026-11-20, a player's video: "With the Deku Leave out pressing down on right analog takes out the shield")
+        // holding the Deku Leaf in first person, ZR (right stick down) is the game's guard: Link raised the shield with
+        // the leaf in his hands. Not given with the leaf out
+        const bool leafOut = l && g_link.valid && !g_thirdPerson.load() && ld16(l + 0x69B0) == kItemDekuLeaf;
         // (on the boat the right stick is the camera's, never ZR: the hop is A there, boat_controls; asked for, 2026-11-06)
-        if (aimingItem || subject_zoom_view() || !aspect::gameplay_camera() || gfx::display_gamepad_menu_open() ||
-            conducting() || boatCtl)  // (conducting: the right stick is the Wind Waker's beat)
+        if ((aimingItem && !bowAimed) || leafOut || subject_zoom_view() || !aspect::gameplay_camera() ||
+            gfx::display_gamepad_menu_open() || conducting() || boatCtl)  // (conducting: the right stick is the Wind Waker's beat)
             held &= ~(1u << int(Action::RightStickDown));
+        static bool swapWas = false;
+        const bool swap = bowAimed && (held & (1u << int(Action::RightStickDown))) != 0;
+        if (swap && !swapWas) LOG("[vr] bow: right stick down: Swap Modes (ZR: the arrow type)");
+        swapWas = swap;
     }
     // VR archery (vr_bow.h): the off hand at the bow puts the arrow on (the game's bow button held: it draws the
     // string), either trigger shoots it (the button let go). The triggers' own buttons (A leaves the aim, ZL locks on)
@@ -4367,6 +4692,18 @@ static void filter_pad_controllers(input::PadState& s) {
         // (the triggers shoot: their own buttons, A leaving the aim and ZL's lock-on, not given meanwhile; with the bow
         // only in his hand, out of the aim and the string not drawn, they keep their own uses)
         if (bi.aiming && (bowAimNow || g_bowOnBow)) held &= ~(mainBit | offBit);
+        // (2026-11-20, asked for: "use R-trigger as well for swap mode") with no arrow on the bow, the triggers shoot
+        // nothing: there the right controller's trigger is ZR, the game's Swap Modes, which sets the next arrow's type
+        // (daArrow_c::changeArrowTypeNotReady: normal, fire, ice, light). With an arrow on it shoots, as before; right
+        // stick down changes the arrow on the bow then
+        {
+            const bool rightTrigger = c.leftHanded ? bi.offTrigger : bi.mainTrigger;
+            const bool swap = bi.aiming && bowAimNow && !g_bowOnBow && rightTrigger;
+            if (swap) s.buttons |= pad::kZR;
+            static bool swapWas = false;
+            if (swap && !swapWas) LOG("[vr] bow: the right trigger, no arrow on the bow: Swap Modes (ZR: the next arrow's type)");
+            swapWas = swap;
+        }
         // the hands: the nearer pair of the drawn ones (Link's posed hand joints, metres) and the controllers (his arms
         // are shorter and reach-clamped: his hands meet before yours, measured 41 to 76 cm apart in the headset)
         bi.bowHand = g_input.hand[bowSide].grip.position;
@@ -5765,7 +6102,9 @@ void link_arms(uint32_t link) {
     }
     bool changed = false;
     // detached arms (vr.detachedArms): eased in and out over a quarter of a second, so switching it never snaps
-    g_detachWeight = std::clamp(g_detachWeight + (c.detachedArms ? 1.0f : -1.0f) * kStepSeconds / 0.25f, 0.0f, 1.0f);
+    // (True size: always detached, so the hands reach your controllers from well above his shoulders)
+    g_detachWeight = std::clamp(g_detachWeight + (c.detachedArms || c.trueSize ? 1.0f : -1.0f) * kStepSeconds / 0.25f,
+                                0.0f, 1.0f);
     // the game's shield hand as its animation posed it, before the arms below: what the shield's own axes are learnt
     // from (measure_held)
     g_animShieldHand = read(kArmJoints[1][2]);
@@ -5970,20 +6309,40 @@ void link_arms(uint32_t link) {
             }
         }
         const float linkArm = length(anim.lower.pos - anim.upper.pos) + length(anim.hand.pos - anim.lower.pos);
+        // (True size: your hands where they are, not scaled to his shorter arm: the controller's offset from your eyes
+        // taken as it is, at the world's own scale)
+        const float playerArmUnits = c.trueSize ? linkArm : c.realArmLength * world_scale();
         // from the eyes, not the shoulders: the hand is drawn in the direction you see the controller in (the
         // camera's own position for this step: Link's eyes plus the head's lean)
         // (HeadController::step_head: this step's room-scale walk in the origin, stepPos has it too)
         const Vec3 eyes = g_head.step_head(v.head, stepPos + g_link.eyeOffset + Vec3{0, g_link.eyeHeight, 0},
                                            c.heightOffset, c.maxHeadOffset, world_scale()).position;
         const Vec3 offset = to_game_dir(g_map, hand.grip.position - v.head.position) * world_scale();
-        const Vec3 seen = eye_wrist_target(eyes, offset, linkArm, c.realArmLength * world_scale());
+        const Vec3 seen = eye_wrist_target(eyes, offset, linkArm, playerArmUnits);
         Vec3 wrist = keep_in_view(eyes, seen, anim.upper.pos, linkArm * 0.98f);
         // detached arms: the hand goes where you see the controller, not held to his shoulder's reach. Beyond it the
         // whole arm (upper arm, forearm, hand) moves out from the shoulder by what the reach lacks, at most one arm's
         // length; every bone keeps its length and the solver below poses it as always. Faded with the arm (tracking
         // lost: the animation's arm, where it was)
         const float detach = g_detachWeight * g_armWeight[side];
-        if (detach > 0 && finite(seen)) {
+        if (c.trueSize && finite(seen) && g_armWeight[side] > 0) {
+            // True size (asked for, 2026-11-20: "the hands detach from the body ... the hands must be able to move
+            // freely"): the hand exactly at the controller, with no reach limit. The (hidden) arm is carried from your
+            // own shoulder (below and beside your eyes) out along the line to the hand, so the hand is never held back
+            // by his arm's length; its wrist and twist limits are open (detached: the hand turns as the controller).
+            // Faded with the arm (tracking lost: the animation's arm)
+            const float w = g_armWeight[side];
+            wrist = lerp(wrist, seen, w);
+            const Vec3 youForward = to_game_dir(g_map, rotate(yaw_quat(g_bodyYaw), {0, 0, -1}));
+            const Vec3 root = true_size_arm_root(true_size_shoulder(eyes, youForward, side ? 1 : -1, world_scale()), wrist,
+                                                 linkArm * 0.98f);
+            const Vec3 shift = (root - anim.upper.pos) * w;
+            if (finite(shift)) {
+                anim.upper.pos = anim.upper.pos + shift;
+                anim.lower.pos = anim.lower.pos + shift;
+                anim.hand.pos = anim.hand.pos + shift;
+            }
+        } else if (detach > 0 && finite(seen)) {
             wrist = lerp(wrist, seen, detach);
             const Vec3 shift = detached_shift(anim.upper.pos, wrist, linkArm * 0.98f, linkArm) * detach;
             anim.upper.pos = anim.upper.pos + shift;
@@ -5993,8 +6352,7 @@ void link_arms(uint32_t link) {
         {
             // (diagnostics, the input summary) the controller's place beyond what his arm reaches: the hand cannot be
             // where you see the controller (Link's body away from you, or turned from where you face)
-            const float beyond = length(eye_wrist_target(eyes, offset, linkArm, c.realArmLength * world_scale()) -
-                                        anim.upper.pos) - linkArm;
+            const float beyond = length(eye_wrist_target(eyes, offset, linkArm, playerArmUnits) - anim.upper.pos) - linkArm;
             if (beyond > 2.0f) {
                 ++g_outOfReach[side];
                 g_maxOutOfReach[side] = std::max(g_maxOutOfReach[side], beyond);
@@ -6002,14 +6360,14 @@ void link_arms(uint32_t link) {
         }
         {
             auto& lag = g_lag[side];
-            const Vec3 target = eye_wrist_target(eyes, offset, linkArm, c.realArmLength * world_scale());
+            const Vec3 target = eye_wrist_target(eyes, offset, linkArm, playerArmUnits);
             const uint64_t st = interp::logic_steps();
             const Quat rot = to_game_orientation(g_map, hand.aim.orientation);
             if (!lag.valid) lag.prev = lag.cur = target, lag.prevRot = lag.curRot = rot;
             else if (st != lag.step) { lag.prev = lag.cur; lag.cur = target; lag.prevRot = lag.curRot; lag.curRot = rot; }
             else lag.cur = target, lag.curRot = rot;
             lag.step = st;
-            lag.k = linkArm / std::max(1e-3f, c.realArmLength * world_scale());
+            lag.k = linkArm / std::max(1e-3f, playerArmUnits);
             lag.valid = true;
         }
         const Vec3 point = to_game_dir(g_map, rotate(hand.aim.orientation, {0, 0, -1}));
@@ -6080,8 +6438,12 @@ void link_arms(uint32_t link) {
         // (2026-11-15) the Hookshot and the Deku Leaf the same way (not the leaf's glide: its hand takes the glide pose's
         // turn, below): their hand's roll was the animation's plus the controller's, and the run animation turned it as
         // Link went round, the item spinning or flipping in the hand (a player's video, 2026-11-15: both sticks circled)
+        // (2026-11-20, a player's video: "with Hammer out holding the two analog sticks at opposite directions will still
+        // make the left hand flip around") the Skull Hammer too: the game holds it in Link's left hand, VR in the right;
+        // the left kept the game's two-handed hold, its roll the run and turn animation's, and flipped as he went round
         const uint16_t handItem = game_item(link);
-        const bool bowHand = (bow_in_hand(handItem) || handItem == kItemHookshot || (handItem == kItemDekuLeaf && !gliding)) &&
+        const bool bowHand = (bow_in_hand(handItem) || handItem == kItemHookshot || handItem == kItemSkullHammer ||
+                              (handItem == kItemDekuLeaf && !gliding)) &&
                              g_held.gameHand == kArmJoints[g_jointSet[side]][2];
         {
             static uint16_t loggedItem = 0xFFFF;
@@ -6298,6 +6660,49 @@ void collapse_joint(uint32_t mtx, int j, Vec3 point) {
 void mark_changed(uint32_t block) {
     if (block) st16(block + kMtxBlockFlags, uint16_t(ld16(block + kMtxBlockFlags) | kMatricesChanged));
 }
+// (2026-11-20: Link's head missing in a cutscene, vr_head_keep.h) each fold kept, to be given back on a draw that does
+// not hide the head
+HeadKeep g_headKeep;
+void fold_joint(uint32_t mtx, int j, Vec3 point) {
+    const uint32_t addr = mtx + uint32_t(j) * 48;
+    auto* words = reinterpret_cast<uint32_t*>(mem::ptr(addr));
+    g_headKeep.before_fold(addr, words);
+    collapse_joint(mtx, j, point);
+    g_headKeep.after_fold(addr, words);
+}
+// a draw that does not hide the head (the game's camera in an event or cutscene, third person, VR off): the head's
+// matrices as the game made them, where its fold from first person still stands (the game has not worked them out
+// again: Link held still by the event). Only within Link's own body and hair models as they are now
+void give_head_back(uint32_t link) {
+    if (g_headKeep.empty()) return;
+    struct Range {
+        uint32_t from = 0, to = 0, block = 0;
+    } ranges[1 + std::size(kHairModels)];
+    int nr = 0;
+    {
+        uint16_t n = 0;
+        uint32_t b = 0;
+        if (const uint32_t m = link ? model_matrices(ld32(link + kBodyModel), &n, &b) : 0) ranges[nr++] = {m, m + uint32_t(n) * 48, b};
+        for (uint32_t off : kHairModels) {
+            n = 0;
+            b = 0;
+            if (const uint32_t h = link ? model_matrices(ld32(link + off), &n, &b) : 0) ranges[nr++] = {h, h + uint32_t(n) * 48, b};
+        }
+    }
+    bool touched[1 + std::size(kHairModels)] = {};
+    const int back = g_headKeep.restore([&](uint32_t addr) -> uint32_t* {
+        for (int i = 0; i < nr; ++i)
+            if (addr >= ranges[i].from && addr + 48 <= ranges[i].to) {
+                touched[i] = true;
+                return reinterpret_cast<uint32_t*>(mem::ptr(addr));
+            }
+        return nullptr;
+    });
+    for (int i = 0; i < nr; ++i)
+        if (touched[i]) mark_changed(ranges[i].block);
+    if (back) LOG("[vr] Link's head given back for a view that shows it: %d joints still folded from first person "
+                  "(the game had not worked them out again)", back);
+}
 void hide_head(uint32_t link) {
     uint16_t count = 0;
     uint32_t block = 0;
@@ -6307,13 +6712,13 @@ void hide_head(uint32_t link) {
     if (!finite(neck) || !finite(head) || length(head - neck) > kHeadRadius) return;
     // the neck too, onto its own base: its skin (drawn by joint 14 alone) was a patch at the bottom of the view when
     // looking down; the collar, shared with the chest, only shrinks towards it (the arms, 5 to 12, come before it)
-    collapse_joint(body, kNeckJoint, neck);
+    fold_joint(body, kNeckJoint, neck);
     int collapsed = 1;
     // every head joint (15 to 28: the hat, the hair, the face), wherever it is: the hat's joints blown by the wind reach
     // past kHeadRadius from the head, and the hat was then drawn into the view (reported in the headset). The waist
     // and legs, which kHeadRadius kept out, are 29 on and never in this range
     for (int j = kHeadJoint; j < std::min<int>(count, kFirstLegJoint); ++j) {
-        collapse_joint(body, j, neck);
+        fold_joint(body, j, neck);
         ++collapsed;
     }
     mark_changed(block);
@@ -6322,7 +6727,7 @@ void hide_head(uint32_t link) {
         uint32_t b = 0;
         const uint32_t m = model_matrices(ld32(link + off), &n, &b);
         if (!m) continue;
-        for (int j = 0; j < n; ++j) collapse_joint(m, j, neck);
+        for (int j = 0; j < n; ++j) fold_joint(m, j, neck);
         mark_changed(b);
     }
     if (g_headLoggedLink != link) {
@@ -6539,9 +6944,17 @@ bool shield_hand(const Joint& to, const Config& c, int d, Quat& handRot) {
 void link_draw_begin(uint32_t link) {
     GameWorkTimer workTimer(GameWork::Draw);  // (docs/VR_PERFORMANCE.md: the VR work on the game thread)
     g_statusAddr = 0;
-    if (!running() || !link) return;
+    if (!link) return;
+    if (!running()) {
+        give_head_back(link);  // (VR ended with his head folded)
+        return;
+    }
     hookshot_tip_begin(link);  // (before the held model is moved: the tip against it as the game calculated them)
     const Config c = config();
+    // (a draw that does not hide his head: the head folded for first person given back, vr_head_keep.h)
+    if (!(play_view() && (!c.showBody || c.hideBody || c.trueSize) && int32_t(ld32(link + kCameraInfoIdx)) == 0 &&
+          !g_thirdPerson.load()))
+        give_head_back(link);
     if (!play_view()) return;
     // after everything below (the sword's shape swap included), whichever way it returns
     struct GrippedHands {
@@ -6550,7 +6963,7 @@ void link_draw_begin(uint32_t link) {
     } grippedHands{link};
     // the game's own close-camera presentation: no head, hair or hat in front of the eyes; arms and legs stay
     const int32_t idx = int32_t(ld32(link + kCameraInfoIdx));
-    if ((!c.showBody || c.hideBody) && idx == 0 && !g_thirdPerson.load()) {  // third person: his whole model, head included
+    if ((!c.showBody || c.hideBody || c.trueSize) && idx == 0 && !g_thirdPerson.load()) {  // third person: his whole model, head included
         g_statusAddr = play() + kPlayCameraInfo + uint32_t(idx) * kCameraInfoSize + kAttentionStatus;
         g_statusSaved = ld32(g_statusAddr);
         st32(g_statusAddr, g_statusSaved | kCloseCameraStatus);
@@ -7491,8 +7904,24 @@ static bool frame_correct_pose(uint32_t model, uint32_t n, uint32_t* w, float t)
 // sets itself
 constexpr uint32_t kFirstArmJoint = 5, kLastArmJoint = 12;
 static bool hides_from_view(uint32_t link, uint32_t model) {
-    if (!config().hideBody || g_thirdPerson.load() || !aspect::gameplay_camera() || subject_zoom_view()) return false;
+    // (True size: his body is not under your view: not drawn, nor are his arms (hide_arms); only his hands, free at the
+    // controllers: link_arms)
+    if (!(config().hideBody || config().trueSize) || g_thirdPerson.load() || !aspect::gameplay_camera() ||
+        subject_zoom_view())
+        return false;
     if (model == ld32(link + kBodyModel)) return true;
+    // (2026-11-20, a tester's video: "when you move analogs in opposite direction and circle ... the sword sheath circles
+    // around you ... All sheaths for all swords on links body must be hidden") the Master Sword's sheath is a model of
+    // its own and was drawn, swinging through the view as the hidden body turned under it. Always on his back: hidden
+    // like the body. (The Hero's Sword's is a part of the body's own model, hidden with it)
+    if (model == ld32(link + kSheathModel)) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LOG("[vr] first person: the Master Sword's sheath hidden with Link's body");
+        }
+        return true;
+    }
     std::lock_guard<std::mutex> lock(g_mutex);
     if (model == ld32(link + kShieldModel)) return !g_held.shieldOnHand;
     if (model == ld32(link + kEquipModel)) return g_held.gameHand < 0;  // (sheathed, stowed: on his back)
@@ -7507,7 +7936,12 @@ static bool hides_from_view(uint32_t link, uint32_t model) {
 // clavicle, upper arm and forearm drawn onto its hand's place, so the arm draws nothing and the hand (and what it
 // holds, placed from it before this) stays where it is. Only the drawn matrices, as for the body
 static bool hide_arms(uint32_t link, uint32_t model, uint32_t n, uint32_t* w) {
-    if (!config().hideArms || g_thirdPerson.load() || !aspect::gameplay_camera() || subject_zoom_view()) return false;
+    // (True size: hidden too, whatever vr.hideArms says: only the hands are drawn, free at the controllers. Drawing the
+    // arms from your shoulders was tried the same day and taken back after the headset: "the body and arms need to be
+    // hidden and need to not be connected to the hands, the hands must be able to move freely")
+    if (!(config().hideArms || config().trueSize) || g_thirdPerson.load() || !aspect::gameplay_camera() ||
+        subject_zoom_view())
+        return false;
     if (model != ld32(link + kBodyModel)) return false;
     // with his body hidden too (hides_from_view), the arms go onto the neck's base with it: onto the hands, the skin
     // the game weights between a shoulder and his chest stretched from each hand to the neck, a thin green thread from
@@ -8517,13 +8951,12 @@ void link_executing(uint32_t link, Cpu* cpu) {
     if (g_physicalLink && g_physicalLink == link) {
         const Config c = config();
         std::lock_guard<std::mutex> lock(g_mutex);
-        bool hit = false;
         for (int i = 0; i < 3; ++i) {
             const uint32_t cps = link + kAtCps + i * kCpsStride;
-            if ((ld32(cps) & 1) && (ld32(cps + 4) & 1) && g_ledger.record(ld32(cps + 8))) hit = true;
+            if ((ld32(cps) & 1) && (ld32(cps + 4) & 1) && g_ledger.record(ld32(cps + 8)))
+                sword_hit_feedback(c, cps, ld32(cps + 8), dominant_side(c), true);
             st32(cps, ld32(cps) & ~1u);
         }
-        if (hit && running()) session().haptic(dominant_side(c), c.hapticStrength, 0.06f);
     }
     g_physicalLink = 0;
     // the game's held item and hand indices back before his logic runs (apply_hands set them for the frames drawn)

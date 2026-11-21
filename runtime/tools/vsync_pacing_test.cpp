@@ -185,12 +185,91 @@ static void test_step_slots() {
     CHECK(next_slot(slot, slot + 2 * step, step, tick) == slot + 2 * step + tick);  // two steps late: a new schedule
 }
 
+
+// VR paced by the runtime (docs/VR_RUNTIME_PACING_PLAN.md): the grid follows the runtime's releases
+// (anchor_grid, ReleaseAnchor). The VR clock: a vsync of 1.5 refreshes of an 89.91 Hz headset, 12 ticks a
+// vsync, a frame (granule) 8 ticks at 90 fps, 16 at 45.
+static constexpr Clock kVr{16'683'350, 12};
+static void test_anchor_grid() {
+    const uint64_t g = 8;
+    const int64_t frame = kVr.granule_ns(g);
+    int64_t shift = 0;
+    // a release 1 ms after a boundary: that boundary moves 1 ms later
+    const int64_t b = kVr.time(800, 0);
+    CHECK(anchor_grid(kVr, shift, b + 1 * kMs, g) == 1 * kMs);
+    CHECK(kVr.time(800, shift) == b + 1 * kMs);
+    CHECK(kVr.index(b + 1 * kMs, shift) == 800);
+    // a release 1 ms before the next boundary: that one moves 1 ms earlier (nearest, never a frame)
+    const int64_t next = kVr.time(808, shift);
+    CHECK(anchor_grid(kVr, shift, next - 1 * kMs, g) == -1 * kMs);
+    CHECK(kVr.time(808, shift) == next - 1 * kMs);
+    // a release on a boundary: nothing moves
+    const int64_t on = kVr.time(816, shift);
+    CHECK(anchor_grid(kVr, shift, on, g) == 0);
+    // the step slots move with the boundaries: the slot's tick stays the same
+    const int64_t slot = kVr.time(824, shift) + 1000;  // (a slot just after a boundary: its tick is the next)
+    const uint64_t tick = slot_tick(kVr, slot, shift, g);
+    const int64_t d = anchor_grid(kVr, shift, kVr.time(824, shift) + 3 * kMs, g);
+    CHECK(slot_tick(kVr, slot + d, shift, g) == tick);
+    (void)frame;
+}
+
+// The runtime's releases against the game's grid over 30 s: the runtime's refresh 2 us longer than the headset's
+// rate says (0.18 ms of drift a second), xrWaitFrame returning +-0.15 ms around each release, and in one frame of
+// six the game asking 3 ms late (xrWaitFrame returns at once then). Without anchoring the grid drifts more than a
+// refresh's tenth; anchored from the display times its boundaries stay on the releases.
+static void test_runtime_releases() {
+    const uint64_t g = 8;
+    const int64_t refresh = 11'122'233 + 2'000;
+    const int64_t clockOffset = 5'000'000'000'000;  // (the runtime's XrTime against the game's clock)
+    std::mt19937 rng(7);
+    std::uniform_int_distribution<int64_t> jitter(-150'000, 150'000);
+    int64_t shift = 0, freeShift = 0;
+    ReleaseAnchor anchor;
+    const int64_t first = kVr.time(80, 0) + 4 * kMs;  // (the runtime's phase: 4 ms into the game's frame)
+    int64_t worstLocked = 0, worstFree = 0;
+    for (int k = 0; k < 2700; ++k) {
+        const int64_t release = first + int64_t(k) * refresh;
+        const int64_t display = release + 2 * refresh + clockOffset;
+        int64_t returned = release + jitter(rng);
+        if (k % 6 == 5) returned = release + 3 * kMs;  // (asked late: returns at once)
+        const int64_t offset = anchor.update(display - returned, refresh);
+        anchor_grid(kVr, shift, display - offset, g);
+        if (k > 90) {  // (after a second to settle)
+            const uint64_t i = kVr.index(release, shift) / g * g;
+            const int64_t a = release - kVr.time(i, shift), b2 = kVr.time(i + g, shift) - release;
+            worstLocked = std::max(worstLocked, std::min(a, b2));
+            const uint64_t j = kVr.index(release, freeShift) / g * g;
+            const int64_t fa = release - kVr.time(j, freeShift), fb = kVr.time(j + g, freeShift) - release;
+            worstFree = std::max(worstFree, std::min(fa, fb));
+        }
+    }
+    CHECK(worstLocked < 400'000);           // within 0.4 ms of every release (the late returns ignored)
+    CHECK(worstFree > refresh / 10);        // (the game's own timer: drifted)
+    // a new rhythm (the runtime's phase moves 5 ms, a hitch): locked again within 20 frames
+    int64_t worstAfter = 0;
+    for (int k = 0; k < 200; ++k) {
+        const int64_t release = first + 5 * kMs + int64_t(3000 + k) * refresh;
+        const int64_t display = release + 2 * refresh + clockOffset;
+        const int64_t offset = anchor.update(display - release, refresh);
+        anchor_grid(kVr, shift, display - offset, g);
+        if (k >= 20) {
+            const uint64_t i = kVr.index(release, shift) / g * g;
+            const int64_t a = release - kVr.time(i, shift), b2 = kVr.time(i + g, shift) - release;
+            worstAfter = std::max(worstAfter, std::min(a, b2));
+        }
+    }
+    CHECK(worstAfter < 100'000);
+}
+
 int main() {
     test_flip_executed();
     test_step_slots();
     test_on_time();
     test_slightly_slow();
     test_hitch();
+    test_anchor_grid();
+    test_runtime_releases();
     if (g_failed) {
         std::fprintf(stderr, "vsync_pacing_test: %d check(s) failed\n", g_failed);
         return 1;

@@ -133,6 +133,7 @@ The controller mapping for first person, third person and the boat, plus the swo
 ## Development status
 
 **Experimental and in active development.** The whole game is playable in VR. Current releases:
+[0.6.0](https://github.com/VR-WakerHD/VR-WakerHD/releases/tag/v0.6.0) (sword play, arrow swapping, True size),
 [0.5.1](https://github.com/VR-WakerHD/VR-WakerHD/releases/tag/v0.5.1) (stability update) and
 [0.5.0](https://github.com/VR-WakerHD/VR-WakerHD/releases/tag/v0.5.0) (first public release). What changed:
 [Releases](https://github.com/VR-WakerHD/VR-WakerHD/releases).

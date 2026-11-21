@@ -34,6 +34,9 @@ void set_tv_format(uint32_t gx2Format, bool tv);
 void invalidate(uint32_t flags, uint32_t addr, uint32_t size);
 void flush();                    // drain: submit and wait (readbacks, tools)
 void flush_async();              // GX2Flush: submit without waiting
+// (VR, PC) the render thread out of game commands (render::before_idle): the frame recorded so far submitted, so the GPU
+// works while the game builds the rest. At most once a millisecond; WWHD_VK_IDLE_SUBMIT=0 off
+void submit_on_idle();
 void wait_idle();
 void write_back_linear_targets();  // GX2DrawDone: linear render targets to guest memory (surfaces.cpp)
 uint64_t frame_count();

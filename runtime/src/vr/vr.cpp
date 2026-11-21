@@ -152,7 +152,8 @@ Vec3 view_velocity() {
 }
 float world_scale() {
     const Config c = config();
-    if (!c.matchLinkBody || !(c.realArmLength > 0)) return c.unitsPerMetre;
+    // (True size: the world at its own scale, you at yours; matching it to Link's arms would make you his size again)
+    if (c.trueSize || !c.matchLinkBody || !(c.realArmLength > 0)) return c.unitsPerMetre;
     return world_scale_for_arms(g_linkArm.load(), c.realArmLength);
 }
 void set_link_arm_length(float units) {
@@ -293,8 +294,15 @@ std::atomic<bool> g_appBackground{false}, g_xrUnfocused{false};
 // run, a black screen (before the pause, such a start played). The app sent to the background holds it always
 std::atomic<bool> g_xrFocusedOnce{false};
 void note_away(const char* what, bool on) {
+#if defined(__ANDROID__) || defined(WWHD_STEAM_FRAME_NATIVE) || (defined(__linux__) && defined(__aarch64__))
     LOG("[vr] headset %s: %s (%s)", on ? "away" : "back", what,
         on ? "the game held and the record worker stopped until it is back" : "the game runs again");
+#else
+    // (2026-11-20, a Windows player's log: "headset away ... the game held" while the game ran on at 30 steps a second
+    // for three minutes) on PC headset_away() holds nothing (the hold is for standalone headsets: a Quest driver crash,
+    // docs/VR_ANDROID.md), so the log says what happens
+    LOG("[vr] headset %s: %s (PC: the game keeps running; only standalone headsets hold it)", on ? "away" : "back", what);
+#endif
 }
 }  // namespace
 void set_app_background(bool on) {

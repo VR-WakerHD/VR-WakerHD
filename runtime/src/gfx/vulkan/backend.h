@@ -279,6 +279,8 @@ struct Renderer {
  bool imageView2DOn3DImage=true; // 2D views of volume slices (render targets); core Vulkan 1.1, optional in the portability subset
  bool samplerMipLodBias=true,separateStencilMaskRef=true,constantAlphaColorBlendFactors=true,vertexAttributeAccessBeyondStride=true,samplerMirrorClampToEdge=false;
  VkPhysicalDeviceProperties properties{}; VkQueue queue=VK_NULL_HANDLE; uint32_t queueFamily=0;
+ // (VR, xr_queue_sync.h) the OpenXR runtime's own queue of the graphics family (UINT32_MAX: it shares `queue`)
+ uint32_t xrQueueIndex=UINT32_MAX; VkQueue xrQueue=VK_NULL_HANDLE;
  bool gpuTimestampsEnabled=false,gpuPassTimestampsEnabled=false;
  uint32_t gpuTimestampValidBits=0;
  struct GpuTimestampStats {

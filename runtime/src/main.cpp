@@ -15,6 +15,7 @@
 #include <csignal>
 #include <filesystem>
 #include "guest_addr.h"
+#include "pad_fault_guard.h"
 #include "mods/guest_mods.h"
 #include "mods/code_mods.h"
 #include "mods/mod_hash.h"
@@ -128,6 +129,9 @@ extern "C" void wwhd_compile_journal_on_crash() __attribute__((weak));  // gfx/v
 extern "C" void wwhd_replay_crash_note(int fd, void (*out)(int, const char*, size_t)) __attribute__((weak));
 
 static void crash_handler(int sig, siginfo_t* si, void* uctx) {
+    // (pad_fault_guard.h, 2026-11-16) a fault in the game's memory inside a guarded feature of the controller read:
+    // back to it, the game goes on (jumps away; returns for every other fault)
+    pad_fault_guard::recover(sig, (uintptr_t)si->si_addr);
     // a crash while compiling a shader or pipeline: noted so the next start leaves it out (compile_journal.h)
     if (wwhd_compile_journal_on_crash) wwhd_compile_journal_on_crash();
     uintptr_t a = (uintptr_t)si->si_addr;

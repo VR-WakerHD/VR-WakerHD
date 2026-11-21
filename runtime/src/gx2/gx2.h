@@ -38,6 +38,13 @@ int step_frames();      // 40 fps: frames the next logic step has before the one
 void lock_vsync_to_display(int64_t period);
 void delay_vsync_grid(int64_t ns);
 int64_t vsync_period_ns();  // 16'683'333 (59.94 Hz), or the headset's
+// VR paced by the runtime (docs/VR_RUNTIME_PACING_PLAN.md): the grid's nearest frame boundary moved to `at`, the
+// moment the runtime released a real frame (its step slots with it); and how far it moved since the last call
+void anchor_vsync_grid(std::chrono::steady_clock::time_point at);
+void take_anchor_stats(uint64_t& moves, double& meanMs, double& maxMs);
+// the calling thread's waits (GX2WaitForVsync, and for the render thread) since its last call, ns (the frame planner, on
+// the game thread)
+uint64_t take_game_waited_ns();
 // swaps the render thread has finished executing (OP_SWAP): during a swap's own execution (render::swap, VR's
 // frame_begin among it) that swap is this + 1. VR pairs its display time with that number (vr.h set_real_frame_display)
 uint64_t swaps_executed();

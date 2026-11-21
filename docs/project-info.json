@@ -81,6 +81,7 @@
   ],
   "features": [
     "First-person view at Link's eyes with 6DoF head tracking",
+    "True size: first person at the player's own height",
     "Third-person view with the game's camera turned by the head",
     "Motion controllers with arm inverse kinematics",
     "Physical sword with swing attacks and hit vibration",
@@ -94,14 +95,15 @@
     "Comfort options",
     "Multiview stereo rendering and foveated rendering on Quest",
     "Dynamic resolution, upscaling and frame synthesis",
-    "VR launcher"
+    "VR launcher",
+    "Fire, ice and light arrows chosen while aiming (arrow swapping)"
   ],
   "developmentStatus": "Experimental, in active development",
   "latestRelease": {
-    "version": "0.5.1",
-    "title": "VR-WakerHD 0.5.1: Stability Release",
-    "date": "2026-11-16",
-    "url": "https://github.com/VR-WakerHD/VR-WakerHD/releases/tag/v0.5.1"
+    "version": "0.6.0",
+    "title": "VR-WakerHD 0.6.0: Sword Play, Arrow Swapping and True Size",
+    "date": "2026-11-21",
+    "url": "https://github.com/VR-WakerHD/VR-WakerHD/releases/tag/v0.6.0"
   },
   "documentation": {
     "readme": "https://github.com/VR-WakerHD/VR-WakerHD/blob/main/README.md",

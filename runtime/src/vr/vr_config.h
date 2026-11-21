@@ -114,6 +114,14 @@ struct Config {
     bool enabled = true;                // start in VR when an OpenXR runtime and headset are available
     Posture posture = Posture::Standing;
     float heightOffset = 0;             // metres added to the calibrated eye height (seated players: +)
+    // True size (asked for by players, 2026-11-20: "they want to be their own size and height"): first person from your
+    // own eye height above Link's feet, in his world at its scale (vr.unitsPerMetre), instead of from his eyes, about
+    // 1 m up. A grown player stands taller than Link; his body and arms are not drawn, only his hands, free at the
+    // controllers.
+    // Your eye height is the headset's above the floor (a floor-level STAGE space, standing) or else vr.playerHeight.
+    // Postures (crawling, swimming, climbing) still put the view at his eyes. docs/VR_FIRST_PERSON_CAMERA.md, "True size"
+    bool trueSize = false;
+    float playerHeight = 1.70f;         // metres: your height, for True size without floor tracking or when seated
     float unitsPerMetre = 100;          // game units per real metre (Link is about 1.2 m tall); see matchLinkBody
     // the world scaled to Link's body: game units per metre = Link's arm over yours (vr.realArmLength), so your hands
     // are drawn where they are and his arms reach as far as yours; off: vr.unitsPerMetre
@@ -299,6 +307,35 @@ struct Config {
     // TPVR's physical sword: while the sword hand swings (swingStartSpeed), the blade cuts and hits along its tracked
     // path without the game's attack animation; full swings still play the game's attack
     bool physicalSword = true;
+    // (docs/VR_SWORD_COMBAT_PLAN.md) sword hits' haptics by the blade's speed where it struck (vr_sword_motion.h); off:
+    // one pulse of hapticStrength for every hit, as before
+    bool swordImpactHaptics = true;
+    // m/s of the blade three quarters of the way to its tip: as fast or faster arms the physical sword (its hits) even
+    // when the hand moves slower than swingStartSpeed (a swing from the elbow or wrist); 0: the hand's swings only.
+    // The game's attack animations still start from the hand's swing (vr_sword_motion.h blade_arm)
+    // (4.5 since 2026-11-20 with swordSwingDistance: a light flick reached 3 m/s and Link yelled, reported in the
+    // headset; BladeSwing, vr_sword_motion.h)
+    float physicalSwordSpeed = 4.5f;
+    // metres the blade's measuring point (three quarters to its tip) must travel at that speed before a swing counts
+    // (its hits armed, Link's voice): a real swing, not a light movement of the hand. With vr.swordPlayerOnly
+    float swordSwingDistance = 0.30f;
+    // (2026-11-20, asked for with a video: "moving your arm normally makes link yell ... the yell should only happen on
+    // real swings", "only plays when you swing a bit harder") m/s the blade's measuring point must reach in a real swing
+    // before Link yells: the swing cuts from vr.physicalSwordSpeed, the yell only once it is this hard. Once a swing,
+    // when its peak gets there. 0: every real swing, as before
+    float swordVoiceSpeed = 7.0f;
+    // (2026-11-20, asked for: "when motion controls are swinging all swings and hits need to be done by the player ...
+    // like a real sword") first person with the sword: no swing presses the game's attacks (B, its cuts, the jump
+    // attack, combo resets, queued swings); the tracked blade cuts where it goes, locked on too. The game's moves stay
+    // on their buttons (asked for: "parry and spin and b attacks should stay"): B attacks, A parries (the finishing cut
+    // the game's, started by your swing), the spin attack. Off: swings play the game's attacks as before
+    bool swordPlayerOnly = true;
+    // m/s of the blade where it struck: a physical-sword hit this fast or faster gets a finishing cut's power (2, the
+    // game's normal cut 1). 0: off (the game's own power for every hit)
+    // (10 since 2026-11-20, the player-only sword: the first headset test's hits struck at 2.3 to 22.7 m/s)
+    float swordStrongHitSpeed = 10.0f;
+    // (diagnostics) once a second, the sword's motion as measured: samples, their rate, the tip's peak speed
+    bool swordDebug = false;
     // the item wheel (docs/VR_ITEM_WHEEL.md): reach over the off hand's shoulder, choose with the right stick, bring the
     // hand forward to put the item on itemWheelButton (X: the off hand's primary button)
     bool itemWheel = true;
@@ -436,6 +473,15 @@ struct Config {
 // scale vr.matchLinkBody gives for an arm of `realArmLength` metres: his arm over yours, within vr.unitsPerMetre's range.
 // The settings show it; the game uses the arm it measures (the same in every scene so far).
 constexpr float kLinkArmUnits = 35.3f;
+
+// True size (vr.trueSize): your eye height in metres. The headset's height above the floor at the recentre, when the
+// tracking space is floor level (STAGE) and you play standing, and it is a plausible standing eye height; else your
+// height (vr.playerHeight) times the eyes' share of a standing height (about 93 %)
+constexpr float kEyeShareOfHeight = 0.933f;
+inline float true_size_eye_metres(bool stageSpace, Posture posture, float headAboveFloor, float playerHeight) {
+    if (stageSpace && posture == Posture::Standing && headAboveFloor > 0.9f && headAboveFloor < 2.2f) return headAboveFloor;
+    return std::clamp(playerHeight, 1.0f, 2.3f) * kEyeShareOfHeight;
+}
 inline float matched_world_scale(float realArmLength) {
     return realArmLength > 0 ? std::clamp(kLinkArmUnits / realArmLength, 40.0f, 250.0f) : 100.0f;
 }
@@ -459,6 +505,7 @@ struct FloatKey { const char* key; float Config::*field; float lo, hi; };
 inline const FloatKey kFloats[] = {
     {"vr.heightOffset", &Config::heightOffset, -1.0f, 1.0f},
     {"vr.unitsPerMetre", &Config::unitsPerMetre, 40.0f, 250.0f},
+    {"vr.playerHeight", &Config::playerHeight, 1.0f, 2.3f},
     {"vr.snapDegrees", &Config::snapDegrees, 10.0f, 90.0f},
     {"vr.smoothDegreesPerSecond", &Config::smoothDegreesPerSecond, 20.0f, 360.0f},
     {"vr.moveSpeed", &Config::moveSpeed, 0.2f, 1.0f},
@@ -497,6 +544,10 @@ inline const FloatKey kFloats[] = {
     {"vr.swingThrustDistance", &Config::swingThrustDistance, 0.05f, 0.6f},
     {"vr.swingCooldown", &Config::swingCooldown, 0.0f, 1.5f},
     {"vr.hapticStrength", &Config::hapticStrength, 0.0f, 1.0f},
+    {"vr.swordStrongHitSpeed", &Config::swordStrongHitSpeed, 0.0f, 12.0f},
+    {"vr.physicalSwordSpeed", &Config::physicalSwordSpeed, 0.0f, 15.0f},
+    {"vr.swordSwingDistance", &Config::swordSwingDistance, 0.05f, 1.0f},
+    {"vr.swordVoiceSpeed", &Config::swordVoiceSpeed, 0.0f, 20.0f},
     {"vr.menuZoomOut", &Config::menuZoomOut, 1.0f, 4.0f},
     {"vr.cutsceneZoomOut", &Config::cutsceneZoomOut, 1.0f, 3.0f},
     {"vr.textZoomOut", &Config::textZoomOut, 1.0f, 3.0f},
@@ -538,12 +589,14 @@ inline const BoolKey kBools[] = {
     {"vr.enabled", &Config::enabled}, {"vr.leftHanded", &Config::leftHanded},
     {"vr.desktopViewFill", &Config::desktopViewFill},
     {"vr.cutsceneFollow", &Config::cutsceneFollow}, {"vr.showBody", &Config::showBody},
-    {"vr.hideBody", &Config::hideBody},
+    {"vr.hideBody", &Config::hideBody}, {"vr.trueSize", &Config::trueSize},
     {"vr.hideArms", &Config::hideArms}, {"vr.shieldFreeRotation", &Config::shieldFreeRotation},
     {"vr.shadowsOnLink", &Config::shadowsOnLink},
     {"vr.turnSmoothing", &Config::turnSmoothing}, {"vr.handsLayer", &Config::handsLayer},
     {"vr.trackedSword", &Config::trackedSword}, {"vr.firstPersonTalk", &Config::firstPersonTalk}, {"vr.autoFrameRate", &Config::autoFrameRate},
     {"vr.physicalSword", &Config::physicalSword}, {"vr.itemWheel", &Config::itemWheel},
+    {"vr.swordImpactHaptics", &Config::swordImpactHaptics}, {"vr.swordDebug", &Config::swordDebug},
+    {"vr.swordPlayerOnly", &Config::swordPlayerOnly},
     {"vr.armIK", &Config::armIK}, {"vr.matchLinkBody", &Config::matchLinkBody},
     {"vr.detachedArms", &Config::detachedArms}, {"vr.aimLaser", &Config::aimLaser},
     {"vr.desktopGamePad", &Config::desktopGamePad}, {"vr.armHearts", &Config::armHearts},

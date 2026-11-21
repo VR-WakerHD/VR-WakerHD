@@ -60,6 +60,17 @@ int vr_display_hz();
 // tries the full rate again (pacing::kAutoBackoffStreamed)
 void set_vr_streamed(bool on);
 void set_vr_stream_rates(bool on);  // a streamed headset with vr.streamingOptimal: 72 / 80 fps at 72 / 80 Hz
+// VR paced by the runtime (docs/VR_RUNTIME_PACING_PLAN.md): the game thread's waits (gx2::take_game_waited_ns) are
+// taken out of each pass's time, as the pacer's own sleeps are, so the planner compares the passes' work, not the
+// headset's rhythm; and a real frame shown a refresh later than its slot (vr_vulkan.cpp, render thread) is noted:
+// three within a second hold one in-between frame back for a second
+void set_vr_runtime_paced(bool on);
+bool vr_runtime_paced();
+// (2026-11-20) the VR runtime in its slow state (SteamVR on Linux, state B: vr_vulkan.cpp state_recovery): its frames
+// come late whatever the game does, so Auto Mode is not judged meanwhile (as in a menu) and settles again after it
+void set_vr_runtime_slow(bool on);
+void note_vr_missed_refresh();
+uint64_t vr_missed_refreshes();  // (every miss noted since the start; the log)
 // VR (vr.frameRate): the session's frame-rate mode, pacing::VrFrameMode (0 unlocked, 1 half the headset's rate:
 // 45 fps at 90 Hz, 2 the game's own 30 fps); set each headset frame, applied from the next step on
 void set_vr_frame_mode(int mode);

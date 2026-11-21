@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <vector>
@@ -37,6 +38,13 @@ std::atomic<uint64_t>* g_hint = nullptr;       // newest hint stamp per page (en
 std::atomic<bool> g_hints{false};
 std::atomic<uint64_t> g_hint_calls{0}, g_hint_bytes{0};
 std::atomic<uint64_t> g_protect_failures{0};  // pages arm() could not protect
+// (probe, 2026-11-20: when the game first writes a watched page after a GX2DrawDone returned) armed by probe_mark,
+// taken by the first write fault after it; ns of the steady clock
+std::atomic<bool> g_probeArmed{false};
+std::atomic<void (*)()> g_guard{nullptr};
+std::atomic<int64_t> g_probeFirstNs{-1};
+std::atomic<uint32_t> g_probeAddr{0};
+std::atomic<int64_t> g_probeT0{0};
 // arm() vs host writes: a page inside a pending kernel write must stay writable until the write ends
 std::mutex g_m;
 std::vector<std::pair<uint64_t, uint64_t>> g_pins;  // page ranges [first, last] of pending host writes
@@ -66,11 +74,18 @@ bool on_write_fault(uintptr_t a) {
     if (a < (uintptr_t)g_base || off >= g_size) return false;
     uint64_t page = off >> g_shift;
     if (!(g_flags[page].load(std::memory_order_acquire) & kEver)) return false;
+#ifdef _WIN32
+    if (auto guard = g_guard.load(std::memory_order_acquire)) guard();  // (the frame overlap: before the write goes on)
+#endif
     if (!set_rw(page, 1, true)) return false;
     g_flags[page].fetch_and((uint8_t)~kProt, std::memory_order_acq_rel);
     stamp_page(page, g_clock.fetch_add(1, std::memory_order_acq_rel) + 1);
     g_seq.fetch_add(1, std::memory_order_acq_rel);
     g_faults.fetch_add(1, std::memory_order_relaxed);
+    if (g_probeArmed.load(std::memory_order_relaxed) && g_probeArmed.exchange(false, std::memory_order_acq_rel)) {
+        g_probeFirstNs.store(std::chrono::steady_clock::now().time_since_epoch().count() - g_probeT0.load(), std::memory_order_release);
+        g_probeAddr.store((uint32_t)off, std::memory_order_release);
+    }
     return true;
 }
 
@@ -239,6 +254,7 @@ void enable_hints() {
 }
 
 void hint(uint32_t addr, uint32_t size) {
+    if (auto guard = g_guard.load(std::memory_order_acquire)) guard();  // (the frame overlap)
     if (!g_hints.load(std::memory_order_acquire) || size >= 0x10000000u) return;
     uint64_t first, last;
     if (!page_range(addr, size, first, last)) return;
@@ -251,8 +267,25 @@ void hint(uint32_t addr, uint32_t size) {
     g_seq.fetch_add(1, std::memory_order_acq_rel);
     g_hint_calls.fetch_add(1, std::memory_order_relaxed);
     g_hint_bytes.fetch_add(size, std::memory_order_relaxed);
+    // (probe: a hint is the game's own "this range was written", for the ranges the buffer cache keeps by hints alone)
+    if (g_probeArmed.load(std::memory_order_relaxed) && g_probeArmed.exchange(false, std::memory_order_acq_rel)) {
+        g_probeFirstNs.store(std::chrono::steady_clock::now().time_since_epoch().count() - g_probeT0.load(), std::memory_order_release);
+        g_probeAddr.store(addr, std::memory_order_release);
+    }
 }
 
+void set_write_guard(void (*guard)()) { g_guard.store(guard, std::memory_order_release); }
+void probe_mark() {
+    g_probeFirstNs.store(-1, std::memory_order_relaxed);
+    g_probeT0.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+    g_probeArmed.store(true, std::memory_order_release);
+}
+bool probe_take(int64_t& ns, uint32_t& addr) {
+    g_probeArmed.store(false, std::memory_order_release);
+    ns = g_probeFirstNs.exchange(-1, std::memory_order_acq_rel);
+    addr = g_probeAddr.load(std::memory_order_acquire);
+    return ns >= 0;
+}
 void take_stats(uint64_t& faults, uint64_t& protectedPages) {
     faults = g_faults.exchange(0, std::memory_order_relaxed);
     protectedPages = g_protected.exchange(0, std::memory_order_relaxed);

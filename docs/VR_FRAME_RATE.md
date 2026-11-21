@@ -203,6 +203,74 @@ keep 59.94 Hz. Once the clocks are locked, the frames arrive at the same point o
 the deadline, `note_display` sees three or more frames land on another refresh within 2 s and moves the grid half a
 refresh later, once, at most every 5 s. The log notes each move ("frames near the headset's deadline").
 
+## Paced by the runtime (2026-11-18, PC VR; replaces the phase handling above there)
+
+The lock above fixed the grid's period but never its phase: nothing compared the game's grid with the runtime's
+frames after it started, and xrWaitFrame came only at the swap, after the frame was drawn. Under SteamVR that call
+returned at once (0.01 ms in a 2026-11-18 frame log), so the game ran on its own timer and its phase drifted against
+the runtime's (8.2 to 9.3 ms of the refresh over 16 s, a 3 ms jump at a hitch). Frames that drifted onto the
+runtime's deadline were shown late (reprojected, a double image) or moved a slot (the "runtime's frame smoothing"
+switching on and off).
+
+Now (`docs/VR_RUNTIME_PACING_PLAN.md`; `WWHD_VR_RUNTIME_PACING=0` keeps the old timing):
+- The frame loop is the Snowrunner VR mod's (its `src/xr/xr_mirror.cpp`, its Linux fix): at each frame the render
+  thread waits for the end-frame thread's last xrEndFrame, polls events, calls xrWaitFrame and xrBeginFrame, copies
+  the eyes and hands xrEndFrame to the end-frame thread. On Linux SteamVR's xrEndFrame waits for the GPU to finish
+  the frame (~9-11 ms a call), so it runs on that thread there; on Windows it returns at once and runs on the render
+  thread (`WWHD_VR_END_FRAME_THREAD=1/0`). A wait ahead after xrEndFrame, a slot keeper and a hold of the game's own
+  were tried on 2026-11-18 and removed: the mod's note on decoupling submission from the game's frames ("tried and
+  removed") held for us too.
+- The game's vsync grid is anchored to the runtime's release of each real frame (its xrWaitFrame) (its display time less a smoothed
+  offset between the two clocks: `vsync_pacing::ReleaseAnchor`, `gx2::anchor_vsync_grid`), the logic steps' slots
+  with it: flips and the 30 Hz steps follow the runtime's display times. A streamed headset's display times move with
+  the network and do not steer it. The half-refresh move above is off in this mode.
+- The frame planner times each pass by its work (the game thread's waits for the vsync and the render thread left
+  out), so the title and menus no longer measure the headset's rhythm as work and drop to 2 frames a step. A real
+  frame shown a refresh late is noted: three within a second hold one in-between frame back for a second (Capped
+  rates); Auto Mode counts each as an in-between frame not drawn and decides the rate itself.
+- Gameplay, game speed and the game's own clock (OSGetTime) are unchanged; Fast Forward keeps the old timer.
+
+The log, every 10 s: `[vr] paced by the runtime (10 s)` (the grid's moves, real frames a refresh late) and `[vr] frame
+deadlines (10 s)` (each xrEndFrame's margin before its own display time, on the game's clock: the runtime's
+XR_KHR_convert_timespec_time / XR_KHR_win32_convert_performance_counter_time).
+
+## SteamVR's slow state, Auto Mode and the recovery's skips (2026-11-20)
+
+A SteamVR 2.19.4 run (Linux, the VR test fortress) stayed in SteamVR's slow state, xrEndFrame 7 to 11 ms a frame,
+almost throughout. In it the game drew only 26 % of its in-between frames and **Auto Mode went to 45 fps**. At 45 fps
+every game frame is two of the runtime's (the real frame and a refresh fill), and each waits for the last xrEndFrame
+(the strict order SteamVR on Linux needs), so the render thread took 33 ms a pass: **30 fps came out, and the game ran
+at half speed** (logic 15 to 19 steps a second). The recovery's skipped slots added more fills. The same scene and
+build held 89 fps on native Monado.
+
+- **Auto Mode is not judged while the runtime is in its slow state** (`interp::set_vr_runtime_slow`, set by
+  `state_recovery`), as in a menu: those misses are the runtime's, not the game's work. After the state ends it
+  settles first, as after a load. Logged: `[interp] VR frame rate auto: not judged while the runtime is in its slow
+  state`.
+- **The recovery skips a slot only while the game draws a frame every refresh.** Below that every other slot is a
+  fill already; a skip changes nothing SteamVR sees and adds a wait. Logged: `[vr] SteamVR state: no slot skipped`.
+- Still open: a refresh fill pays a whole xrEndFrame wait of its own, which is what made 45 fps 30 here.
+
+**The frame handed to the GPU while it is built (2026-11-20).** The next run (SteamVR 2.19.4, the fortress) showed
+where the end-frame thread's time went: before xrEndFrame it waited for the frame's writes into the eye images
+("graphics queue taken", 1.6 to 3.3 ms at the median, up to 5.6), about the GPU's whole frame (2 to 4.5 ms). The frame
+reached the GPU only at its end, unless the game flushed. With xrEndFrame at 7 to 11 ms the thread was busy 10.9 ms of
+an 11.1 ms frame, and the render thread waited for it, 12 ms at a time. Now, each time the render thread goes idle
+waiting for the game's next commands (`render::before_idle`), the frame so far is submitted
+(`gfxvk::submit_on_idle`, at most once a millisecond; VR on PC; `WWHD_VK_IDLE_SUBMIT=0` off), so the GPU works while the
+game builds the rest and only the tail is left at the hand-over. Logged: `[vulkan] idle submits (10 s)`. To compare
+in the next run: "graphics queue taken" and the render thread's waits for the end-frame thread.
+
+**The detector sees the mixed slow state (2026-11-20).** The slow state was detected after ten frames in a row with
+xrEndFrame over 8 ms. In the same run SteamVR was mostly in a mixed form, xrEndFrame alternating about 3 and 10 ms
+(the median 6 to 7.5 ms): never ten in a row, so Auto Mode, judging meanwhile, went to 45 fps before the detector saw
+anything, and later the detector flipped between the states. Now the average of the last 20 frames decides
+(`vr_runtime_slow.h`, tested): slow above 5 ms, good again below 3 ms (state A averages about 2 ms, the mixed form 6
+to 7.5, state B 10.8). The log's switch lines give the average.
+
+(Moving the whole OpenXR frame loop to a thread of its own instead was ruled out: the Snowrunner VR mod tried
+decoupling the render rate from the submit rate and removed it, "a self-reinforcing collapse".)
+
 ## Quest defaults: 72 Hz, capped at 36 fps (2026-11-11, replaced the same day: below)
 
 On a Meta Quest (`quest_headset()`) the defaults are **72 Hz** (`default_refresh_rate()`) with the frame rate **capped

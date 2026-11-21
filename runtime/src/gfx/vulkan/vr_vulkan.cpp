@@ -46,6 +46,9 @@
 #include "vr_sgsr2.h"
 #include "vr_fsr1.h"
 #include "motion_pass.h"
+#include "gx2/vsync_pacing.h"
+#include "xr_queue_sync.h"
+#include "vr/vr_runtime_slow.h"
 #include "vr_framesynth.h"
 #include "vr_genframe.h"
 #include "fov_diag.h"
@@ -53,7 +56,13 @@
 #include "ngx_vk.h"
 #include "vr/vr_upscale.h"
 #include <unordered_map>
-namespace gx2 { void lock_vsync_to_display(int64_t period); void delay_vsync_grid(int64_t ns); uint64_t swaps_executed(); }  // (gx2_core.cpp)
+namespace gx2 {  // (gx2_core.cpp)
+void lock_vsync_to_display(int64_t period);
+void delay_vsync_grid(int64_t ns);
+uint64_t swaps_executed();
+void anchor_vsync_grid(std::chrono::steady_clock::time_point at);
+void take_anchor_stats(uint64_t& moves, double& meanMs, double& maxMs);
+}
 namespace vr::game { bool menu_open(); bool name_entry_open(); bool hands_layer_view(bool force); }  // (vr_game.cpp: the VR menu, the new save's name, first-person play)
 #endif
 
@@ -64,6 +73,7 @@ int preferred_device(const std::vector<VkPhysicalDevice>&) { return -1; }
 VkResult create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo& ci, VkDevice* out) {
     return vkCreateDevice(physical, &ci, nullptr, out);
 }
+bool wants_queue(VkPhysicalDevice) { return false; }
 void device_ready() {}
 void frame_begin() {}
 bool skip_desktop_gamepad() { return false; }
@@ -458,6 +468,7 @@ int low_rate_repeats(double hz, int fps) {
 struct Stats {
     std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
     uint64_t begun = 0, submitted = 0, withViews = 0, renderFrame = 0, logicSteps = 0, keptAlive = 0, viewsReused = 0;
+    uint64_t notAsked = 0;  // frames begun the runtime asked no picture for (shouldRender false: the session not visible)
     double waitMs = 0;
 } g_stats;
 // frame timing (every 10 s, docs/VR_PERFORMANCE.md): per frame shown, without allocating per frame
@@ -499,14 +510,298 @@ vr::xr::Session& xs() { return vr::session(); }
 // it reads is copied into its job or written only after that wait (the views, the quads, the synthesis images).
 // On by default (PS VR2, 2026-11-03: the render thread never waited for it, 87 to 89 fps steady); WWHD_VR_END_FRAME_THREAD=0
 // keeps the frame's end on the render thread
+// ---- The runtime's own queue (2026-11-18; xr_queue_sync.h). The session ran on the game's graphics queue, and
+// OpenXR needs that queue externally synchronized for every call that may use it: the end-frame thread held the
+// game's queue lock (graphics_queue_mutex) through the images' release and xrEndFrame. On Linux SteamVR's xrEndFrame
+// waits for the GPU (~10.8 ms a frame in its slow state, B): for all of that no graphics submission of the game could
+// be made (the render thread's and the record worker's both take the lock), so the next frame's GPU work started late,
+// finished late, and SteamVR's next xrEndFrame waited for it in turn: B kept itself going. Now the runtime gets a queue
+// of the graphics family of its own (the device made with one more), the OpenXR calls take a lock of their own, and
+// two timeline semaphores order the two queues (OpenXR's acquire and release barriers sit on the runtime's queue: the
+// game's writes come after the acquires and before the release). A late frame no longer delays the next one's
+// submission, so it fades out the way it does on Monado. PC VR; WWHD_VR_OWN_QUEUE=0: the game's queue as before
+namespace xr_queue {
+std::mutex g_mutex;
+bool g_own = false;
+uint64_t g_acquired = 0, g_written = 0;  // the last values signalled / armed
+bool wanted() {
+#if defined(__ANDROID__) || defined(WWHD_STEAM_FRAME_NATIVE) || (defined(__linux__) && defined(__aarch64__))
+    return false;
+#else
+    const char* e = std::getenv("WWHD_VR_OWN_QUEUE");
+    return !(e && *e == '0');
+#endif
+}
+// for an OpenXR call that may use the runtime's queue: its own lock, or the game's queue lock when it shares it
+std::unique_lock<std::mutex> lock() { return std::unique_lock<std::mutex>(g_own ? g_mutex : graphics_queue_mutex()); }
+std::unique_lock<std::mutex> try_lock() {
+    return std::unique_lock<std::mutex>(g_own ? g_mutex : graphics_queue_mutex(), std::try_to_lock);
+}
+VkSemaphore make_timeline() {
+    VkSemaphoreTypeCreateInfo type{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
+    type.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+    VkSemaphoreCreateInfo ci{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    ci.pNext = &type;
+    VkSemaphore sem = VK_NULL_HANDLE;
+    return vkCreateSemaphore(R.device, &ci, nullptr, &sem) == VK_SUCCESS ? sem : VK_NULL_HANDLE;
+}
+PFN_vkWaitSemaphores g_waitSemaphores = nullptr;
+void ready() {
+    if (!R.xrQueue) return;
+    {
+        PFN_vkVoidFunction f = vkGetDeviceProcAddr(R.device, "vkWaitSemaphores");
+        if (!f) f = vkGetDeviceProcAddr(R.device, "vkWaitSemaphoresKHR");
+        g_waitSemaphores = reinterpret_cast<PFN_vkWaitSemaphores>(f);
+    }
+    const VkSemaphore a = make_timeline(), w = make_timeline();
+    if (!a || !w || !g_waitSemaphores) {
+        LOG("[vr] the OpenXR runtime shares the game's queue (its timeline semaphores could not be made)");
+        return;
+    }
+    gfxvk::xr_queue_sync::g_written = w;
+    // (no wait for the acquires: every graphics submission waited for the runtime's queue to pass each acquire, which
+    // sits behind the runtime's own xrEndFrame work there: the game's GPU work waited for xrEndFrame again, on the GPU.
+    // The release side alone keeps the images whole: the frame's writes done on the CPU before release and xrEndFrame;
+    // the queues are of one family, so the images need no ownership transfer)
+    (void)a;
+    g_own = true;
+    LOG("[vr] the OpenXR runtime on a queue of its own (graphics family queue %u; WWHD_VR_OWN_QUEUE=0 shares the game's): "
+        "its xrEndFrame no longer holds the game's submissions", R.xrQueueIndex);
+}
+// on the runtime's queue (its lock held): wait for and/or signal a timeline value
+void submit(VkSemaphore waitSem, uint64_t waitValue, VkSemaphore signalSem, uint64_t signalValue) {
+    VkTimelineSemaphoreSubmitInfo t{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
+    const VkPipelineStageFlags stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.pNext = &t;
+    if (waitSem) {
+        si.waitSemaphoreCount = 1, si.pWaitSemaphores = &waitSem, si.pWaitDstStageMask = &stage;
+        t.waitSemaphoreValueCount = 1, t.pWaitSemaphoreValues = &waitValue;
+    }
+    if (signalSem) {
+        si.signalSemaphoreCount = 1, si.pSignalSemaphores = &signalSem;
+        t.signalSemaphoreValueCount = 1, t.pSignalSemaphoreValues = &signalValue;
+    }
+    const VkResult r = vkQueueSubmit(R.xrQueue, 1, &si, VK_NULL_HANDLE);
+    if (r != VK_SUCCESS) LOG("[vr] the runtime's queue: a semaphore submission failed (%d)", int(r));
+}
+// a swapchain image acquired (the runtime's barriers on its queue), then the value the game's submissions wait for
+VkImage acquire(int swapchain) {
+    if (!g_own) return xs().acquire(swapchain);
+    auto l = lock();
+    return xs().acquire(swapchain);
+}
+// the graphics submission of `cmd` carries this frame's writes into the images: it signals the value returned
+uint64_t arm(VkCommandBuffer cmd) {
+    if (!g_own || !cmd) return 0;
+    gfxvk::xr_queue_sync::g_armedValue.store(++g_written, std::memory_order_relaxed);
+    gfxvk::xr_queue_sync::g_armed.store(cmd, std::memory_order_release);
+    return g_written;
+}
+// before the images are released and the frame ends: the frame's writes done. Waited for on the CPU (the end-frame
+// thread; the render thread for the frames it ends itself), at most 100 ms: a GPU-side wait on the runtime's queue for
+// a value never signalled would stall that queue for good; this logs and goes on instead. (SteamVR's xrEndFrame waits
+// for the frame's GPU work in any case)
+void wait_written(uint64_t value) {
+    if (!g_own || !value) return;
+    VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+    wi.semaphoreCount = 1;
+    wi.pSemaphores = &gfxvk::xr_queue_sync::g_written;
+    wi.pValues = &value;
+    const VkResult r = g_waitSemaphores(R.device, &wi, 100'000'000);
+    if (r != VK_SUCCESS) {
+        static int logged = 0;
+        if (logged++ < 10) LOG("[vr] the runtime's queue: a frame's writes not done after 100 ms (%d); its images released anyway", int(r));
+    }
+}
+}  // namespace xr_queue
+// (record_eyes -> frame_end) the value the frame's writes signal
+uint64_t g_frameWritten = 0;
+
+// (docs/VR_RUNTIME_PACING_PLAN.md) VR paced by the runtime: the game's vsync grid follows the runtime's frames (each real
+// frame's release by xrWaitFrame, frame_begin: gx2::anchor_vsync_grid) instead of running on the game's own timer,
+// whose phase drifted against the runtime's (8.2 to 9.3 ms of the refresh over 16 s in a 2026-11-18 frame log, a 3 ms
+// jump at a hitch). The frame loop itself is the Snowrunner VR mod's (its src/xr/xr_mirror.cpp): at each frame the
+// end-frame thread's last xrEndFrame waited for, then xrWaitFrame, xrBeginFrame, the eyes copied, xrEndFrame handed over.
+// PC VR (not Android, Quest standalone or the Steam Frame's own build); WWHD_VR_RUNTIME_PACING=0: the game's own timer
+bool runtime_pacing_wanted() {
+#if defined(__ANDROID__) || defined(WWHD_STEAM_FRAME_NATIVE) || (defined(__linux__) && defined(__aarch64__))
+    return false;
+#else
+    static const bool v = [] {
+        const char* e = std::getenv("WWHD_VR_RUNTIME_PACING");
+        const bool on = !(e && *e == '0');
+        LOG("[vr] frames paced by the runtime: %s", on ? "on (the game's frame grid follows the runtime's frames; "
+            "WWHD_VR_RUNTIME_PACING=0: the game's own timer as before)" : "off (WWHD_VR_RUNTIME_PACING=0: the game's own timer)");
+        return on;
+    }();
+    return v;
+#endif
+}
+bool runtime_paced() { return runtime_pacing_wanted() && xs().running(); }
+// (WWHD_VR_RUNTIME_PACING_LEAD_MS) the grid's frame boundary this long before the runtime's release (tuning; default 0)
+int64_t runtime_pacing_lead_ns() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("WWHD_VR_RUNTIME_PACING_LEAD_MS");
+        return e ? int64_t(std::clamp(std::atof(e), -5.0, 5.0) * 1e6) : int64_t(0);
+    }();
+    return v;
+}
+// the runtime's release of each real frame, from its display time (gx2/vsync_pacing.h ReleaseAnchor)
+vsync_pacing::ReleaseAnchor g_release;
+
+// (2026-11-18) SteamVR on Linux runs in one of two states with the Snowrunner frame loop: A, xrWaitFrame holding ~6 ms
+// and xrEndFrame ~2.9 ms, frames 11.12 +- 0.04 ms apart (as native Monado); B, xrWaitFrame returning at once and
+// xrEndFrame holding ~10.8 ms, frames +- 1 ms, the game released ~3 ms later in the cycle. A log only: each switch,
+// after 10 real frames in a row in the other state, with the last 20 frames, so the trigger can be found. (A recovery
+// that called the next xrWaitFrame right after xrBeginFrame, Unreal's order, was tried and removed the same day: on
+// SteamVR for Linux that xrWaitFrame returned at once too, and the session stayed in B.) Armed only in play: after the
+// session's first 20 s and while the game steps its logic (not while loading or paused). WWHD_VR_STATE_LOG=0 off
+// (2026-11-18) Pipelining, as runtimes expect (Unreal Engine's order; Monado: "a subsequent xrWaitFrame call must
+// block until the previous frame has been begun", two waited frames at most): the next frame's xrWaitFrame on a thread
+// of its own right after each xrBeginFrame, so it never waits behind the frame's xrEndFrame. Not a fix for SteamVR's
+// slow state by itself (a run with this alone stayed in it); with the runtime on its own queue (xr_queue) it is the
+// order runtimes are written for. Every frame call of the render thread joins it first (end_thread::wait). Only with
+// the end-frame thread; WWHD_VR_PIPELINE=0 off
+namespace wait_ahead {
+std::mutex g_mutex;
+std::condition_variable g_cv;
+bool g_requested = false, g_busy = false;
+bool wanted() {
+    static const bool v = [] {
+        // (off by default since 2026-11-18 21:55: on SteamVR the early xrWaitFrame held 9.8-18.5 ms, and the render
+        // thread, which has to join it before its next frame call, lost that time: 58-63 fps. WWHD_VR_PIPELINE=1 on)
+        const char* e = std::getenv("WWHD_VR_PIPELINE");
+        const bool on = e && *e == '1';
+        LOG("[vr] xrWaitFrame pipelined: %s", on ? "on (WWHD_VR_PIPELINE=1: the next frame's xrWaitFrame right after each "
+            "xrBeginFrame, on its own thread)" : "off (WWHD_VR_PIPELINE=1 turns it on)");
+        return on;
+    }();
+    return v;
+}
+void loop() {
+    host::boost_thread_priority();
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> l(g_mutex);
+            g_cv.wait(l, [] { return g_requested; });
+            g_requested = false;
+            g_busy = true;
+        }
+        xs().wait_frame();
+        {
+            std::lock_guard<std::mutex> l(g_mutex);
+            g_busy = false;
+        }
+        g_cv.notify_all();
+    }
+}
+// after an xrBeginFrame (render thread)
+void request() {
+    static std::thread* t = new std::thread(loop);  // (lives as long as the process; it only waits between frames)
+    (void)t;
+    {
+        std::lock_guard<std::mutex> l(g_mutex);
+        g_requested = true;
+    }
+    g_cv.notify_all();
+}
+// before the render thread's next frame call: its xrWaitFrame done
+void join() {
+    std::unique_lock<std::mutex> l(g_mutex);
+    g_cv.wait(l, [] { return !g_requested && !g_busy; });
+}
+}  // namespace wait_ahead
+namespace state_recovery {
+bool wanted() {
+    static const bool v = [] {
+        const char* e = std::getenv("WWHD_VR_STATE_LOG");
+        return !(e && *e == '0');
+    }();
+    return v;
+}
+constexpr int kSwitch = 10, kRing = 20, kSkipAgain = 90;
+bool g_inSlow = false, g_skip = false;
+int g_sinceSkip = 0;
+uint64_t g_skipsAgain = 0;
+int g_run = 0;  // (unused since the average decides: kept at 0)
+vr::RuntimeSlowDetector g_detector;  // the last 20 frames' xrEndFrame
+uint64_t g_switches = 0;
+struct Rec { float wait, end, margin; };
+Rec g_ring[kRing];
+int g_next = 0;
+std::chrono::steady_clock::time_point g_started{};
+std::atomic<float> g_lastEndMs{0}, g_lastMarginMs{0};  // (written where xrEndFrame is called)
+void dump(const char* what) {
+    if (++g_switches > 20) return;
+    char line[1200];
+    int k = std::snprintf(line, sizeof line, "[vr] SteamVR state: %s; the last %d frames (xrWaitFrame/xrEndFrame/margin ms):",
+                          what, kRing);
+    for (int i = 0; i < kRing && k < int(sizeof line) - 24; ++i) {
+        const Rec& r = g_ring[(g_next + i) % kRing];
+        k += std::snprintf(line + k, sizeof line - size_t(k), " %.1f/%.1f/%.1f", double(r.wait), double(r.end), double(r.margin));
+    }
+    LOG("%s", line);
+}
+// each real frame (frame_begin, render thread): waitMs how long its xrWaitFrame held; inPlay: the game steps its logic
+void note(double waitMs, bool endThread, bool inPlay) {
+    if (!wanted() || !endThread) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (g_started == std::chrono::steady_clock::time_point{}) g_started = now;
+    const double endMs = g_lastEndMs.load(std::memory_order_relaxed);
+    g_ring[g_next] = {float(waitMs), float(endMs), g_lastMarginMs.load(std::memory_order_relaxed)};
+    g_next = (g_next + 1) % kRing;
+    if (now - g_started < std::chrono::seconds(20) || !inPlay) {
+        g_run = 0;
+        g_detector.restart();
+        return;
+    }
+    // (2026-11-20) by the average of the last 20 frames' xrEndFrame (vr_runtime_slow.h): ten slow frames in a row
+    // missed SteamVR's mixed slow state, xrEndFrame alternating about 3 and 10 ms ("the detector didn't work")
+    if (g_detector.update(endMs)) {
+        g_inSlow = g_detector.slow, g_run = 0;
+        interp::set_vr_runtime_slow(g_inSlow);  // (Auto Mode not judged meanwhile: its misses are the runtime's)
+        char why[96];
+        std::snprintf(why, sizeof why, "%s (xrEndFrame %.1f ms on average over 20 frames)",
+                      g_inSlow ? "to B, one slot skipped with a refresh fill" : "to A", g_detector.average());
+        dump(why);
+        if (g_inSlow) g_skip = true, g_sinceSkip = 0;
+    } else if (g_inSlow && ++g_sinceSkip >= kSkipAgain) {
+        g_skip = true, g_sinceSkip = 0;  // (still in B a second later: another slot skipped)
+        ++g_skipsAgain;
+    }
+}
+// (planned_repeats, render thread) a slot to skip with a refresh fill: the only thing seen to get SteamVR out of B
+// (both natural recoveries in the 2026-11-18 logs followed a skipped frame)
+bool take_skip() {
+    if (!g_skip) return false;
+    g_skip = false;
+    return true;
+}
+void reset() {
+    g_inSlow = false, g_run = 0, g_started = {}, g_skip = false;
+    g_detector.reset();
+    interp::set_vr_runtime_slow(false);
+}
+}  // namespace state_recovery
+
 namespace end_thread {
 bool on() {
+    // (2026-11-18, as the Snowrunner VR mod's Linux fix) on Linux SteamVR's xrEndFrame does not return until the GPU
+    // has finished the frame (~9-11 ms a call: that mod's measurements and ours), so it runs here, off the render
+    // thread. On Windows it returns at once (Snowrunner keeps it synchronous there): on the render thread.
+    // WWHD_VR_END_FRAME_THREAD=1 or 0 decides for a test start. (Android keeps the thread, as before)
     static const bool v = [] {
         const char* e = std::getenv("WWHD_VR_END_FRAME_THREAD");
-        const bool yes = !(e && e[0] == '0');
+#ifdef _WIN32
+        const bool platform = false;
+#else
+        const bool platform = true;
+#endif
+        const bool yes = e && *e ? e[0] != '0' : platform;
         LOG("[vr] the frame's end (images released, xrEndFrame): %s",
             yes ? "on its own thread (WWHD_VR_END_FRAME_THREAD=0 keeps it on the render thread)"
-                : "on the render thread (WWHD_VR_END_FRAME_THREAD=0)");
+                : "on the render thread (WWHD_VR_END_FRAME_THREAD=1 moves it to its own thread)");
         return yes;
     }();
     return v;
@@ -516,6 +811,7 @@ struct Job {
     bool drawn = false, eyes = false, panel = false, wheel = false, wrist = false, laser = false, ui = false;
     bool hands = false;  // (docs/VR_HANDS_LAYER_PLAN.md step 3) the hands layer's images written this frame
     bool handsShow = false;  // (g_handsShow) and both halves written: the layer shown
+    uint64_t written = 0;    // (xr_queue) the value the frame's writes into the images signal (0: none to wait for)
     vr::xr::Quad panelQuad, wheelQuad, uiQuad;
     vr::xr::SubQuad wristQuads[vr::kWristPanels], laserQuads[2];
 };
@@ -526,13 +822,34 @@ bool g_queued = false, g_busy = false;
 // the last job's timing (ms), taken by the render thread at the next wait
 float g_queueMs = 0, g_releaseMs = 0, g_submitMs = 0;
 bool g_timed = false;
+// each frame's margin before its own display time when xrEndFrame was called (the runtime's time converted to the
+// game's clock), per 10 s: real frames and refresh fills
+struct Margins {
+    std::mutex m;
+    std::vector<float> real;  // ms
+    uint64_t fills = 0, negative = 0;
+} g_margins;
+void note_margin(XrTime display, bool fill) {
+    const int64_t d = xs().to_steady_ns(display);
+    std::lock_guard<std::mutex> l(g_margins.m);
+    if (fill) ++g_margins.fills;
+    if (!d) return;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    const float ms = float(double(d - now) / 1e6);
+    if (!fill) state_recovery::g_lastMarginMs.store(ms, std::memory_order_relaxed);
+    if (ms < 0) ++g_margins.negative;
+    if (!fill && g_margins.real.size() < 4096) g_margins.real.push_back(ms);
+}
 
 // the frame's end itself: on this thread, or on the render thread with the switch off
 void end(const Job& j, float& queueMs, float& releaseMs, float& submitMs) {
     const auto ms = [](auto a, auto b) { return float(std::chrono::duration<double, std::milli>(b - a).count()); };
-    // the runtime uses the graphics queue in release and end frame: keep the renderer's submissions out
+    // the runtime uses its queue in release and end frame: the game's queue lock when it shares it, else its own (the
+    // game's submissions go on meanwhile: xr_queue), its queue first waiting for the frame's writes
     const auto queueStart = std::chrono::steady_clock::now();
-    std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+    xr_queue::wait_written(j.written);  // (before the lock: nothing waits behind it)
+    auto queueLock = xr_queue::lock();
     const auto submitStart = std::chrono::steady_clock::now();
     if (j.eyes) {
         xs().release(0);
@@ -550,6 +867,7 @@ void end(const Job& j, float& queueMs, float& releaseMs, float& submitMs) {
     }
     const auto released = std::chrono::steady_clock::now();
     vr::xr::Quad panel = j.panelQuad, wheel = j.wheelQuad, ui = j.uiQuad;
+    note_margin(xs().predicted_display_time(), false);
     xs().end_frame(j.views, j.drawn, &panel, &wheel, j.wrist ? j.wristQuads : nullptr, j.wrist ? vr::kWristPanels : 0,
                    j.laser ? j.laserQuads : nullptr, j.laser ? 2 : 0, j.ui ? &ui : nullptr,
                    j.hands && j.handsShow ? &j.views : nullptr);
@@ -577,10 +895,13 @@ void note_runtime_smoothing() {
     onFrames += on;
     if (on != was) {
         ++switches;
-        if (++changes <= 30)
-            LOG("[vr] the runtime's frame smoothing: %s", on
-                ? "on (it asks for frames %.0f refreshes apart: Virtual Desktop's Synchronous Spacewarp, or the runtime's own)"
-                : "off (frames a refresh apart again)", ratio);
+        if (++changes <= 30) {
+            if (on)
+                LOG("[vr] the runtime's frame smoothing: on (it asks for frames %.0f refreshes apart: Virtual Desktop's "
+                    "Synchronous Spacewarp, or the runtime's own)", ratio);
+            else
+                LOG("[vr] the runtime's frame smoothing: off (frames a refresh apart again)");
+        }
         was = on;
     }
     const auto now = std::chrono::steady_clock::now();
@@ -612,6 +933,7 @@ void loop() {
         float q = 0, r = 0, s = 0;
         xs().declare_thread(vr::xr::Session::XrThread::RenderWorker);  // (Android: it calls xrEndFrame; once per session)
         end(j, q, r, s);
+        state_recovery::g_lastEndMs.store(s, std::memory_order_relaxed);
         note_runtime_smoothing();  // (log only; the queue's lock released)
         {
             std::lock_guard<std::mutex> l(g_mutex);
@@ -630,6 +952,11 @@ void push_times(float q, float r, float s) {
     g_times.submit.push_back(s);
 }
 
+// the thread itself, started by the first job (lives as long as the process; it only waits between frames)
+void start() {
+    static std::thread* t = new std::thread(loop);
+    (void)t;
+}
 // the render thread: hands the frame's end over (the thread is idle: frame_begin waited for it)
 void submit(const Job& j) {
     if (!on()) {
@@ -638,8 +965,7 @@ void submit(const Job& j) {
         push_times(q, r, s);
         return;
     }
-    static std::thread* t = new std::thread(loop);  // (lives as long as the process; it only waits between frames)
-    (void)t;
+    start();
     {
         std::lock_guard<std::mutex> l(g_mutex);
         g_job = j;
@@ -647,10 +973,16 @@ void submit(const Job& j) {
     }
     g_cv.notify_all();
 }
-
-// the render thread, before the session's next frame call (xrWaitFrame, a frame shown again, the session's end):
+// (frame_begin's early xrWaitFrame, for its counts) the last frame's end still queued or running
+bool busy() {
+    if (!on()) return false;
+    std::lock_guard<std::mutex> l(g_mutex);
+    return g_queued || g_busy;
+}
+// the render thread, before the session's next frame call (xrBeginFrame, a frame shown again, the session's end):
 // the last frame's end is done
 void wait() {
+    wait_ahead::join();  // (the pipelined xrWaitFrame done before this thread's next frame call)
     if (!on()) return;
     const auto start = std::chrono::steady_clock::now();
     float q = 0, r = 0, s = 0;
@@ -671,6 +1003,9 @@ int64_t g_lockedVsync = -1;  // (the period lock_to_headset set; -1: none yet th
 void restore_frame_rate() {
     interp::set_vr_display_hz(0);
     interp::set_vr_streamed(false);
+    interp::set_vr_runtime_paced(false);
+    g_release = {};
+    state_recovery::reset();
     gx2::lock_vsync_to_display(0);
     g_lockedVsync = -1;
     if (g_savedInterpMode >= 0) {
@@ -712,9 +1047,17 @@ void note_display(XrTime shown, XrTime last) {
     // (only with Streaming optimal: off, every frame-rate mode keeps the wired headset's rules, this one too; asked for,
     // 2026-11-05)
     if (xs().streamed() && vr::config().streamingOptimal) return;
+    // (docs/VR_RUNTIME_PACING_PLAN.md) paced by the runtime the grid follows its releases and cannot drift onto the
+    // deadline; a frame shown a refresh late is a real miss, for the frame planner (interp::note_vr_missed_refresh)
     const double hz = xs().refresh_rate();
     const int fps = interp::mode() == 1 ? interp::output_fps() : 30;
     if (hz <= 0 || fps <= 0 || !last || shown <= last) return;
+    if (runtime_paced()) {
+        const double perFrame = std::max(1.0, std::round(hz / double(fps)));
+        const double steps = double(shown - last) / (1e9 / hz);
+        if (!xs().streamed() && steps > perFrame + 0.5 && steps < 4.0 * perFrame) interp::note_vr_missed_refresh();
+        return;
+    }
     const double refresh = 1e9 / hz, expected = 1e9 / double(fps);
     // only while the game keeps its rate, a whole number of refreshes a frame: at 90 fps the game drew 60 (frames 1 and
     // 2 refreshes in turn), and in loads and menus it has no steady rate; every frame there looked like a slip and the
@@ -812,11 +1155,49 @@ void log_stats() {
     const uint64_t steps = interp::logic_steps();
     LOG("[vr] timing: %.1f frames/s to the headset (%.1f begun), headset %.1f Hz, xrWaitFrame %.2f ms per frame, "
         "game %.1f frames/s, logic %.1f steps/s (30 expected), interpolation %d fps; %llu frames shown again while the "
-        "game had none ready (headset_frame); %llu with the last views (no head pose)",
+        "game had none ready (headset_frame); %llu with the last views (no head pose)%s",
         g_stats.submitted / s, g_stats.begun / s, double(xs().refresh_rate()),
         g_stats.begun ? g_stats.waitMs / double(g_stats.begun) : 0.0, (R.frame - g_stats.renderFrame) / s,
         (steps - g_stats.logicSteps) / s, interp::mode() == 1 ? interp::output_fps() : 30,
-        (unsigned long long)g_stats.keptAlive, (unsigned long long)g_stats.viewsReused);
+        (unsigned long long)g_stats.keptAlive, (unsigned long long)g_stats.viewsReused, [&] {
+            // (2026-11-20) the frames the runtime asked no picture for (a headset in standby, the session only
+            // synchronized): "0.0 frames/s to the headset" read as a failure when SteamVR had stopped asking
+            static char buf[160];
+            buf[0] = 0;
+            if (g_stats.notAsked)
+                std::snprintf(buf, sizeof buf, "; %llu frames the runtime asked no picture for (the session not visible: "
+                              "the headset away or in standby)", (unsigned long long)g_stats.notAsked);
+            return buf;
+        }());
+    if (runtime_paced()) {
+        // (docs/VR_RUNTIME_PACING_PLAN.md) how far the game's grid moved to follow the runtime's frames (small and
+        // steady: locked; a frame or more: a hitch, a new rhythm), and each frame's margin before its own display time
+        // when xrEndFrame was called (the runtime's time on the game's clock)
+        uint64_t moves = 0;
+        double mean = 0, most = 0;
+        gx2::take_anchor_stats(moves, mean, most);
+        static uint64_t missesSeen = 0;
+        const uint64_t misses = interp::vr_missed_refreshes();
+        LOG("[vr] paced by the runtime (10 s): the game's frame grid moved to the runtime's frames %llu times, %.3f ms on "
+            "average, %.3f ms at most%s; %llu real frames a refresh late", (unsigned long long)moves, mean, most,
+            xs().streamed() ? " (a streamed headset: the grid not moved)" : "", (unsigned long long)(misses - missesSeen));
+        missesSeen = misses;
+        std::vector<float> m;
+        uint64_t fills, negative;
+        {
+            std::lock_guard<std::mutex> l(end_thread::g_margins.m);
+            m.swap(end_thread::g_margins.real);
+            fills = end_thread::g_margins.fills, negative = end_thread::g_margins.negative;
+            end_thread::g_margins.fills = end_thread::g_margins.negative = 0;
+        }
+        if (!m.empty()) {
+            std::sort(m.begin(), m.end());
+            const auto pct = [&](double p) { return double(m[std::min(m.size() - 1, size_t(p * double(m.size())))]); };
+            LOG("[vr] frame deadlines (10 s): %zu real frames submitted %.2f ms before their display time at the least, "
+                "%.2f at 1%%, %.2f median, %.2f at 99%%; %llu frames submitted after it; %llu refresh fills", m.size(),
+                double(m.front()), pct(0.01), pct(0.5), pct(0.99), (unsigned long long)negative, (unsigned long long)fills);
+        }
+    }
     vr::Fov f;
     const bool fov = vr::projection(f);
     const auto e = vr::eye_offsets();
@@ -1083,8 +1464,10 @@ void stop(const std::string& why) {
     g_shown.valid = false;
     g_panelShown = false;
     if (R.device) {
-        // the session's swapchain images must be idle before the runtime destroys them
+        // the session's swapchain images must be idle before the runtime destroys them (every queue: the device's idle)
         std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+        std::unique_lock<std::mutex> xrLock = xr_queue::g_own ? std::unique_lock<std::mutex>(xr_queue::g_mutex)
+                                                              : std::unique_lock<std::mutex>();
         const auto uploadQueueLock = texture_pack_queue_lock();  // (the texture packs' upload queue: idle too)
         vkDeviceWaitIdle(R.device);
         destroy_panel_views();
@@ -1150,6 +1533,10 @@ int preferred_device(const std::vector<VkPhysicalDevice>& devices) {
     return -1;
 }
 
+bool wants_queue(VkPhysicalDevice physical) {
+    return g_xrInstance && xs().initialised() && physical == g_physical && xr_queue::wanted() && end_thread::on();
+}
+
 VkResult create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo& ci, VkDevice* out) {
     if (g_xrInstance && xs().initialised() && physical == g_physical) {
         const VkResult r = xs().create_vulkan_device(physical, ci, vkGetInstanceProcAddr, out);
@@ -1168,7 +1555,9 @@ void device_ready() {
     // recommended size. On a PC the headset's images are that size too (a 1:1 copy); a standalone headset keeps the
     // runtime's own size for them and upscales the smaller pictures into them (Quest Super Resolution, SGSR1)
     const float headsetRes = vr::config().renderScale;
-    if (!xs().begin(R.instance, R.physicalDevice, R.device, R.queueFamily, 0, vr::kPcVrBuild ? headsetRes : 1.0f)) {
+    xr_queue::ready();  // (the runtime's own queue, when the device was made with one)
+    if (!xs().begin(R.instance, R.physicalDevice, R.device, R.queueFamily, xr_queue::g_own ? R.xrQueueIndex : 0,
+                    vr::kPcVrBuild ? headsetRes : 1.0f)) {
         stop("VR is not available: " + xs().why() + ". Playing on the desktop.");
         return;
     }
@@ -1188,9 +1577,58 @@ void device_ready() {
     LOG("[vr] session created; waiting for the runtime to start it");
 }
 
+// (2026-11-18) xrWaitFrame alongside the last frame's xrEndFrame: the next frame is waited for as soon as the last one
+// has been handed to the end-frame thread, and that thread is joined only before xrBeginFrame. OpenXR needs the last
+// xrEndFrame done before the next xrBeginFrame, not before xrWaitFrame, which may run on another thread (Unreal Engine
+// waits on its game thread while its RHI thread ends frames). A long xrEndFrame (SteamVR on Linux) then overlaps
+// xrWaitFrame's own hold instead of adding to it. One frame ahead, not two (the pipelining removed earlier waited
+// right after xrBeginFrame, during the frame's drawing). With the end-frame thread.
+// Off by default since its headset runs (2026-11-18 22:41 and 22:43): SteamVR on Linux needs xrEndFrame done before
+// the next xrWaitFrame (OpenVR's Submit, then WaitGetPoses). Overlapped, its xrEndFrame grew to two refreshes (p99
+// 22 ms), one run locked at 30 fps, 1287 and 630 frames dropped; the one clean window had no overlap. The Snowrunner VR
+// mod keeps the same order. WWHD_VR_WAIT_OVERLAP=1 on (another runtime, a test)
+bool wait_overlap_wanted() {
+    static const bool v = [] {
+        const char* e = std::getenv("WWHD_VR_WAIT_OVERLAP");
+        const bool on = e && *e == '1';
+        LOG("[vr] xrWaitFrame alongside the last frame's xrEndFrame: %s",
+            on ? "on (WWHD_VR_WAIT_OVERLAP=1: the end-frame thread joined only before xrBeginFrame)"
+               : "off (xrEndFrame done before xrWaitFrame, as SteamVR on Linux needs; WWHD_VR_WAIT_OVERLAP=1 on)");
+        return on;
+    }();
+    return v;
+}
+struct OverlapStats {
+    uint64_t frames = 0, overlapped = 0;  // frames waited for early; of them, while xrEndFrame was still running
+    std::chrono::steady_clock::time_point since = std::chrono::steady_clock::now();
+} g_overlap;
+
 void frame_begin() {
-    end_thread::wait();  // (the last frame's xrEndFrame before this one's xrWaitFrame, and before any session event)
+    // the next frame waited for while the last one's xrEndFrame may still run (wait_overlap_wanted); the session's
+    // frame state keeps the begun frame's display time for that xrEndFrame until xrBeginFrame
+    double earlyMs = 0;
+    bool early = false;
+    if (g_started && end_thread::on() && wait_overlap_wanted() && xs().initialised() && xs().running() &&
+        !xs().frame_waited() && !(runtime_paced() && wait_ahead::wanted())) {
+        const bool ending = end_thread::busy();
+        const auto t0 = std::chrono::steady_clock::now();
+        early = xs().wait_frame();
+        earlyMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (early) {
+            ++g_overlap.frames;
+            g_overlap.overlapped += ending;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_overlap.since >= std::chrono::seconds(10)) {
+            if (g_overlap.frames)
+                LOG("[vr] xrWaitFrame alongside xrEndFrame (10 s): %llu frames waited for early, %llu of them while the last "
+                    "xrEndFrame still ran", (unsigned long long)g_overlap.frames, (unsigned long long)g_overlap.overlapped);
+            g_overlap = OverlapStats{};
+        }
+    }
+    end_thread::wait();  // (the last frame's xrEndFrame before this one's xrBeginFrame, and before any session event)
     g_recorded = false;
+    g_frameWritten = 0;
     g_frameViews = vr::render_views();
     if (!xs().initialised()) return;
     xs().poll_events();
@@ -1208,10 +1646,38 @@ void frame_begin() {
     xs().declare_thread(vr::xr::Session::XrThread::RenderMain);  // (Android: once per session; docs/diagnosis/QUEST3_PERFORMANCE_AUDIT.md)
     const auto waitStart = std::chrono::steady_clock::now();
     g_frame = xs().begin_frame(g_shouldRender);
+    g_stats.notAsked += g_frame && !g_shouldRender;  // ([vr] timing: why none reached the headset)
+    // (xrWaitFrame's hold: the early wait's, when the frame was waited for alongside xrEndFrame)
+    const double heldMs =
+        earlyMs + std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+    if (g_frame && end_thread::on() && runtime_paced() && wait_ahead::wanted()) wait_ahead::request();
+    if (g_frame) {
+        // (in play: the game stepped its logic within the last half second; not while loading or paused. At 90 fps a
+        // step comes every third frame)
+        static uint64_t lastSteps = 0;
+        static auto lastStep = std::chrono::steady_clock::now();
+        const uint64_t steps = interp::logic_steps();
+        const auto now = std::chrono::steady_clock::now();
+        if (steps != lastSteps) lastSteps = steps, lastStep = now;
+        state_recovery::note(heldMs, end_thread::on(), now - lastStep < std::chrono::milliseconds(500));
+    }
+    interp::set_vr_runtime_paced(runtime_paced());
+    // (a streamed headset's display times move with the network, up to 155 ms apart over Wi-Fi: they do not steer the
+    // grid there; its frames are still asked for ahead)
+    if (g_frame && runtime_paced() && !xs().streamed()) {
+        // the vsync grid to the runtime's release of this real frame: its display time less the smoothed offset of the
+        // two clocks (the anchor as even as the display times)
+        const int64_t released = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     xs().waited_at().time_since_epoch()).count();
+        const int64_t display = int64_t(xs().predicted_display_time());
+        const int64_t offset = g_release.update(display - released, int64_t(xs().refresh_period()));
+        gx2::anchor_vsync_grid(std::chrono::steady_clock::time_point(
+            std::chrono::nanoseconds(display - offset - runtime_pacing_lead_ns())));
+    }
     // (the camera's base: display_time; with the swap being executed now, render::swap from OP_SWAP: executed + 1)
     if (g_frame) vr::set_real_frame_display(int64_t(xs().predicted_display_time()), gx2::swaps_executed() + 1);
     g_times.begun = std::chrono::steady_clock::now();
-    const double waited = std::chrono::duration<double, std::milli>(g_times.begun - waitStart).count();
+    const double waited = earlyMs + std::chrono::duration<double, std::milli>(g_times.begun - waitStart).count();
     g_stats.waitMs += waited;
     if (g_frame && g_times.wait.size() < 4096) g_times.wait.push_back(float(waited));
     g_stats.begun += g_frame;
@@ -1347,6 +1813,8 @@ bool ensure_swapchain(int index, uint32_t width, uint32_t height, Ensure&& ensur
     const bool remade = sc.handle && sc.acquired == UINT32_MAX;
     if (remade) end_thread::wait();
     std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+    std::unique_lock<std::mutex> xrLock = xr_queue::g_own ? std::unique_lock<std::mutex>(xr_queue::g_mutex)
+                                                          : std::unique_lock<std::mutex>();  // (the device's idle: every queue)
     if (remade && R.device) {
         const auto uploadQueueLock = texture_pack_queue_lock();
         vkDeviceWaitIdle(R.device);
@@ -1362,7 +1830,7 @@ bool ensure_swapchain(int index, uint32_t width, uint32_t height, Ensure&& ensur
 bool upload_picture(VkCommandBuffer cmd, int swapchain, const std::vector<uint8_t>& pixels, uint32_t width, uint32_t height) {
     if (pixels.size() < size_t(width) * height * 4) return false;
     const UploadSlice up = allocate_upload(pixels.size(), 16);
-    VkImage image = up.mapped ? xs().acquire(swapchain) : VK_NULL_HANDLE;
+    VkImage image = up.mapped ? xr_queue::acquire(swapchain) : VK_NULL_HANDLE;
     if (!image) return false;
     std::memcpy(up.mapped, pixels.data(), pixels.size());
     VkImageMemoryBarrier b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -1543,7 +2011,7 @@ void record_eyes(VkCommandBuffer cmd) {
     VkImage targets[2] = {};
     const auto acquireStart = std::chrono::steady_clock::now();
     for (int eye = 0; eye < 2; ++eye) {
-        targets[eye] = xs().acquire(eye);
+        targets[eye] = xr_queue::acquire(eye);
         if (!targets[eye]) {
             if (eye) xs().release(0);
             return;
@@ -1750,8 +2218,8 @@ void record_eyes(VkCommandBuffer cmd) {
         swapchainTest != 1 && h0 && h1 && xs().ensure_hands(xs().swapchain(0).width, xs().swapchain(0).height)) {
         const bool shared = vr::xr::hands_shared();
         xs().set_hands_premultiplied(vr_genframe::hands_coverage_from_depth());
-        VkImage hi[2] = {xs().acquire(vr::xr::Session::kHands), VK_NULL_HANDLE};
-        if (hi[0]) hi[1] = shared ? hi[0] : xs().acquire(vr::xr::Session::kHands + 1);
+        VkImage hi[2] = {xr_queue::acquire(vr::xr::Session::kHands), VK_NULL_HANDLE};
+        if (hi[0]) hi[1] = shared ? hi[0] : xr_queue::acquire(vr::xr::Session::kHands + 1);
         if (hi[0] && hi[1]) {
             Surface* hs[2] = {h0, h1};
             bool written = true;
@@ -1997,7 +2465,7 @@ void record_eyes(VkCommandBuffer cmd) {
     g_uiRecorded = false;
     if (Surface* ui = ui_layer_image(); ui && ensure_swapchain(vr::xr::Session::kUi, ui->extent.width, ui->extent.height,
                                              [&] { return xs().ensure_ui(ui->extent.width, ui->extent.height); })) {
-        if (VkImage img = xs().acquire(vr::xr::Session::kUi)) {
+        if (VkImage img = xr_queue::acquire(vr::xr::Session::kUi)) {
             const auto& us = xs().swapchain(vr::xr::Session::kUi);
             transition_image(ui, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_PIPELINE_STAGE_TRANSFER_BIT,
                              VK_ACCESS_TRANSFER_READ_BIT);
@@ -2051,7 +2519,7 @@ void record_eyes(VkCommandBuffer cmd) {
         const uint32_t pw = std::max({sc.width, w, kMenuPanelWidth}), ph = std::max({sc.height, h, kMenuPanelHeight});
         if (!ensure_swapchain(vr::xr::Session::kPanel, pw, ph, [&] { return xs().ensure_panel(pw, ph); })) return VK_NULL_HANDLE;
         g_panel.pixelWidth = w, g_panel.pixelHeight = h;
-        return xs().acquire(vr::xr::Session::kPanel);
+        return xr_queue::acquire(vr::xr::Session::kPanel);
     };
     if (g_panelShown && g_panelMenu) {
         VkImage panel = panelImage(kMenuPanelWidth, kMenuPanelHeight);
@@ -2176,6 +2644,7 @@ void record_eyes(VkCommandBuffer cmd) {
             g_laserRecorded = true;
         }
     }
+    g_frameWritten = xr_queue::arm(cmd);  // (this submission carries the frame's writes into the images)
 }
 
 bool skip_desktop_gamepad() {
@@ -2283,6 +2752,8 @@ void frame_end() {
     job.panel = g_panelRecorded, job.wheel = g_wheelRecorded, job.wrist = g_wristRecorded, job.laser = g_laserRecorded;
     job.hands = g_handsRecorded && g_recorded && views;
     job.handsShow = g_handsShow;
+    job.written = g_frameWritten;
+    g_frameWritten = 0;
     g_handsRecorded = g_handsShow = false;
     job.panelQuad = panel, job.wheelQuad = wheel;
     // the UI layer's quad: head-locked, kUiDistance ahead, the size the symmetric field covers there
@@ -2436,12 +2907,13 @@ bool turn_step_clock() {
 }
 bool show_again(bool motion, int step = 0) {
     end_thread::wait();  // (the last frame's end first: its images released, its xrEndFrame called)
-    std::unique_lock<std::mutex> queueLock(graphics_queue_mutex(), std::try_to_lock);
+    auto queueLock = xr_queue::try_lock();
     if (!queueLock) return false;
     xs().poll_events();
     if (!xs().running()) return false;
     bool shouldRender = false;
     if (!xs().begin_frame(shouldRender)) return false;
+    if (end_thread::on() && runtime_paced() && wait_ahead::wanted()) wait_ahead::request();
     const auto rtBegun = std::chrono::steady_clock::now();
     const XrTime rtShown = xs().predicted_display_time();
     const bool rtLate = repeat_late(rtShown);
@@ -2476,6 +2948,7 @@ bool show_again(bool motion, int step = 0) {
     vr::xr::Quad panel = g_shown.panel, wheel = g_shown.wheel, ui = g_shown.uiQuad;
     // (docs/VR_HANDS_LAYER_PLAN.md step 4) the hands layer at the views the frame was drawn with, not turned: the eyes'
     // layer turns with the stick, the hands stay where they were (Link's hands follow the controllers, not the turn)
+    end_thread::note_margin(rtShown, true);
     xs().end_frame(views, g_shown.drawn, &panel, &wheel, g_shown.wrist ? g_shown.wristQuads : nullptr,
                    g_shown.wrist ? vr::kWristPanels : 0, g_shown.laser ? g_shown.laserQuads : nullptr, g_shown.laser ? 2 : 0,
                    g_shown.ui ? &ui : nullptr, g_shown.hands ? &g_shown.views : nullptr);
@@ -2615,6 +3088,7 @@ int show_generated(bool turnOnly, bool headMode = false) {
     if (!xs().running()) return -1;
     bool shouldRender = false;
     if (!xs().begin_frame(shouldRender)) return -1;
+    if (end_thread::on() && runtime_paced() && wait_ahead::wanted()) wait_ahead::request();
     const auto rtBegun = std::chrono::steady_clock::now();
     const bool rtLate = repeat_late(xs().predicted_display_time());
     vr::xr::Views out = g_shown.views;
@@ -2667,8 +3141,9 @@ int show_generated(bool turnOnly, bool headMode = false) {
                 g_gen = GenStats{};
             }
         }
-        VkImage img[2] = {xs().acquire(0), VK_NULL_HANDLE};
-        if (img[0]) img[1] = xs().acquire(1);
+        VkImage img[2] = {xr_queue::acquire(0), VK_NULL_HANDLE};
+        if (img[0]) img[1] = xr_queue::acquire(1);
+        uint64_t written = 0;  // (xr_queue: the value its draws into the images signal)
         if (img[0] && img[1]) {
             auto cmd = command_buffer();
             end_encoder();
@@ -2830,10 +3305,12 @@ int show_generated(bool turnOnly, bool headMode = false) {
                     g_cap.notes += line;
                 }
             }
+            written = xr_queue::arm(cmd);
             flush_async();
             drawn = both;
         }
-        std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+        xr_queue::wait_written(written);
+        auto queueLock = xr_queue::lock();
         if (img[0]) xs().release(0);
         if (img[1]) xs().release(1);
         if (!drawn) out = g_shown.views;  // (a draw failed: the images hold what they held; the old frame's views)
@@ -2845,7 +3322,8 @@ int show_generated(bool turnOnly, bool headMode = false) {
     if (headOnly && drawn) xs().reuse_last_depth();
     {
         vr::xr::Quad panel = g_shown.panel, wheel = g_shown.wheel, ui = g_shown.uiQuad;
-        std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+        auto queueLock = xr_queue::lock();
+        end_thread::note_margin(xs().predicted_display_time(), true);
         xs().end_frame(out, drawn || g_shown.drawn, &panel, &wheel, g_shown.wrist ? g_shown.wristQuads : nullptr,
                        g_shown.wrist ? vr::kWristPanels : 0, g_shown.laser ? g_shown.laserQuads : nullptr,
                        g_shown.laser ? 2 : 0, g_shown.ui ? &ui : nullptr, g_shown.hands ? &g_shown.views : nullptr);
@@ -2890,6 +3368,23 @@ bool hands_layer_wanted() {
 uint64_t& plain_fills() { static uint64_t n = 0; return n; }
 void planned_repeats() {
     if (!g_started || !g_shown.valid || !g_shown.drawn || !g_shown.views.valid || !xs().running()) return;
+    // (state_recovery: SteamVR's slow state detected) one slot skipped: the last frame again in the next slot. Only
+    // while the game draws a frame every refresh: below that (Capped 45, Steady 30, Auto at half) every other slot is
+    // already a refresh fill, a skip changes nothing SteamVR sees, and each fill is one more wait for its xrEndFrame
+    // (2026-11-20, a SteamVR 2.19.4 run: 20 skips at 45 fps, none ended the slow state, the render thread at 33 ms a pass)
+    if (state_recovery::take_skip()) {
+        const double hz = xs().refresh_rate();
+        const bool everyRefresh = hz > 0 && interp::output_fps() >= int(hz * 0.9);
+        if (everyRefresh && show_again(false)) {
+            static int logged = 0;
+            if (logged++ < 20) LOG("[vr] SteamVR state: a slot skipped with a refresh fill (recovery)");
+        } else if (!everyRefresh) {
+            static int logged = 0;
+            if (logged++ < 5)
+                LOG("[vr] SteamVR state: no slot skipped (the game draws at %d fps of %.0f Hz: its fills already skip)",
+                    interp::output_fps(), hz);
+        }
+    }
     // only in the low frame-rate modes (Capped 45, Steady 30: vr.frameRate half or original), never in Capped 90,
     // Unlocked or Auto (asked for, 2026-11-12: "make sure we don't use this in 90 fps modes so our fps isn't impacted")
     // (and Auto Mode while the game runs below the headset's rate: low_rate_repeats)
@@ -3076,8 +3571,9 @@ int smoke(int frames) {
         bool drawn = false;
         if (shouldRender && located) {
             ++shown;
-            VkImage img[2] = {xs().acquire(0), VK_NULL_HANDLE};
-            if (img[0]) img[1] = xs().acquire(1);
+            VkImage img[2] = {xr_queue::acquire(0), VK_NULL_HANDLE};
+            if (img[0]) img[1] = xr_queue::acquire(1);
+            uint64_t written = 0;
             if (img[0] && img[1]) {
                 auto cmd = command_buffer();
                 for (int eye = 0; eye < 2; ++eye) {
@@ -3105,17 +3601,19 @@ int smoke(int frames) {
                     record::vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &b);
                 }
+                written = xr_queue::arm(cmd);
                 flush();
                 drawn = true;
             }
-            std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+            xr_queue::wait_written(written);
+            auto queueLock = xr_queue::lock();
             if (img[0]) xs().release(0);
             if (img[1]) xs().release(1);
         }
         float eyeX[2];
         const vr::xr::Views r = located ? vr::as_rendered(v, eyeX) : vr::xr::Views{};
         {
-            std::lock_guard<std::mutex> queueLock(graphics_queue_mutex());
+            auto queueLock = xr_queue::lock();
             xs().end_frame(r, drawn);
         }
         g_frame = false;

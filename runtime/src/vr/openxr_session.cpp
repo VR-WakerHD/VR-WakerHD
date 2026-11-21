@@ -3,9 +3,16 @@
 // credit required, see LICENSE-VR.md.
 // OpenXR session: see openxr_session.h.
 #include "openxr_session.h"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>  // (QueryPerformanceFrequency: to_steady_ns)
+#endif
 
 #include <algorithm>
 #include <chrono>
+#include <ctime>
 #include <cctype>
 #include <cmath>
 #include <cstdlib>
@@ -243,6 +250,19 @@ bool Session::init(const std::string& appName) {
     }
     if (refreshRateExt_) enabled.push_back(XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME);
     if (cylinderExt_) enabled.push_back(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME);
+#ifndef __ANDROID__
+    // (docs/VR_RUNTIME_PACING_PLAN.md) the runtime's times on the game's clock: each frame's deadline measured against
+    // its own display time (CLOCK_MONOTONIC on Linux, the performance counter on Windows: std::chrono::steady_clock)
+#ifdef _WIN32
+    static constexpr const char* kTimeConvExt = "XR_KHR_win32_convert_performance_counter_time";
+#else
+    static constexpr const char* kTimeConvExt = "XR_KHR_convert_timespec_time";
+#endif
+    timeConvExt_ = std::any_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
+        return !std::strcmp(e.extensionName, kTimeConvExt);
+    });
+    if (timeConvExt_) enabled.push_back(kTimeConvExt);
+#endif
     // (cpu_boost) the CPU level hinted around stalls: standalone headsets only (a PC's clocks are its own), when offered
     perfSettingsExt_ = !kPcVrBuild && std::any_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
         return !std::strcmp(e.extensionName, XR_EXT_PERFORMANCE_SETTINGS_EXTENSION_NAME);
@@ -334,6 +354,17 @@ bool Session::init(const std::string& appName) {
     }
     WWHD_XR_FUNCTIONS(WWHD_XR_LOAD)
 #undef WWHD_XR_LOAD
+#ifndef __ANDROID__
+    if (timeConvExt_) {
+#ifdef _WIN32
+        gipa_(instance_, "xrConvertTimeToWin32PerformanceCounterKHR", reinterpret_cast<PFN_xrVoidFunction*>(&timeConv_));
+#else
+        gipa_(instance_, "xrConvertTimeToTimespecTimeKHR", reinterpret_cast<PFN_xrVoidFunction*>(&timeConv_));
+#endif
+        timeConvExt_ = timeConv_ != nullptr;
+    }
+    LOG("[vr] the runtime's times on the game's clock (frame deadlines): %s", timeConvExt_ ? "available" : "not offered");
+#endif
     if (refreshRateExt_) {
         gipa_(instance_, "xrEnumerateDisplayRefreshRatesFB", reinterpret_cast<PFN_xrVoidFunction*>(&xrEnumerateDisplayRefreshRatesFB_));
         gipa_(instance_, "xrGetDisplayRefreshRateFB", reinterpret_cast<PFN_xrVoidFunction*>(&xrGetDisplayRefreshRateFB_));
@@ -980,6 +1011,7 @@ void Session::poll_events() {
                 break;
             }
             case XR_SESSION_STATE_STOPPING:
+                waited_.store(false, std::memory_order_release);  // (no xrBeginFrame follows it)
                 check(xrEndSession_(session_), "xrEndSession");
                 set_state(State::Idle);
                 break;
@@ -1037,14 +1069,20 @@ void Session::poll_events() {
     }
 }
 
-bool Session::begin_frame(bool& shouldRender) {
-    shouldRender = false;
+// (docs/VR_RUNTIME_PACING_PLAN.md) xrWaitFrame alone: the frame it returns is kept as the waited one until begin_frame
+// takes it. predicted_display_time() stays the begun frame's meanwhile: the end-frame thread's xrEndFrame of the frame
+// before reads it. begin_frame waits itself when none is waited (the render thread, after end_thread::wait, as the
+// Snowrunner VR mod's frame loop). One thread at a time: xrWaitFrame is externally synchronized
+bool Session::wait_frame() {
+    if (waited_.load(std::memory_order_acquire)) return true;
     if (!running()) return false;
     XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};
     XrFrameState fs{XR_TYPE_FRAME_STATE};
     if (!check(xrWaitFrame_(session_, &wi, &fs), "xrWaitFrame")) return false;
-    predictedTime_ = fs.predictedDisplayTime;
-    if (fs.predictedDisplayPeriod > 0) predictedPeriod_ = fs.predictedDisplayPeriod;
+    waitedAt_ = std::chrono::steady_clock::now();
+    waitedTime_ = fs.predictedDisplayTime;
+    waitedPeriod_ = fs.predictedDisplayPeriod;
+    waitedShouldRender_ = fs.shouldRender == XR_TRUE;
     {
         // one display refresh (refresh_period; docs/VR_STREAMING_AUDIT.md, finding 12). VDXR reports two refreshes as its
         // frame period while Virtual Desktop's frame smoothing (SSW) runs, and the game's timing in refreshes (Turn
@@ -1119,11 +1157,25 @@ bool Session::begin_frame(bool& shouldRender) {
             d.logAt = now;
         }
     }
+    waited_.store(true, std::memory_order_release);
+    return true;
+}
+
+bool Session::begin_frame(bool& shouldRender) {
+    shouldRender = false;
+    if (!running()) {
+        waited_.store(false, std::memory_order_release);  // (a frame waited for before the session stopped: dropped)
+        return false;
+    }
+    if (!wait_frame()) return false;
+    waited_.store(false, std::memory_order_release);
+    predictedTime_ = waitedTime_;
+    if (waitedPeriod_ > 0) predictedPeriod_ = waitedPeriod_;
     XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};
     const XrResult r = xrBeginFrame_(session_, &bi);
     if (!check(r, "xrBeginFrame")) return false;
     frameBegun_ = true;
-    shouldRender = fs.shouldRender == XR_TRUE;
+    shouldRender = waitedShouldRender_;
     return true;
 }
 
@@ -2007,6 +2059,7 @@ void Session::destroy_session() {
     if (session_) xrDestroySession_(session_);
     session_ = XR_NULL_HANDLE;
     frameBegun_ = false;
+    waited_.store(false, std::memory_order_release);
 }
 
 void Session::shutdown() {
@@ -2025,3 +2078,29 @@ void Session::shutdown() {
 }
 
 }  // namespace vr::xr
+
+// (docs/VR_RUNTIME_PACING_PLAN.md) a runtime time on std::chrono::steady_clock, ns since its epoch; 0: not available
+int64_t vr::xr::Session::to_steady_ns(XrTime t) const {
+#ifdef __ANDROID__
+    (void)t;
+    return 0;
+#else
+    if (!timeConvExt_ || !timeConv_ || !instance_ || t <= 0) return 0;
+#ifdef _WIN32
+    int64_t counter = 0;  // (LARGE_INTEGER)
+    using Fn = XrResult(XRAPI_PTR*)(XrInstance, XrTime, int64_t*);
+    if (XR_FAILED(reinterpret_cast<Fn>(timeConv_)(instance_, t, &counter))) return 0;
+    static const int64_t freq = [] {
+        LARGE_INTEGER f{};
+        QueryPerformanceFrequency(&f);
+        return f.QuadPart > 0 ? int64_t(f.QuadPart) : int64_t(1);
+    }();
+    return (counter / freq) * 1000000000 + (counter % freq) * 1000000000 / freq;
+#else
+    struct timespec ts{};
+    using Fn = XrResult(XRAPI_PTR*)(XrInstance, XrTime, struct timespec*);
+    if (XR_FAILED(reinterpret_cast<Fn>(timeConv_)(instance_, t, &ts))) return 0;
+    return int64_t(ts.tv_sec) * 1000000000 + int64_t(ts.tv_nsec);
+#endif
+#endif
+}

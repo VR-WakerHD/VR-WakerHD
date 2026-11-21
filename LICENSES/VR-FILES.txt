@@ -69,6 +69,8 @@ docs/VR_SCENE_THREADS.md
 docs/VR_SCREEN_EFFECTS.md
 docs/VR_SETTINGS.md
 docs/VR_SKULL_HAMMER.md
+docs/VR_STARS_BATCH_PLAN.md
+docs/VR_SWORD_COMBAT_PLAN.md
 docs/VR_STEAM_FRAME.md
 docs/VR_STREAMING.md
 docs/VR_TELESCOPE.md
@@ -186,9 +188,12 @@ runtime/src/vr/vr_locomotion.h
 runtime/src/vr/vr_math.h
 runtime/src/vr/vr_platform.h
 runtime/src/vr/vr_probe.cpp
+runtime/src/vr/vr_runtime_slow.h
 runtime/src/vr/vr_sail_view.h
 runtime/src/vr/vr_settings_file.h
 runtime/src/vr/vr_swing.h
+runtime/src/vr/vr_head_keep.h
+runtime/src/vr/vr_sword_motion.h
 runtime/src/vr/vr_sword.h
 runtime/src/vr/vr_test_env.cpp
 runtime/src/vr/vr_test_env.h

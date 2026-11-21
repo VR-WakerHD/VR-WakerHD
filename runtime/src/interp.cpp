@@ -61,6 +61,8 @@ namespace interp {class NativeResumeBoundaryIssuer {public:static void after_ser
 #include "savestate.h"
 #include "game_hooks.h"
 #include "gx2/gx2.h"
+#include "gx2/gx2_cmd.h"
+#include "write_watch.h"
 #include "gfx/renderer.h"
 #ifdef WWHD_VR
 #include "vr/vr_game.h"
@@ -154,6 +156,14 @@ static bool g_auto_on = false;
 static pacing::AutoRate g_auto;
 static std::atomic<bool> g_vr_streamed{false};  // a streamed headset (set_vr_streamed): Auto's longer waits
 static std::atomic<bool> g_vr_stream_rates{false};  // (set_vr_stream_rates)
+static std::atomic<bool> g_vr_runtime_paced{false};  // (set_vr_runtime_paced)
+static std::atomic<bool> g_vr_runtime_slow{false};   // (set_vr_runtime_slow)
+// (note_vr_missed_refresh, render thread writes) misses in the current second, and until when one in-between frame is
+// held back (steady clock ns; 0: none)
+static int64_t g_vr_miss_window = 0;
+static int g_vr_misses = 0;
+static std::atomic<int64_t> g_vr_miss_hold_until{0};
+static std::atomic<uint64_t> g_vr_miss_total{0};  // (every miss noted: Auto Mode's share, auto_rate_after_step)
 // (tests) WWHD_INTERP_VR_HZ=90: a headset's rate without one (desktop stereo runs at the headset's frame schedule: 3
 // frames a step at 90 Hz); a VR session sets its headset's rate over it
 static std::atomic<int> g_vr_hz{[] { const char* e = getenv("WWHD_INTERP_VR_HZ"); return e ? std::max(0, atoi(e)) : 0; }()};
@@ -203,6 +213,42 @@ int requested_display_hz() { return g_requested_hz.load(std::memory_order_relaxe
 bool present_vsync() { return g_present_vsync.load(std::memory_order_relaxed); }
 int vr_display_hz() { return g_vr_hz.load(std::memory_order_relaxed); }
 void set_vr_streamed(bool on) { g_vr_streamed.store(on, std::memory_order_relaxed); }
+void set_vr_runtime_paced(bool on) {
+    if (g_vr_runtime_paced.exchange(on, std::memory_order_relaxed) != on)
+        LOG("[interp] VR paced by the runtime: %s", on ? "on (the passes timed by their work, the headset's waits left out)"
+                                                       : "off");
+}
+bool vr_runtime_paced() { return g_vr_runtime_paced.load(std::memory_order_relaxed); }
+void set_vr_runtime_slow(bool on) {
+    if (g_vr_runtime_slow.exchange(on, std::memory_order_relaxed) != on)
+        LOG("[interp] VR frame rate auto: %s", on ? "not judged while the runtime is in its slow state (its frames are late "
+                                                     "whatever the game draws)"
+                                                  : "judged again (the runtime's slow state ended; settling first)");
+}
+void note_vr_missed_refresh() {
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    // (during a hold the planner itself draws fewer frames than the refreshes, which show as late too: not counted, so
+    // the hold ends after its second and the full rate is tried again)
+    g_vr_miss_total.fetch_add(1, std::memory_order_relaxed);
+    if (now < g_vr_miss_hold_until.load(std::memory_order_relaxed)) return;
+    if (now - g_vr_miss_window > 1'000'000'000) g_vr_miss_window = now, g_vr_misses = 0;
+    if (++g_vr_misses >= 3) {
+        static int logged = 0;
+        if (logged++ < 20) LOG("[interp] VR: 3 frames a refresh late within a second: one in-between frame held back for 1 s");
+        g_vr_miss_hold_until.store(now + 1'000'000'000, std::memory_order_relaxed);
+        g_vr_misses = 0;
+    }
+}
+uint64_t vr_missed_refreshes() { return g_vr_miss_total.load(std::memory_order_relaxed); }
+// (planner) one in-between frame held back while misses repeat (note_vr_missed_refresh)
+static int vr_miss_capped(int n) {
+    // (Auto Mode decides the rate itself, from the misses: auto_rate_after_step)
+    if (n <= 1 || !g_vr_runtime_paced.load(std::memory_order_relaxed) || g_auto_on) return n;
+    const int64_t now = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count();
+    return now < g_vr_miss_hold_until.load(std::memory_order_relaxed) ? n - 1 : n;
+}
 // a streamed headset with vr.streamingOptimal on (docs/VR_STREAMING.md): 72 and 80 fps, a frame every refresh at 72
 // and 80 Hz (pacing::is_fps_variable). Off: the rates of a wired headset there (60 fps at 72 Hz)
 void set_vr_stream_rates(bool on) {
@@ -1999,8 +2045,12 @@ static void paced_pass_start() {
     if (!g_hold_next) g_exact_step = !previousRecord;  // this logic pass: blend only after a record pass
     previousRecord = g_hold_next && g_phase + 1 >= g_step_n;  // this pass is the step's record pass
     const auto now = pace_clock::now();
+    // (paced by the runtime: the game thread's waits for the vsync and the render thread out of the pass, as g_slept)
+    const auto waited = std::chrono::duration_cast<pace_clock::duration>(std::chrono::nanoseconds(gx2::take_game_waited_ns()));
     if (g_last_entry != pace_clock::time_point{}) {
-        const auto pass = now - g_last_entry - g_slept;
+        auto pass = now - g_last_entry - g_slept;
+        if (g_vr_runtime_paced.load(std::memory_order_relaxed))
+            pass = std::max(pace_clock::duration(std::chrono::microseconds(100)), pass - waited);
         pace_clock::duration& avg = g_pass_was_hold ? g_hold_avg : g_logic_avg;
         // a probe after a long pause replaces the old value (pacing::probe_estimate; one that hit a
         // hitch is repeated a second later)
@@ -2129,6 +2179,7 @@ static int plan_step_variable() {
     if (n > 1 && paced()) {
         n = pacing::plan_in_between(n, paced_budget().count(), std::chrono::duration_cast<std::chrono::nanoseconds>(g_logic_avg).count(),
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(g_hold_avg).count());
+        n = std::max(1, vr_miss_capped(n));
     }
     if (paced()) g_paced_planned += n;
     if (g_exact_step) n = pacing::exact_step_holds(g_step_capacity, false, g_resume_step);
@@ -2145,6 +2196,7 @@ static int plan_step() {
     if (n > 1 && paced() && interp_on()) {
         n = pacing::plan_in_between(n, paced_budget().count(), std::chrono::duration_cast<std::chrono::nanoseconds>(g_logic_avg).count(),
                                     std::chrono::duration_cast<std::chrono::nanoseconds>(g_hold_avg).count());
+        n = std::max(1, vr_miss_capped(n));
         // even frame delivery: only counts that divide the display's refreshes per step evenly
         if (g_even_pacing && present_vsync() && display_hz() > 0)
             n = pacing::even_in_between(n, int(std::lround(display_hz() * std::chrono::duration<double>(paced_step()).count())));
@@ -2169,7 +2221,11 @@ static void auto_rate_after_step(int holds, int capacity) {
 #ifdef WWHD_VR
     vrMenu = vr::game::menu_open();
 #endif
-    if (!aspect::gameplay_camera() || vrMenu) {
+    // (2026-11-20, a SteamVR 2.19.4 run's log: in the runtime's slow state, xrEndFrame 7-11 ms a frame, the game drew
+    // only 26 % of its in-between frames and Auto went to 45 fps, where every game frame is two of the runtime's and the
+    // waits for its xrEndFrame doubled: 30 fps, the game at half speed. The same scene held 90 on Monado. Its misses are
+    // the runtime's, not the game's work: not judged meanwhile, as in a menu)
+    if (!aspect::gameplay_camera() || vrMenu || g_vr_runtime_slow.load(std::memory_order_relaxed)) {
         inPlay = false;
         return;
     }
@@ -2194,6 +2250,15 @@ static void auto_rate_after_step(int holds, int capacity) {
     static pace_clock::duration fullLogic{}, fullHold{};
     const bool wasHalf = g_auto.half;
     const bool full = g_vr_mode.load(std::memory_order_relaxed) == pacing::kVrFull;
+    // (docs/VR_RUNTIME_PACING_PLAN.md) paced by the runtime the planner draws every in-between frame its work allows, so
+    // the share Auto judges counts each real frame shown a refresh late as one not drawn
+    {
+        static uint64_t seen = 0;
+        const uint64_t total = g_vr_miss_total.load(std::memory_order_relaxed);
+        const int misses = int(std::min<uint64_t>(total - seen, 8));
+        seen = total;
+        if (g_vr_runtime_paced.load(std::memory_order_relaxed)) holds = std::max(0, holds - misses);
+    }
     pacing::auto_rate_step(g_auto, full ? holds : 0, full ? capacity : 0);
     if (g_auto.half && !wasHalf) {
         fullLogic = g_logic_avg;
@@ -3168,6 +3233,28 @@ float g_vrMoonDir[3];
 bool g_vrMoonKnown = false;
 float g_vrMoonCos = 1.0f;  // a star whose direction's cosine to the moon's is above it: not drawn (near the moon)
 float g_vrStarScreen[2];   // a point inside the flat screen
+// (2026-11-20) the stars outside the headset's view left out, as those near the moon: a game-thread profile in the
+// Forsaken Fortress at night (MajyuE) had dKyr_drawStar and its hook at 13.1% of the game thread's time (about a
+// quarter of its work: its own loop the top game function, 5.6% self), each star projected, written, flushed and
+// drawn every frame since every star in the sky was kept (2026-11-13). Kept: a star within the view's cone, the
+// half diagonal of the field of view both eyes cover (vr::projection) plus kStarCullMarginDeg for the head's turn
+// before the frame is shown. WWHD_VR_STARS_CULL=0: every star kept, as before
+constexpr float kStarCullMarginDeg = 20.0f;
+bool g_vrStarCull = false;  // this draw: cull by the view
+float g_vrStarFwd[3];       // the view's forward (game space)
+float g_vrStarCullCos = -1.0f;
+struct StarCullStats { uint64_t calls = 0, kept = 0, culled = 0, nearMoon = 0; double ms = 0, msMax = 0; } g_starStats;
+std::chrono::steady_clock::time_point g_starStatsSince = std::chrono::steady_clock::now();
+bool vr_stars_cull_on() {
+    static const bool on = [] {
+        const char* e = getenv("WWHD_VR_STARS_CULL");
+        const bool v = !(e && *e == '0');
+        LOG("[vr] night sky stars: %s", v ? "those outside the headset's view left out (WWHD_VR_STARS_CULL=0: all kept)"
+                                          : "all kept (WWHD_VR_STARS_CULL=0)");
+        return v;
+    }();
+    return on;
+}
 bool vr_stars_on() {
     static const bool on = [] {
         const char* e = getenv("WWHD_VR_STARS_SKY");
@@ -3177,6 +3264,343 @@ bool vr_stars_on() {
         return v;
     }();
     return on;
+}
+float vr_len3(const float v[3]);
+// ---- (2026-11-20) the stars built here and drawn as one draw a colour (docs/VR_STARS_BATCH_PLAN.md). The game's
+// dKyr_drawStar loop, done in C++ with its single-precision operations in the verified decomp's order
+// (d_kankyo_rain_drawStar.cpp), the view's cone and the moon tested first; the kept stars' two triangles a star (the
+// game's own halves, in star order) written into a ring of ours in guest memory, a colour after another; then the
+// game's own dKankyo_star_Packet::render (0258115C: its render state, matrices and shader), whose setColor
+// (02581060, weather_quads.cpp) draws each colour as one draw from the ring (interp_vr_star_set_color). Before:
+// per star a projection set up and made (two guest calls), its own buffer written and flushed, and two draws, each
+// with its own buffer bind (weatherBindGeometryMaterial, the profile's third game function by self time), about
+// 4,000 draws a frame the renderer then merged again (weather_flush, 11.4% of the render thread).
+// WWHD_VR_STARS_BATCH=0: the game's own loop and draws (as with the culling above); WWHD_VR_STARS_CHECK=1: the game's
+// own loop and draws are kept, and every star both keep is compared with ours (logged). The layout (layout_begin,
+// layout_star) is the same code in both, and in the desktop proof (WWHD_STARS_BATCH_TEST, interp_vr_star_set_color)
+namespace sb {
+// the guest's argument registers, kept before our own guest calls and put back before the game's own function runs
+// (guest_call keeps only lr, ctr and the stack pointer: the desktop proof crashed in weatherBindRenderer with the
+// game's setColor run on our calls' r3)
+struct Args {
+    uint32_t r[8];
+    std::remove_reference_t<decltype(Cpu::f[0])> f[8];
+    void keep(const Cpu* c) { for (int i = 0; i < 8; i++) r[i] = c->r[3 + i], f[i] = c->f[1 + i]; }
+    void put(Cpu* c) const { for (int i = 0; i < 8; i++) c->r[3 + i] = r[i], c->f[1 + i] = f[i]; }
+};
+inline float add(float a, float b) { return (float)((double)a + (double)b); }
+inline float sub(float a, float b) { return (float)((double)a - (double)b); }
+inline float mul(float a, float b) { return (float)((double)a * (double)b); }
+inline float madd(float a, float c, float b) { return (float)((double)a * (double)c + (double)b); }   // a*c+b
+inline float nmsub(float a, float c, float b) { return (float)(-((double)a * (double)c - (double)b)); } // b-a*c
+inline float cst(uint32_t a) { return (float)ldf32(a); }  // (a: this build's address, GD at the call)
+constexpr uint32_t kMax = 2000;
+constexpr uint32_t kTriBytes = 36;               // a half: 3 positions of 12 bytes (prepare_weather_element 3, 0x24)
+constexpr uint32_t kFrameBytes = kMax * 2 * kTriBytes;
+constexpr uint32_t kRingFrames = 16;             // frames the renderer may still read
+// g_env_light 0x10475A68 (its +0xA60: the star packet, +0xB44: the moon): GD(0x10475A68) at its use
+struct Kept { float pos[3], scale; uint16_t index; uint8_t color; };
+Kept g_kept[kMax];
+Kept g_all[kMax];                                 // (the desktop proof) every star's place
+float g_ours[kMax][2][9];                         // (compare mode) each kept star's two halves
+bool g_oursKept[kMax];
+struct Batch {
+    uint32_t packet = 0;
+    bool vr = false;  // (stars_batch's; else the desktop proof's)
+    uint32_t addr[8] = {}, tris[8] = {};
+} g_batch;
+uint32_t g_ring = 0, g_ringAt = 0, g_scratch = 0;
+uint32_t g_index = 0, g_indexType = 0, g_prim = 0;
+bool g_ready = false, g_failed = false;
+Args g_args;  // (stars_batch: the game's arguments, for its own loop in compare mode)
+struct Stats {
+    uint64_t batched = 0, game = 0, draws = 0, tris = 0, checks = 0, compared = 0, onlyOurs = 0, onlyGame = 0,
+             colorDiffers = 0;
+    double worst = 0;
+} g_stats;
+bool batch_on() {
+    static const bool on = [] {
+        const char* e = getenv("WWHD_VR_STARS_BATCH");
+        const bool v = !(e && *e == '0');
+        LOG("[vr] night sky stars: %s", v ? "built here, one draw a colour (WWHD_VR_STARS_BATCH=0: the game's own loop and draws)"
+                                          : "the game's own loop and draws (WWHD_VR_STARS_BATCH=0)");
+        return v;
+    }();
+    return on;
+}
+bool check_on() {
+    static const bool on = [] {
+        const char* e = getenv("WWHD_VR_STARS_CHECK");
+        const bool v = e && *e == '1';
+        if (v) LOG("[vr] night sky stars: compare mode (WWHD_VR_STARS_CHECK=1): the game's own drawn, ours compared with it");
+        return v;
+    }();
+    return on;
+}
+// (the desktop proof, flat play: 1 compare only, 2 compare and draw ours in place of the game's draws)
+int desktop_test() {
+    static const int v = [] {
+        const char* e = getenv("WWHD_STARS_BATCH_TEST");
+        const int m = !e ? 0 : !strcmp(e, "draw") ? 2 : !strcmp(e, "compare") ? 1 : 0;
+        if (m) LOG("[stars test] WWHD_STARS_BATCH_TEST=%s: the stars' layout compared with the game's each frame%s", e,
+                   m == 2 ? ", and drawn one draw a colour in place of the game's draws" : "");
+        return m;
+    }();
+    return v;
+}
+// once: the game's star triangle's index data (expected a triangle list of 3 indices), our ring, our index buffer of
+// the same type for 2 x 2000 triangles
+bool ready() {
+    if (g_ready || g_failed) return g_ready;
+    g_prim = ld32(GD(0x104B4A88));
+    g_indexType = ld32(GD(0x104B4A84));
+    const uint32_t idx = ld32(GD(0x104B4A8C));
+    uint32_t tri[3] = {};
+    const bool be16 = g_indexType == 4, be32 = g_indexType == 9, le16 = g_indexType == 0, le32 = g_indexType == 1;
+    if (idx)
+        for (int k = 0; k < 3; k++) {
+            if (be16) tri[k] = ld16(idx + 2 * k);
+            else if (be32) tri[k] = ld32(idx + 4 * k);
+            else if (le16) { const uint32_t v = ld16(idx + 2 * k); tri[k] = ((v & 0xFF) << 8) | (v >> 8); }
+            else if (le32) tri[k] = __builtin_bswap32(ld32(idx + 4 * k));
+        }
+    // (a strip of 3 indices, GX2 primitive 6, is the one triangle of a list of 3, 4, with the same winding: the batch
+    // is drawn as a list; the desktop proof found 6, index type 9, indices 0 1 2)
+    const uint32_t gamePrim = g_prim;
+    if (g_prim == 6) g_prim = 4;
+    const bool sane = idx && g_prim == 4 && (be16 || be32 || le16 || le32) && tri[0] < 3 && tri[1] < 3 && tri[2] < 3 &&
+                      tri[0] != tri[1] && tri[1] != tri[2] && tri[0] != tri[2];
+    LOG("[vr] night sky stars: the game's star triangle: primitive %u, index type %u, indices %u %u %u at %08X: %s", gamePrim,
+        g_indexType, tri[0], tri[1], tri[2], idx, sane ? "batched draws possible" : "not a triangle list of 3: the game's own draws");
+    if (!sane) { g_failed = true; return false; }
+    const uint32_t n = kMax * 2 * 3, unit = (be16 || le16) ? 2 : 4;
+    g_index = mem::host_alloc(n * unit, 0x100);
+    g_ring = mem::host_alloc(kFrameBytes * kRingFrames, 0x100);
+    g_scratch = mem::host_alloc(0x100, 0x40);
+    if (!g_index || !g_ring || !g_scratch) {
+        g_failed = true;
+        LOG("[vr] night sky stars: no memory for the batch: the game's own draws");
+        return false;
+    }
+    for (uint32_t t = 0; t < kMax * 2; t++)
+        for (int k = 0; k < 3; k++) {
+            const uint32_t v = 3 * t + tri[k], at = g_index + (3 * t + k) * unit;
+            if (be16) st16(at, uint16_t(v));
+            else if (be32) st32(at, v);
+            else if (le16) st16(at, uint16_t(((v & 0xFF) << 8) | ((v >> 8) & 0xFF)));
+            else st32(at, __builtin_bswap32(v));
+        }
+    wwatch::hint(g_index, n * unit);
+    g_ready = true;
+    return true;
+}
+// the frame's layout: everything dKyr_drawStar computes once (the fade, the billboard triangle around the eye) and
+// the spiral's running state its stars are placed along
+struct Layout {
+    float cam[3], tri[3][3];
+    float zero, one, fade, half, sizeBase, mSin, spiralShrink, two, distanceFactor, tableScale;
+    float spiral;
+    uint32_t phase, phaseStep;
+    int n;
+};
+// the game's billboard triangle: its view's inverse rotation turned by the packet's rotation (its own PSMTX code,
+// guest calls on scratch memory), three points of the given radius, around the camera's eye
+bool layout_begin(Cpu* c, uint32_t view, uint32_t packet, const float cam[3], Layout& L) {
+    for (int k = 0; k < 3; k++) L.cam[k] = cam[k];
+    L.zero = cst(GD(0x1004F528)), L.one = cst(GD(0x1004F550));
+    float fade = (float)((float)ldf32(view + 0xD4) / cst(GD(0x1004F6EC)));
+    if (!(fade < L.one)) fade = L.one;
+    L.fade = sub(L.one, fade);
+    L.sizeBase = cst(GD(0x1004FC98)), L.half = cst(GD(0x1004F57C));
+    const float radius = mul(nmsub(cst(GD(0x1004F740)), L.fade, L.sizeBase), L.half), bottom = -mul(radius, L.half);
+    const uint32_t inv = g_scratch, rot = g_scratch + 0x30, in = g_scratch + 0x60, out = g_scratch + 0x70;
+    guest_call(c, GC(0x028E91EC), {view + 0x1E4, inv});  // MTXInverse
+    const auto f1 = c->f[1];
+    c->f[1].ps0 = (double)mul((float)(uint32_t)ld32(packet + 0xD0), cst(GD(0x1004FB7C)));
+    guest_call(c, GC(0x028E98C0), {rot, 90});             // MTXRotDeg(rot, 'Z', the packet's rotation)
+    c->f[1] = f1;
+    guest_call(c, GC(0x028E9108), {inv, rot, inv});       // MTXConcat
+    for (int v = 0; v < 3; v++) {
+        stf32(in, v == 0 ? L.zero : v == 1 ? radius : -radius);
+        stf32(in + 4, v == 0 ? radius : bottom);
+        stf32(in + 8, L.zero);
+        guest_call(c, GC(0x028E8F64), {inv, in, out});    // MTXMultVec
+        for (int k = 0; k < 3; k++) L.tri[v][k] = add(cam[k], (float)ldf32(out + 4 * k));
+    }
+    for (int v = 0; v < 3; v++)
+        for (int k = 0; k < 3; k++)
+            if (!std::isfinite(L.tri[v][k])) return false;
+    L.mSin = (float)ldf32(packet + 0xC0), L.spiralShrink = cst(GD(0x1004FCB0)), L.two = cst(GD(0x1004F52C));
+    L.distanceFactor = cst(GD(0x1004F800)), L.tableScale = cst(GD(0x1004F54C));
+    L.spiral = L.zero, L.phase = 0, L.phaseStep = 0;
+    L.n = std::min<int>((int16_t)ld16(packet + 0xCC), (int)kMax);
+    return true;
+}
+// star i (in order, from 0: the spiral runs on): its colour kind, its place around the eye, its size
+void layout_star(Layout& L, int i, Kept& s) {
+    uint8_t color;
+    if (i < 16) color = (i == 6 || i == 8) ? 0 : 1;
+    else {
+        const uint32_t kind = (uint32_t)i & 7;
+        color = uint8_t(kind < 2 ? 2 : kind);
+    }
+    float x, y, z, scale;
+    if (i < 16) {
+        const uint32_t a = GD(0x10477520) + (uint32_t)i * 6;
+        x = (float)(int16_t)ld16(a), y = (float)(int16_t)ld16(a + 2), z = (float)(int16_t)ld16(a + 4);
+        scale = mul(L.mSin, cst(i > 7 ? GD(0x1004FCB4) : GD(0x1004F6D8)));
+        scale = nmsub(L.fade, mul(scale, L.half), scale);
+    } else {
+        scale = madd(mul(mul((float)(i & 63), cst(GD(0x1004FCB8))), cst(GD(0x1004F640))), L.mSin, L.sizeBase);
+        if ((i & 15) == 2) {
+            scale = mul(scale, cst(GD(0x1004FB8C)));
+            color = 2;
+        }
+        const uint32_t table = GD(0x104A44F8) + (((L.phase - 0x8000) & 0xFFFFu) >> 3) * 8;
+        const float shrink = nmsub(L.spiral, L.spiralShrink, L.one);
+        const float px = mul(mul((float)ldf32(table), L.tableScale), shrink);
+        const float pz = mul(mul((float)ldf32(table + 4), L.tableScale), shrink);
+        float term = L.spiral / L.two;
+        term = mul(term, mul(term, term));
+        const float increment = madd(term, L.distanceFactor, L.one);
+        y = add(L.spiral, cst(GD(0x1004FB84)));
+        L.spiral = add(L.spiral, increment);
+        L.phase += L.phaseStep;
+        L.phaseStep += 2500;
+        x = -px;
+        z = pz;
+        if (L.spiral > L.two) L.spiral = mul((float)i / cst(GD(0x1004F540)), cst(GD(0x1004F6D4)));
+    }
+    s.pos[0] = add(L.cam[0], x), s.pos[1] = add(L.cam[1], y), s.pos[2] = add(L.cam[2], z);
+    s.scale = scale, s.index = uint16_t(i), s.color = color;
+}
+// one star's half (h 0: plus the triangle's offsets, 1: minus), 9 floats
+inline void half_of(const Kept& s, const Layout& L, int h, float o[9]) {
+    for (int v = 0; v < 3; v++)
+        for (int k = 0; k < 3; k++) {
+            const float off = mul(sub(L.tri[v][k], L.cam[k]), s.scale);
+            o[3 * v + k] = h ? sub(s.pos[k], off) : add(s.pos[k], off);
+        }
+}
+// the game's own halves of star i, as setColor reads them (the side it just wrote), compared with ours: the largest
+// difference (into g_stats.worst); false when the game has no buffer there
+bool compare_star(uint32_t packet, int i, const float ours[2][9]) {
+    const uint32_t geom = packet + 0x8A8 + (uint32_t)i * 0x968;
+    const uint32_t side = ld32(geom + 0x950) == 0 ? 1 : 0;
+    for (int h = 0; h < 2; h++) {
+        const uint32_t buf = ld32(geom + (side + 2 * h) * 0x254);
+        if (!buf) return false;
+        for (int q = 0; q < 9; q++) {
+            const double diff = std::fabs((double)(float)ldf32(buf + 4 * q) - (double)ours[h][q]);
+            g_stats.worst = std::max(g_stats.worst, std::isfinite(diff) ? diff : 1e30);
+        }
+    }
+    ++g_stats.compared;
+    return true;
+}
+// this frame's part of the ring: the given stars a colour after another in their order (each star's two halves)
+void write_ring(uint32_t packet, const Kept* stars, uint32_t count, const Layout& L) {
+    if (g_ringAt + kFrameBytes > kFrameBytes * kRingFrames) g_ringAt = 0;
+    const uint32_t base = g_ring + g_ringAt;
+    g_ringAt += kFrameBytes;
+    uint32_t at = base;
+    g_batch = {};
+    for (int col = 0; col < 8; col++) {
+        g_batch.addr[col] = at;
+        for (uint32_t k = 0; k < count; k++) {
+            if (stars[k].color != col) continue;
+            for (int h = 0; h < 2; h++) {
+                float o[9];
+                half_of(stars[k], L, h, o);
+                for (int q = 0; q < 9; q++) stf32(at + 4 * q, o[q]);
+                at += kTriBytes;
+                ++g_batch.tris[col];
+            }
+        }
+    }
+    if (at > base) wwatch::hint(base, at - base);  // (the buffer cache: these vertices are new)
+    g_batch.packet = packet;
+}
+}  // namespace sb
+// 1: built and drawn here; 0: not (the caller runs the game's own); 2: the game's own ran here (compare mode)
+int stars_batch(Cpu* c, uint32_t cam, const float eye[3]) {
+    using namespace sb;
+    g_args.keep(c);
+    if (!sb::ready()) return 0;
+    const uint32_t env = GD(0x10475A68), packet = ld32(env + 0xA60), gi = GD(0x1046F0B0), view = ld32(gi + 0x5FA4);
+    // (the game's own: its constellations set up on its first call, no stars, no view)
+    if (!packet || !view || !ld32(GD(0x10477588)) || (int16_t)ld16(packet + 0xCC) <= 0) return 0;
+    const float camp[3] = {(float)ldf32(cam + 0xDC), (float)ldf32(cam + 0xE0), (float)ldf32(cam + 0xE4)};
+    Layout L;
+    if (!layout_begin(c, view, packet, camp, L)) return 0;
+    // the moon: its direction from the eye, and the game's distance limit off it (MoonDistanceGain * fade^2 +
+    // MoonDistanceBase, in the flat screen's pixels) as an angle: the flat screen's 480 rows over the view's fovy
+    {
+        float d[3];
+        for (int k = 0; k < 3; k++) d[k] = (float)ldf32(env + 0xB44 + 4 * k) - eye[k];
+        const float len = vr_len3(d);
+        g_vrMoonKnown = len > 1e-3f;
+        if (g_vrMoonKnown)
+            for (int k = 0; k < 3; k++) g_vrMoonDir[k] = d[k] / len;
+        const float limit = madd(cst(GD(0x1004F6BC)), mul(L.fade, L.fade), cst(GD(0x1004F55C)));
+        const float fovy = (float)ldf32(view + 0xD4) * 0.01745329f, px = 240.0f / std::tan(0.5f * fovy);
+        g_vrMoonCos = px > 1.0f && std::isfinite(px) && limit > 0 ? std::cos(std::atan(limit / px)) : 1.0f;
+    }
+    const uint32_t flags = packet + 0x49A608, drawn = packet + 0xD4;
+    const bool check = check_on();
+    uint32_t kept = 0, culled = 0, nearMoon = 0;
+    for (int i = 0; i < L.n; i++) {
+        st8(drawn + i, 0);
+        Kept s;
+        layout_star(L, i, s);
+        st8(flags + i, s.color);
+        g_oursKept[i] = false;
+        // the moon and the view's cone (as interp_vr_star_project's test of the game's own loop)
+        float d[3];
+        for (int k = 0; k < 3; k++) d[k] = s.pos[k] - g_vrStarEye[k];
+        const float len = vr_len3(d);
+        if (g_vrMoonKnown && len > 1e-3f &&
+            (d[0] * g_vrMoonDir[0] + d[1] * g_vrMoonDir[1] + d[2] * g_vrMoonDir[2]) / len > g_vrMoonCos) {
+            ++nearMoon;
+            continue;
+        }
+        if (g_vrStarCull && len > 1e-3f &&
+            (d[0] * g_vrStarFwd[0] + d[1] * g_vrStarFwd[1] + d[2] * g_vrStarFwd[2]) / len < g_vrStarCullCos) {
+            ++culled;
+            continue;
+        }
+        g_kept[kept++] = s;
+        g_oursKept[i] = true;
+        st8(drawn + i, 1);
+    }
+    if (check) {
+        // the game's own loop and draws, then every star both keep compared
+        for (uint32_t k = 0; k < kept; k++) {
+            half_of(g_kept[k], L, 0, g_ours[g_kept[k].index][0]);
+            half_of(g_kept[k], L, 1, g_ours[g_kept[k].index][1]);
+        }
+        g_args.put(c);
+        t_vrStars = true;
+        f_02574144_orig(c);
+        t_vrStars = false;
+        ++g_stats.checks;
+        for (int i = 0; i < L.n; i++) {
+            const bool game = ld8(drawn + i) != 0, ours = g_oursKept[i];
+            if (game != ours) {
+                ++(game ? g_stats.onlyGame : g_stats.onlyOurs);
+                continue;
+            }
+            if (game) compare_star(packet, i, g_ours[i]);
+        }
+        return 2;
+    }
+    g_starStats.kept += kept, g_starStats.culled += culled, g_starStats.nearMoon += nearMoon;
+    write_ring(packet, g_kept, kept, L);
+    g_batch.vr = true;
+    ++g_stats.batched;
+    guest_call(c, GC(0x0258115C), {packet});  // dKankyo_star_Packet::render: its colours drawn by interp_vr_star_set_color
+    g_batch.packet = 0;
+    return 1;
 }
 void stars_vr(Cpu* c) {
     const uint32_t cam = ld32(GD(0x1046F0B0) + 0x5AF8);  // dComIfGp_getCamera(0), the camera the stars are put around
@@ -3197,9 +3621,60 @@ void stars_vr(Cpu* c) {
     g_vrStarScreen[1] = 0.5f * (lo + hy);
     g_vrMoonKnown = false;
     g_vrMoonCos = 1.0f;
-    t_vrStars = true;
-    f_02574144_orig(c);
-    t_vrStars = false;
+    // the view's cone (its forward: minus the view's back row, view +0x1E4 + 32)
+    g_vrStarCull = false;
+    if (vr_stars_cull_on()) {
+        const uint32_t view = ld32(GD(0x1046F0B0) + 0x5FA4);
+        vr::Fov f;
+        if (view && vr::projection(f)) {
+            float fwd[3];
+            for (int k = 0; k < 3; k++) fwd[k] = -(float)ldf32(view + 0x1E4 + 32 + 4 * k);
+            const float n = std::sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+            const float tx = std::max(std::tan(f.right), std::tan(-f.left)), ty = std::max(std::tan(f.up), std::tan(-f.down));
+            const float half = std::atan(std::sqrt(tx * tx + ty * ty)) + kStarCullMarginDeg * 0.01745329f;
+            if (n > 1e-3f && std::isfinite(half) && half < 3.0f) {
+                for (int k = 0; k < 3; k++) g_vrStarFwd[k] = fwd[k] / n;
+                g_vrStarCullCos = std::cos(half);
+                g_vrStarCull = true;
+            }
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    sb::Args args;
+    args.keep(c);
+    const int how = sb::batch_on() ? stars_batch(c, cam, eye) : 0;
+    if (how == 0) {
+        args.put(c);
+        ++sb::g_stats.game;
+        t_vrStars = true;
+        f_02574144_orig(c);
+        t_vrStars = false;
+    }
+    {
+        // (proof, every 10 s: stars kept and left out by the view, and the stars' game-thread time per draw)
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++g_starStats.calls;
+        g_starStats.ms += ms;
+        g_starStats.msMax = std::max(g_starStats.msMax, ms);
+        if (std::chrono::steady_clock::now() - g_starStatsSince > std::chrono::seconds(10)) {
+            const double n = double(std::max<uint64_t>(1, g_starStats.calls));
+            LOG("[vr] night sky stars (10 s): %llu draws, %.0f stars kept and %.0f outside the view left out a draw "
+                "(%.0f near the moon; view cone %.0f degrees across, %s); %.3f ms a draw on the game thread, %.3f at most",
+                (unsigned long long)g_starStats.calls, g_starStats.kept / n, g_starStats.culled / n, g_starStats.nearMoon / n,
+                2.0 * std::acos(std::clamp(double(g_vrStarCullCos), -1.0, 1.0)) * 57.2958, g_vrStarCull ? "culling" : "not culling",
+                g_starStats.ms / n, g_starStats.msMax);
+            const auto& b = sb::g_stats;
+            LOG("[vr] night sky stars (10 s): %llu draws built here (%llu one draw a colour: %llu draws, %llu triangles), %llu "
+                "the game's own; compared %llu times: %llu stars both kept, the largest difference %.6f units, %llu kept only "
+                "by ours, %llu only by the game's", (unsigned long long)(b.batched + b.checks), (unsigned long long)b.batched,
+                (unsigned long long)b.draws, (unsigned long long)b.tris, (unsigned long long)b.game,
+                (unsigned long long)b.checks, (unsigned long long)b.compared, b.worst, (unsigned long long)b.onlyOurs,
+                (unsigned long long)b.onlyGame);
+            sb::g_stats = {};
+            g_starStats = {};
+            g_starStatsSince = std::chrono::steady_clock::now();
+        }
+    }
     for (int k = 0; k < 3; k++) st32(cam + 0xDC + 4 * k, saved[k]);
     static bool logged = false;
     if (!logged) {
@@ -3263,13 +3738,100 @@ bool interp_vr_star_project(Cpu* c, void (*orig)(Cpu*)) {
         const float cosA = (d[0] * g_vrMoonDir[0] + d[1] * g_vrMoonDir[1] + d[2] * g_vrMoonDir[2]) / len;
         nearMoon = cosA > g_vrMoonCos;
     }
+    // outside the view's cone (g_vrStarCull): left out as the moon's are
+    const bool outside = !nearMoon && g_vrStarCull && len > 1e-3f &&
+                         (d[0] * g_vrStarFwd[0] + d[1] * g_vrStarFwd[1] + d[2] * g_vrStarFwd[2]) / len < g_vrStarCullCos;
+    g_starStats.nearMoon += nearMoon;
+    g_starStats.culled += outside;
+    g_starStats.kept += !nearMoon && !outside;
+    if (outside) nearMoon = true;
     stf32(dst, nearMoon ? kFar : g_vrStarScreen[0]);
     stf32(dst + 4, nearMoon ? kFar : g_vrStarScreen[1]);
     stf32(dst + 8, 0.5f);
     return true;
 }
+// (2026-11-20, docs/VR_STARS_BATCH_PLAN.md) dKankyo_star_Packet::setColor while stars_batch built this frame's
+// stars: the colour's renderer bound as the game binds it, star 0's first half bound as each half is (its fetch shader
+// and attribute set-up: the stars' one layout, positions only, 12 bytes a vertex), then attribute buffer 0 on this
+// colour's part of our ring and all its triangles in one draw (our index buffer, the game's triangle repeated). True:
+// drawn here; false: the game's own setColor (no batch this frame, or not this packet).
+// The desktop proof (WWHD_STARS_BATCH_TEST=compare|draw, flat play, no headset): at the first colour the same layout
+// code as in VR places every star around the game camera's eye, and each star the game drew this frame is compared
+// with the game's own vertices; with "draw" those stars are drawn one draw a colour in place of the game's draws, so
+// a picture dump with and without shows whether the batched draws are the game's picture
+namespace {
+void stars_batch_draw(Cpu* c, uint32_t packet, uint32_t col) {
+    const uint32_t tris = sb::g_batch.tris[col];
+    if (!tris) return;
+    const uint32_t geom = packet + 0x8A8;
+    const uint32_t side = ld32(geom + 0x950) == 0 ? 1 : 0;
+    if (ld32(geom + 0x960)) guest_call(c, GC(0x027BFE5C), {geom + side * 0x254 + 0x158});  // weatherBindGeometryMaterial
+    const uint32_t w[7] = {sb::g_batch.addr[col], tris * sb::kTriBytes - 1, (12u & 0xFFFF) << 11, 0, 0, 0, 0xC0000000};
+    gx2::set_regs(0xE8C0, w, 7);  // (mmSQ_VTX_ATTRIBUTE_BLOCK_START: as GX2SetAttribBuffer(0, size, 12, ring))
+    gx2::emit(gx2::OP_DRAW_INDEXED, {sb::g_prim, tris * 3, sb::g_indexType, sb::g_index, 0u, 1u});
+    ++sb::g_stats.draws;
+    sb::g_stats.tris += tris;
+}
+struct DesktopTest { uint32_t packet = 0; bool draw = false; uint64_t frames = 0, stars = 0; } g_desk;
+std::chrono::steady_clock::time_point g_deskSince = std::chrono::steady_clock::now();
+}  // namespace
+bool interp_vr_star_set_color(Cpu* c, uint32_t packet, uint32_t col) {
+    if (col >= 8) return false;
+    sb::Args args;
+    args.keep(c);
+    struct PutBack { Cpu* c; const sb::Args& a; bool drawn = false; ~PutBack() { if (!drawn) a.put(c); } } putBack{c, args};
+    const uint32_t renderer = packet + 0x498528 + col * 0x41C, material = ld32(packet + 0x8A4);
+    if (sb::g_batch.packet && sb::g_batch.vr && packet == sb::g_batch.packet) {
+        guest_call(c, GC(0x027FE118), {renderer, material, 0});  // weatherBindRenderer
+        stars_batch_draw(c, packet, col);
+        putBack.drawn = true;
+        return true;
+    }
+    const int test = sb::desktop_test();
+    if (!test || vr::active()) return false;
+    if (col == 0) {
+        g_desk = {};
+        const uint32_t gi = GD(0x1046F0B0), view = ld32(gi + 0x5FA4), cam = ld32(gi + 0x5AF8);
+        sb::Layout L;
+        if (!sb::ready() || !view || !cam || !ld32(GD(0x10477588)) || (int16_t)ld16(packet + 0xCC) <= 0) return false;
+        const float camp[3] = {(float)ldf32(cam + 0xDC), (float)ldf32(cam + 0xE0), (float)ldf32(cam + 0xE4)};
+        if (!sb::layout_begin(c, view, packet, camp, L)) return false;
+        uint32_t kept = 0;
+        for (int i = 0; i < L.n; i++) {
+            sb::Kept s;
+            sb::layout_star(L, i, s);
+            if (ld8(packet + 0x49A608 + i) != s.color) ++sb::g_stats.colorDiffers;
+            if (!ld8(packet + 0xD4 + i)) continue;  // (the stars the game drew this frame)
+            float o[2][9];
+            sb::half_of(s, L, 0, o[0]);
+            sb::half_of(s, L, 1, o[1]);
+            sb::compare_star(packet, i, o);
+            sb::g_kept[kept++] = s;
+        }
+        ++sb::g_stats.checks;
+        g_desk.packet = packet, g_desk.stars = kept, g_desk.draw = test == 2;
+        if (g_desk.draw) sb::write_ring(packet, sb::g_kept, kept, L);
+        if (std::chrono::steady_clock::now() - g_deskSince > std::chrono::seconds(5)) {
+            const auto& b = sb::g_stats;
+            LOG("[stars test] (5 s) %llu frames, %llu stars the game drew compared, the largest difference %.9f units; "
+                "%llu colour kinds differ; %s (%llu draws, %llu triangles)", (unsigned long long)b.checks,
+                (unsigned long long)b.compared, b.worst, (unsigned long long)b.colorDiffers,
+                g_desk.draw ? "drawn one draw a colour" : "the game's own draws", (unsigned long long)b.draws,
+                (unsigned long long)b.tris);
+            sb::g_stats = {};
+            g_deskSince = std::chrono::steady_clock::now();
+        }
+    }
+    if (!g_desk.draw || packet != g_desk.packet || sb::g_batch.packet != packet) return false;
+    guest_call(c, GC(0x027FE118), {renderer, material, 0});  // weatherBindRenderer
+    stars_batch_draw(c, packet, col);
+    if (col == 7) sb::g_batch.packet = 0;
+    putBack.drawn = true;
+    return true;
+}
 #else
 bool interp_vr_star_project(Cpu*, void (*)(Cpu*)) { return false; }
+bool interp_vr_star_set_color(Cpu*, uint32_t, uint32_t) { return false; }
 #endif
 static void stars_draw(Cpu* c) {
 #ifdef WWHD_VR
@@ -3392,6 +3954,102 @@ void sun_vr(Cpu* c) {
         g_sunStatsSince = now;
     }
 }
+// (VR, 2026-11-20, the player after the sun and moon fix: "the fix worked for the moon not the sun") the sun has a
+// second draw the moon has not: its lens flare, dKyr_drawLenzflare. Its first two squares are the glow and the rays on
+// the sun itself (8000 and 10000 units, the sun's disc 575), built from the view's rotation, so they tilted with the
+// head, and turned by the sunlenz packet's mAngleDeg, which dKyr_lenzflare_move takes each step from where the sun
+// lands on the screen against its middle (mDoLib_project with the game's camera, in VR the head's): it changed as the
+// head turned, and the rays spun. While the flare is drawn: the view's rotation faces the sun from the eye with the
+// world's up, as for the sun's disc, and mAngleDeg is 180, the game's own value looking straight at the sun (the screen
+// offset zero, cM_atan2s(0, 0) = 0, + 180). Both put back after. The flare's other pieces (the ghosts along the line
+// through the view's middle) still move with the view, as a lens flare does. WWHD_VR_SUN_FACING=0: the game's own
+// (0x120 and 0x124 since 2026-11-20: the first build read 0x114 and 0x118, the GameCube's 0x90 and 0x94 moved by its
+// positions' 0x84, and found an angle of 0 and a falloff of 1e9 there, so the check left the game's own flare on and the
+// rays still turned with the head (the player's log). The HD layout: LensPacket mAngleDeg 0x120, mDistFalloff 0x124
+// (d_kankyo_rain_kazanbai_move.h, d_kankyo_rain_drawSibuki.h), and dKyr_lenzflare_move's own store of the angle,
+// stfs f13,0x120(r30) at 02565CC4, r30 the packet it writes the positions of at +0xA4)
+constexpr uint32_t kLenzAngleDeg = 0x120, kLenzDistFalloff = 0x124;
+void lens_vr(Cpu* c, void (*orig)(Cpu*)) {
+    const uint32_t gi = GD(0x1046F0B0);
+    const uint32_t cam = ld32(gi + 0x5AF8), view = ld32(gi + 0x5FA4), pos = c->r[4], lenz = lenz_packet();
+    float eye[3];
+    if (!vr_sun_facing_on() || !cam || !view || !pos || !lenz || !vr::game::drawn_head_eye(cam, interp::pass_count(), eye)) {
+        orig(c);
+        return;
+    }
+    // (the offsets checked by their values: an angle 0 .. 360, a falloff 0 .. 1; else the game's own, logged once)
+    const float angle = (float)ldf32(lenz + kLenzAngleDeg), falloff = (float)ldf32(lenz + kLenzDistFalloff);
+    static int checked = 0;
+    const bool sane = std::isfinite(angle) && angle >= -1.0f && angle <= 361.0f && std::isfinite(falloff) &&
+                      falloff >= -0.01f && falloff <= 1.01f;
+    if (checked == 0 || (!sane && checked == 1)) {
+        LOG("[vr] lens flare: the sunlenz packet's angle %.1f, falloff %.3f: %s", double(angle), double(falloff),
+            sane ? "the flare faces the eye with the world's up, its rays not turned by the head"
+                 : "not plausible: the game's own flare (the packet's layout differs)");
+        checked = sane ? 2 : 3;
+    }
+    if (!sane) {
+        orig(c);
+        return;
+    }
+    const uint32_t m = view + 0x1E4;
+    float R[3][4];
+    for (int r = 0; r < 3; r++)
+        for (int k = 0; k < 4; k++) R[r][k] = (float)ldf32(m + 16 * r + 4 * k);
+    float d[3];  // (the flare's first position: the sun's)
+    for (int k = 0; k < 3; k++) d[k] = (float)ldf32(pos + 4 * k) - eye[k];
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    auto finite3 = [](const float* v) { return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]); };
+    if (!(len > 1.0f) || !finite3(d) || !finite3(R[0]) || !finite3(R[1]) || !finite3(R[2])) {
+        orig(c);
+        return;
+    }
+    for (int k = 0; k < 3; k++) d[k] /= len;
+    // the squares' back: from the sun to the eye (the flare is drawn only with the sun in front: no behind case)
+    const float b[3] = {-d[0], -d[1], -d[2]};
+    float r[3] = {b[2], 0.0f, -b[0]};  // (0,1,0) x b: the world's up
+    float rl = std::sqrt(r[0] * r[0] + r[2] * r[2]);
+    if (rl < 1e-3f) {
+        const float t = R[0][0] * b[0] + R[0][1] * b[1] + R[0][2] * b[2];
+        for (int k = 0; k < 3; k++) r[k] = R[0][k] - t * b[k];
+        rl = std::sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        if (!(rl > 1e-4f)) {
+            orig(c);
+            return;
+        }
+    }
+    for (float& v : r) v /= rl;
+    const float u[3] = {b[1] * r[2] - b[2] * r[1], b[2] * r[0] - b[0] * r[2], b[0] * r[1] - b[1] * r[0]};
+    const float t[3] = {R[0][3], R[1][3], R[2][3]};
+    float o[3];
+    for (int k = 0; k < 3; k++) o[k] = R[0][k] * t[0] + R[1][k] * t[1] + R[2][k] * t[2];
+    const float* rows[3] = {r, u, b};
+    uint32_t savedView[12];
+    for (int i = 0; i < 12; i++) savedView[i] = ld32(m + 4 * i);
+    const uint32_t savedAngle = ld32(lenz + kLenzAngleDeg);
+    for (int row = 0; row < 3; row++) {
+        for (int k = 0; k < 3; k++) stf32(m + 16 * row + 4 * k, rows[row][k]);
+        stf32(m + 16 * row + 12, rows[row][0] * o[0] + rows[row][1] * o[1] + rows[row][2] * o[2]);
+    }
+    stf32(lenz + kLenzAngleDeg, 180.0f);
+    orig(c);
+    for (int i = 0; i < 12; i++) st32(m + 4 * i, savedView[i]);
+    st32(lenz + kLenzAngleDeg, savedAngle);
+    static uint64_t draws = 0;
+    static double turned = 0;
+    static auto since = std::chrono::steady_clock::now();
+    ++draws;
+    double a = std::fabs(double(angle) - 180.0);
+    if (a > 180) a = 360 - a;
+    turned += a;
+    if (const auto now = std::chrono::steady_clock::now(); now - since > std::chrono::seconds(10)) {
+        LOG("[vr] lens flare (10 s): %llu draws faced the eye with the world's up; the head's turn of its rays taken out "
+            "%.1f degrees on average", (unsigned long long)draws, draws ? turned / double(draws) : 0.0);
+        draws = 0;
+        turned = 0;
+        since = now;
+    }
+}
 }  // namespace
 #endif
 static void sun_draw(Cpu* c) {
@@ -3399,6 +4057,13 @@ static void sun_draw(Cpu* c) {
     sun_vr(c);
 #else
     f_0256F1C4_orig(c);
+#endif
+}
+static void lens_draw(Cpu* c) {
+#ifdef WWHD_VR
+    lens_vr(c, f_02570210_orig);
+#else
+    f_02570210_orig(c);
 #endif
 }
 // dKyr_drawSun(view, &sun packet +0x98, ...) from the sun packet's draw
@@ -3429,7 +4094,7 @@ extern "C" void hook_02570210(Cpu* c) {
 #endif
     const uint32_t sun = sun_packet(), lenz = lenz_packet();
     static SkyHistory history;
-    if (sun && lenz && c->r[4] == lenz + 0xA4) with_drawn_camera(c, f_02570210_orig, "lens flare", {{c->r[4], 9}, {sun + 0x98, 1}}, &history);
+    if (sun && lenz && c->r[4] == lenz + 0xA4) with_drawn_camera(c, lens_draw, "lens flare", {{c->r[4], 9}, {sun + 0x98, 1}}, &history);
     else with_drawn_camera(c, f_02570210_orig, "lens flare");
 }
 extern "C" void hook_02571B1C(Cpu* c) { with_drawn_camera(c, f_02571B1C_orig, "sea spray"); }

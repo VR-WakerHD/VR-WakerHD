@@ -92,9 +92,13 @@ inline bool track_pose(PoseHold& h, bool positionValid, bool positionTracked, bo
 // is back within that reach; it keeps growing (a drifted estimate snapping back 0.5 to 1 m is taken after a moment),
 // but downwards only the reach at the jump counts. Grown there too, a PSVR2 that lost the room and put the head 1.25 m
 // lower (1.44 m in all, 2026-10-31) was taken as back after 0.47 s, and the view sank through the floor. Upwards it
-// grows as before: that is how the tracker corrects an estimate that drifted down
-constexpr float kHeadJumpMetres = 0.5f, kHeadSpeed = 2.0f;
+// grows as before: that is how the tracker corrects an estimate that drifted down.
+// A last position more than kRoomMetres from the tracking space's origin was never a head in the room, so nothing is
+// held against it: Sony's SteamVR driver reports the head 43 m out (a fixed placeholder) until its tracking locks, and
+// the jump to the real head 8.7 s later was held as a glitch for 10 s (2026-11-18), the view turning but not moving
+constexpr float kHeadJumpMetres = 0.5f, kHeadSpeed = 2.0f, kRoomMetres = 10.0f;
 inline bool head_out_of_reach(Vec3 fresh, Vec3 last, double sinceLast, double heldFor) {
+    if (!(length(last) <= kRoomMetres)) return false;
     const auto reach = [](double s) { return kHeadJumpMetres + kHeadSpeed * float(s > 0 ? s : 0); };
     if (length(fresh - last) > reach(sinceLast)) return true;
     return heldFor >= 0 && last.y - fresh.y > reach(sinceLast - heldFor);

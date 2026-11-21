@@ -335,6 +335,21 @@ inline Vec3 detached_shift(Vec3 shoulder, Vec3 target, float reach, float maxShi
     if (!finite(d) || !(dist > reach) || !(dist > 1e-4f)) return {};
     return d * (std::min(dist - reach, std::max(maxShift, 0.0f)) / dist);
 }
+// True size (vr.trueSize, docs/VR_ARM_ANIMATION.md "True size"): your shoulder on `side` (-1 left, +1 right) in the
+// game, from your eyes and your body's facing: kTrueShoulderDrop metres below the eyes, kTrueShoulderOut to that side
+// and kTrueShoulderBack behind them (an adult's), at the world scale
+constexpr float kTrueShoulderDrop = 0.24f, kTrueShoulderOut = 0.19f, kTrueShoulderBack = 0.06f;
+inline Vec3 true_size_shoulder(Vec3 eyes, Vec3 bodyForward, int side, float unitsPerMetre) {
+    const Vec3 f = normalize(Vec3{bodyForward.x, 0, bodyForward.z}, {0, 0, 1});
+    const Vec3 out = Vec3{-f.z, 0, f.x} * float(side);
+    return eyes + (Vec3{0, -kTrueShoulderDrop, 0} + out * kTrueShoulderOut - f * kTrueShoulderBack) * unitsPerMetre;
+}
+// where the arm's shoulder joint goes in True size: at your shoulder, or, with the hand farther from it than the arm
+// reaches, along the line from your shoulder to the hand, `reach` short of it (the arm ends at the hand and points
+// back to you; every bone keeps its length)
+inline Vec3 true_size_arm_root(Vec3 playerShoulder, Vec3 wrist, float reach) {
+    return playerShoulder + detached_shift(playerShoulder, wrist, reach, 1e9f);
+}
 // a limit opened from its normal value to `detached` by the detached arms' weight (0 off .. 1 on)
 inline float detached_limit(float normal, float detached, float weight) {
     return normal + (detached - normal) * std::clamp(weight, 0.0f, 1.0f);

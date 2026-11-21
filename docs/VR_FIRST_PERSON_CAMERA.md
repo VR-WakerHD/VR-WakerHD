@@ -307,3 +307,83 @@ person: the view's height held at ...` in the log), for every action but the pos
 crawling (0x0D..0x12) and hanging, swimming, ladders and climbing (0x2B..0x3F), which it follows and eases back from.
 Asked for after a play test: with the shield up, locked on, his battle stance lowered his eyes as he moved and the
 view went down with them, as if crouching; standing, lasting changes of 52, -21 and 26 units had been followed.
+
+## True size (your own height)
+
+Asked for by players (2026-11-20): "they want to be their own size and height". Normally the view is at Link's eyes,
+about 93 game units above his feet (`[vr] first person: the view's height held at his standing eye height`), which
+at the default scale (`vr.unitsPerMetre` 100) is about 0.9 m: whatever your height, you see the world as he does, and
+the floor feels much nearer than your own.
+
+With **True size** (`vr.trueSize`, Settings > VR and the launcher's Camera and comfort tab) the standing view is at
+**your** eye height above his feet, in his world at its normal scale. A 1.75 m player sees from about 163 units, well
+above Link's eyes; NPCs, doors and Link's world look as they would to an adult standing there.
+
+- **Your eye height.** With a floor-level tracking space (STAGE; SteamVR and Quest offer one) and standing play, it is
+  the headset's height above the floor at the recentre, so the view is as high above Link's feet as your eyes are
+  above your floor, and crouching or standing up moves it as before. Without one, or seated, it is `vr.playerHeight`
+  times 0.933 (the eyes' share of a standing height). `true_size_eye_metres` in `vr_config.h`, tested in `vr_test`.
+- **How.** Only the standing target of the view's height changes (`link_executed`: `standTarget` instead of his
+  standing eye height). Everything measured from the view (the arms' reach, the item wheel, aiming) follows it.
+- **Postures** still put the view at his eyes: crawling, swimming, hanging, ladders and climbing follow his eyes as
+  before, eased over 0.35 s, and the view comes back up when he stands. A crawlspace is still crawled through at his
+  height.
+- **His body and arms** are not drawn, whatever Hide Link's body and Hide Link's arms say: only his hands, free at the
+  controllers (2026-11-20, asked for after the headset: "the body and arms need to be hidden and need to not be
+  connected to the hands, the hands must be able to move freely"). Each hand is exactly where your controller is (not
+  scaled to his shorter arm) and turns as it does (the detached arms' open wrist and twist limits). The hidden arm is
+  carried from your own shoulder (0.24 m below, 0.19 m beside your eyes) out along the line to the hand
+  (`true_size_shoulder`, `true_size_arm_root` in `vr_arm.h`, tested), so his arm's length never holds a hand back.
+  (Drawing the arms from your shoulders was tried the same day: in the headset the body and arms showed and the hands
+  looked tied to them.)
+- **Weapons and items at your hands (audit, 2026-11-20).** Asked for: "all the weapons and items ... at the players
+  hand height not at links height". The arms are posed in Link's own execute (`link_arms`, right after the game's
+  `jointCB1`), before the game reads his hand joints, so everything the game places from his hands follows the posed
+  hands, which True size puts exactly at the controllers. Checked one by one:
+  - the sword, its hit capsules (from the posed sword hand; their fallback from the view's eye height) and the Skull
+    Hammer's head;
+  - the shield (on its hand, `shield_hand`);
+  - the bow, the arrow along it and its shot (from the hands), the hookshot and its aim line, the boomerang, the
+    grappling hook, the Wind Waker baton, the Deku Leaf (glide pose at the controllers), and an enemy's weapon picked up
+    (`weapon_drawing`, at the tracked hand);
+  - bombs (in the hand, thrown with the hand's velocity);
+  - the per-frame hand smoothing and the hookshot's line (`lag.k`, 1 in True size: no scaling to his arm);
+  - the item wheel (from the view's anchor), the shoulder reaches and the wrist panels (on the controllers).
+  Only what the game carries **over his head** (pots, barrels, rocks) stays in the game's carry pose at his head: it is
+  not drawn in first person (`hides_held_object`), and its throw is the game's own. matching it to Link's arms (`vr.matchLinkBody`) would make you his size
+  again, so it is ignored while True size is on.
+- Third person, events and cutscenes use the game's camera, as before.
+
+Not yet tried in a headset (2026-11-20). To check: the log's `[vr] first person: True size, the view at ... m` line
+(which height it used), low ceilings and doorways at the higher view, and the sword's and items' reach from above.
+
+## Link's head in cutscenes (2026-11-20)
+
+A tester in the Tower of the Gods: "there is a cutscene and link steps into the switch his head is missing during the
+scene".
+
+- **Cause:** `hide_head` folds the head's, neck's and hair's joint matrices onto the neck in Link's own matrices, not
+  in a copy.
+  - In play, the game works them out again every step, so the fold lasts one draw.
+  - A cutscene that holds Link still does not work them out again, so the fold from the last first-person draw stayed,
+    and he had no head.
+  - His body showed, because `vr.hideBody` folds a per-draw copy (`frame_correct`).
+- **Fix** (`vr_head_keep.h` `HeadKeep`, `fold_joint` and `give_head_back` in `vr_game.cpp`):
+  - each folded joint's matrix, as the game made it, is kept;
+  - on any draw that does not hide the head (the game's camera in an event or cutscene, third person, VR off) it is
+    put back, only where the fold still stands. A joint the game worked out since is left alone;
+  - only within Link's own body and hair models as they are then;
+  - logged as `[vr] Link's head given back for a view that shows it: N joints`;
+  - `vr_test` `test_head_keep` covers it.
+
+## The Master Sword's sheath (2026-11-20)
+
+A tester's video ("WWVR Sword Sheath Gets in Way when moving"): circling with both sticks, the Master Sword's blue
+and gold sheath swung through the view, around the hidden body.
+
+- **Cause:** the sheath is a model of its own, `podms` (`PlayerModelState` `mpPodmsModel`, Link + 0xE7C). The game
+  draws it only with a Master Sword equipped, and it was not in the first-person hiding list (`hides_from_view`).
+  - Link's draw (023D9820) and the sheath's placing on his back (02403C24) both read it at +0xE7C.
+- **Fix:** hidden like the body, always (it is always on his back); logged once as `the Master Sword's sheath hidden`.
+- The Hero's Sword's sheath has no model of its own: it is part of the body model `cl`, already hidden.
+

@@ -18,6 +18,7 @@
 // - the Free Roam Camera (FreeRoamCamera: its zoom and slide, reset each time it begins; its numbers in kFreeRoam).
 // HeadController (vr_head.h) composes the head-tracked view from the anchor (boat_view); vr_game.cpp reads the boat.
 #pragma once
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -107,11 +108,17 @@ struct SailState {
     bool ship = false;         // the boat actor exists (play's ship pointer, its position finite)
     bool riding = false;       // Link rides it (player status 0 SHIP_RIDE, play +0x5CD8 bit 0x10000)
     uint8_t shipMode = 0xFF;   // its mCurMode
-    bool greatSea = false;     // the stage is the Great Sea ("sea"): the open world
+    bool greatSea = false;     // the stage is one sailed on with the boat's views: boat_view_stage
     bool playCamera = false;   // normal play with the player's camera: no event, cutscene, talk, title, conducting
     bool menu = false;         // a GamePad menu (items, map, pause...) is open
     bool zoomView = false;     // the telescope's or the Picto Box's view
 };
+// the stages where the boat's views may be chosen: the Great Sea ("sea", the open world), and the Tower of the Gods
+// ("Siren", asked for 2026-11-20: "in the tower of god when link is ... on the boat sailing ... we only get the 2 view,
+// so allow all boat views on the boat in the tower of god"), sailed inside it with the King of Red Lions
+inline bool boat_view_stage(const char* stage) {
+    return stage && (!std::strcmp(stage, "sea") || !std::strcmp(stage, "Siren"));
+}
 inline bool sailing_eligible(const SailState& s) {
     return s.ship && s.riding && s.greatSea && s.playCamera && !s.menu && !s.zoomView && sailing_ship_mode(s.shipMode);
 }
@@ -119,7 +126,7 @@ inline bool sailing_eligible(const SailState& s) {
 inline const char* sail_blocker(const SailState& s) {
     if (!s.riding) return "Link is not on the boat";
     if (!s.ship) return "no boat";
-    if (!s.greatSea) return "not on the Great Sea";
+    if (!s.greatSea) return "not on the Great Sea or in the Tower of the Gods";
     if (!s.playCamera) return "an event, a talk or a cutscene";
     if (s.menu) return "a menu";
     if (s.zoomView) return "the telescope or the Picto Box";

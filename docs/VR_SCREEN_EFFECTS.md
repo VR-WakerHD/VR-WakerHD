@@ -219,3 +219,33 @@ commands held, and closed normally. The player confirmed the crash is gone.
 - the log line `[vulkan] frame N repeated while a shader or pipeline is made (n): <stereo state>`, for the first 20
   repeats and then every 1000th (`stereo_debug_state`);
 - the test switch `WWHD_TEST_SLOW_TRANSLATION_MS`.
+
+## The sun and the moon facing the eye (2026-11-15, the sun's lens flare 2026-11-20)
+
+A player: "Moon or the Sun, they turn with your head movements". The game builds them as screen-facing squares, and in
+VR the screen is the head.
+
+- **The discs** (`dKyr_drawSun`, `interp.cpp` `sun_vr`, commit abbf6d9f): their squares are built from the view's
+  rotation and turned about the line of sight by an angle from the camera's heading. While they are built, the view's
+  rotation faces the sprite from the eye with the world's up and the camera looks at the sprite, so the head's tilt
+  and turn no longer reach them. Logged: `[vr] sun and moon (10 s)`.
+- **The sun's lens flare** (`dKyr_drawLenzflare`, `lens_vr`). The player afterwards: "the fix worked for the moon not
+  the sun". The audit against the decompilation found the sun's second draw, which the moon does not have: the lens
+  flare. Its first two squares are the glow and the rays on the sun itself (8000 and 10000 units against the disc's
+  575), built from the same view rotation (tilted with the head) and turned by the sunlenz packet's `mAngleDeg`.
+  `dKyr_lenzflare_move` takes that angle each step from where the sun lands on the screen against its middle, with the
+  game's camera (the head's), so the rays spun as the head turned. While the flare is drawn, the view's rotation faces
+  the sun as for the disc, and `mAngleDeg` is 180, the game's own value looking straight at the sun. Both are put back
+  after. Its other pieces (the ghosts along the line through the view's middle) still move with the view, as a lens
+  flare does.
+  - `mAngleDeg` is at packet +0x120 here, `mDistFalloff` at +0x124. The first build guessed +0x114 and +0x118 (the
+    GameCube's +0x90 and +0x94, shifted by +0x84 as its positions are: +0xA4 against +0x20).
+    - The player's first headset log read an angle of 0 and a falloff of 1e9 there. The check left the game's own flare
+      on, and the rays still turned with the head.
+    - +0x120 is the HD layout (`LensPacket` in `d_kankyo_rain_kazanbai_move.h` and `d_kankyo_rain_drawSibuki.h`), and
+      it is where `dKyr_lenzflare_move` itself stores the angle (`stfs f13,0x120(r30)` at 02565CC4).
+    - The fix applies only when the angle reads 0 to 360 and the falloff 0 to 1, and logs which:
+      `[vr] lens flare: the sunlenz packet's angle ...`, then `[vr] lens flare (10 s)`.
+  - With `vr.lensFlare` off (the Quest's default) the flare is not drawn at all.
+- `WWHD_VR_SUN_FACING=0` keeps the game's own for both.
+- Not yet tried in a headset (the flare part).

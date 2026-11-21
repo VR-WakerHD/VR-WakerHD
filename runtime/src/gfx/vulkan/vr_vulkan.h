@@ -20,7 +20,9 @@ VkResult create_instance(const VkInstanceCreateInfo& ci, VkInstance* out);
 // the index in `devices` of the GPU the headset needs (-1: no preference)
 int preferred_device(const std::vector<VkPhysicalDevice>& devices);
 VkResult create_device(VkPhysicalDevice physical, const VkDeviceCreateInfo& ci, VkDevice* out);
-void device_ready();  // R.device and R.queue exist: the session starts
+// (xr_queue_sync.h) whether the device for `physical` should get a queue for the OpenXR runtime of its own
+bool wants_queue(VkPhysicalDevice physical);
+void device_ready();  // R.device and R.queue (and R.xrQueue when made) exist: the session starts
 // every frame (render thread)
 void frame_begin();                    // swap(), before the TV present
 void record_eyes(VkCommandBuffer cmd); // the TV present, after the window's picture

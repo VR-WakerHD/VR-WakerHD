@@ -1332,6 +1332,12 @@ void tab_camera() {
          "clicks for a moment in the game (or Settings > VR > Recentre). The view also recentres on Link at every stage "
          "change.");
     ImGui::Checkbox("Show Link's head in first person", &c.showBody);
+    ImGui::Checkbox("True size (your own height)", &c.trueSize);
+    help("First person: you see from your own eye height, not Link's (about 1 m up), in his world at its normal scale, "
+         "so you stand taller than him. Only his hands are drawn, free at your controllers. Your height comes from the "
+         "headset when it tracks the floor; otherwise, and when seated, from Your height. Crawling, swimming and "
+         "climbing still put the view at his eyes. Also in the game: F1 > VR.");
+    if (c.trueSize) slider("Your height", "vr.playerHeight", c.playerHeight, "%.2f m");
     ImGui::Checkbox("Hide Link's body", &c.hideBody);
     help("First person: only his arms, hands and whatever is in them are drawn; not his body, legs and head, nor the "
          "shield and sword on his back. His shadow goes with his body. Also in the game: F1 > VR.");
@@ -1355,6 +1361,8 @@ void tab_camera() {
         c.eyeForward = d.eyeForward;
         c.matchLinkBody = d.matchLinkBody; c.unitsPerMetre = d.unitsPerMetre; c.maxHeadOffset = d.maxHeadOffset;
         c.showBody = d.showBody;
+        c.trueSize = d.trueSize;
+        c.playerHeight = d.playerHeight;
         c.hideBody = d.hideBody;
         c.hideArms = d.hideArms;
         c.shieldFreeRotation = d.shieldFreeRotation;

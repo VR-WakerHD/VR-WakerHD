@@ -1,4 +1,5 @@
 #include "mods/mods.h"
+#include <chrono>
 // Libraries the game uses for system integration and online features.
 // Online services (Miiverse, SpotPass, accounts) report "unavailable".
 #include "../crashrec.h"
@@ -13,6 +14,7 @@
 #include "../mods/long_name.h"
 #include "../mods/story_scenes.h"
 #include "../rumble.h"
+#include "../pad_fault_guard.h"
 #include "../motion/motion.h"
 
 namespace interp { bool repeat_input(); void trace_read(const char*); uint64_t logic_steps(); }
@@ -82,6 +84,29 @@ HLE(proc_ui, ProcUIDrawDoneRelease) {}
 HLE(proc_ui, ProcUIProcessMessages) { ret(c, 0); }  // PROCUI_STATUS_IN_FOREGROUND
 
 // ---- vpad (GamePad): keyboard / host controllers
+// (pad_fault_guard.h, 2026-11-16) a feature of the controller read left after a fault in the game's memory: logged once
+// per feature (which, where, while what), then counted every 30 s, so a player's log names the feature to fix
+void pad_fault_guard::note(const char* what, uint32_t guest) {
+    struct Seen { const char* what; uint64_t count; };
+    static Seen seen[32];
+    static int nseen = 0;
+    static auto lastSummary = std::chrono::steady_clock::now();
+    Seen* e = nullptr;
+    for (int i = 0; i < nseen; ++i)
+        if (seen[i].what == what) e = &seen[i];
+    if (!e && nseen < 32) seen[nseen] = {what, 0}, e = &seen[nseen++];
+    if (e && e->count++ == 0)
+        LOG("[pad] %s read the game's memory at %08X (an object that does not exist, an empty pointer): skipped this "
+            "controller read instead of ending the game (pad_fault_guard.h); the controller input still reaches the game",
+            what, guest);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastSummary >= std::chrono::seconds(30)) {
+        lastSummary = now;
+        for (int i = 0; i < nseen; ++i)
+            if (seen[i].count > 1) LOG("[pad] %s: %llu controller reads skipped so far", seen[i].what, (unsigned long long)seen[i].count);
+    }
+}
+
 HLE(vpad, VPADRead) {
     // (chan, VPADStatus* buf, count, int32* error) -> samples written
     uint32_t chan = arg(c, 0), st = arg(c, 1), count = arg(c, 2), err = arg(c, 3);
@@ -110,26 +135,26 @@ HLE(vpad, VPADRead) {
     static input::PadState last_p;
     const bool repeat = interp::repeat_input();
     input::PadState p = repeat ? last_p : crashrec::read(0);  // live input, recorded/replayed by crash recovery
-    if (!repeat) mods::one_screen_pad(p);  // One screen: Minus pauses as Plus (Off-TV Play has no TV to switch to)
-    if (!repeat) mods::pad_play_rules(p);  // L and d-pad down by whether Link plays (input_map::play_buttons)
+    if (!repeat) pad_fault_guard::run("one screen", [&] { mods::one_screen_pad(p); });  // One screen: Minus pauses as Plus (Off-TV Play has no TV to switch to)
+    if (!repeat) pad_fault_guard::run("play rules", [&] { mods::pad_play_rules(p); });  // L and d-pad down by whether Link plays (input_map::play_buttons)
     const uint32_t live_virt = p.virt;  // the virtual inputs (Jump, moon jump) as read now: not on a stale repeat
     const bool live = !repeat;
-    if (!input::pro_controller()) mods::item_ring_pad(p, repeat);  // X / Y / R: tap, or hold for the item ring
-    if (!input::pro_controller()) mods::context_touch_pad(p, repeat);  // touch play: items by tap, put-away, ZL latch
-    if (!input::pro_controller()) mods::touch_talk_pad(p, repeat);  // talks, answers, shops by touch; hold to go on
-    if (!input::pro_controller()) mods::guest_pad_filter(c, p, repeat);  // code mods: their touches and input filters
+    if (!input::pro_controller()) pad_fault_guard::run("item ring", [&] { mods::item_ring_pad(p, repeat); });  // X / Y / R: tap, or hold for the item ring
+    if (!input::pro_controller()) pad_fault_guard::run("touch play", [&] { mods::context_touch_pad(p, repeat); });  // touch play: items by tap, put-away, ZL latch
+    if (!input::pro_controller()) pad_fault_guard::run("touch talk", [&] { mods::touch_talk_pad(p, repeat); });  // talks, answers, shops by touch; hold to go on
+    if (!input::pro_controller()) pad_fault_guard::run("code mods' pad filters", [&] { mods::guest_pad_filter(c, p, repeat); });  // code mods: their touches and input filters
     last_p = p;
-    story_notebook::pad(p, c);  // the story notebook's page takes the controller while it is open
-    story_scenes::mute(p);
-    story_bag::pad(p, c);       // then the Delivery Bag's extra pages (mod items), while open
-    game_settings_page::pad(p, c);  // the settings page in the item menu (left of the items), while open
-    if (!repeat) menu_sounds::service(c);  // the Settings overlay's menu sounds, through the game (menu_sounds.h)
-    player_name::service(c);  // a new name for Link (settings page or Settings window) goes in here, on the game's thread
-    long_name::service(c);    // save file names over 8 characters (mods/long_name.h)
-    if (!input::pro_controller()) mods::moon_jump_input(p);
-    if (!input::pro_controller()) mods::move_speed_input(p.buttons);
-    if (!input::pro_controller() && live) mods::jump_input(live_virt);
-    if (!input::pro_controller()) mods::fast_forward_input(p.buttons);
+    pad_fault_guard::run("story notebook", [&] { story_notebook::pad(p, c); });  // the story notebook's page takes the controller while it is open
+    pad_fault_guard::run("story scenes", [&] { story_scenes::mute(p); });
+    pad_fault_guard::run("Delivery Bag pages", [&] { story_bag::pad(p, c); });  // then the Delivery Bag's extra pages (mod items), while open
+    pad_fault_guard::run("settings page", [&] { game_settings_page::pad(p, c); });  // the settings page in the item menu (left of the items), while open
+    if (!repeat) pad_fault_guard::run("menu sounds", [&] { menu_sounds::service(c); });  // the Settings overlay's menu sounds, through the game (menu_sounds.h)
+    pad_fault_guard::run("Link's name", [&] { player_name::service(c); });  // a new name for Link (settings page or Settings window) goes in here, on the game's thread
+    pad_fault_guard::run("long save names", [&] { long_name::service(c); });    // save file names over 8 characters (mods/long_name.h)
+    if (!input::pro_controller()) pad_fault_guard::run("moon jump", [&] { mods::moon_jump_input(p); });
+    if (!input::pro_controller()) pad_fault_guard::run("run/swim speed", [&] { mods::move_speed_input(p.buttons); });
+    if (!input::pro_controller() && live) pad_fault_guard::run("jump", [&] { mods::jump_input(live_virt); });
+    if (!input::pro_controller()) pad_fault_guard::run("fast forward", [&] { mods::fast_forward_input(p.buttons); });
     if (input::pro_controller()) {
         // GamePad on the table: screen and touch only. Not yet while the game still reads it and is
         // being switched to the Pro Controller (controller_reapply::holds_gamepad, issue #330)

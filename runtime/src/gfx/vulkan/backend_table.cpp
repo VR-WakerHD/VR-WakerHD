@@ -103,6 +103,7 @@ const Backend& vulkan_backend() {
             if (gfxvk::scene_thread::running()) gfxvk::stereo_part_join_at(gfxvk::PartJoinSite::Idle);
             if (gfxvk::eye_thread::running()) gfxvk::stereo_flush();  // (eye 1's thread too: the GPU gets the frame so far)
             if (gfxvk::atlas_thread::take_deferred_flush()) gfxvk::flush_async();
+            gfxvk::submit_on_idle();  // (VR: the GPU starts on the frame so far while the game builds the rest)
         };
         // (docs/VR_SCENE_THREADS.md, stage S4) the scene's thread draws with the state as it was at each draw
         b.before_draw_state = [] {

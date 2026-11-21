@@ -5,6 +5,7 @@
 // configuration parsing, bindings, locomotion, arm IK reach, swing detection and the swept blade.
 #include "interp_pacing.h"
 #include "vr/vr_arm.h"
+#include "vr/vr_runtime_slow.h"
 #include "vr/vr_baton.h"
 #include "vr/vr_tracking.h"
 #include "vr/vr_ui.h"
@@ -25,6 +26,8 @@
 #include "vr/vr_settings_file.h"
 #include <filesystem>
 #include "vr/vr_swing.h"
+#include "vr/vr_sword_motion.h"
+#include "vr/vr_head_keep.h"
 #include "vr/vr_item_wheel.h"
 #include "vr/vr_sail_view.h"
 #include "vr/vr_bud_view.h"
@@ -928,6 +931,82 @@ static void test_skull_hammer() {
     CHECK(c.hammerRollDegrees == 180.0f);  // turned over: the flat end down (asked for in the headset)
     CHECK(from_kv(c, "vr.hammerRollDegrees", "45") && near(c.hammerRollDegrees, 45.0f));
     CHECK(from_kv(c, "vr.hammerRollDegrees", "400") && near(c.hammerRollDegrees, 180.0f));  // clamped
+}
+
+// Link's yell waits for a hard swing (vr.swordVoiceSpeed): BladeSwing keeps the swing's peak through it
+static void test_swing_voice_peak() {
+    BladeSwing b;
+    const BladeSwingConfig k{4.5f, 0.30f, 2.0f, 0.06f};
+    const float dt = 1.0f / 90.0f;
+    // a normal arm movement: 5 m/s, far enough to be a real swing, never 7 m/s
+    for (int i = 0; i < 20; ++i) b.update({5.0f, 0, 0}, {0, 0, -1}, dt, k);
+    CHECK(b.active() && b.peak() < 7.0f);
+    // the same swing speeding up: its peak follows (the yell's test)
+    for (int i = 0; i < 3; ++i) b.update({8.5f, 0, 0}, {0, 0, -1}, dt, k);
+    CHECK(b.active() && std::fabs(b.peak() - 8.5f) < 1e-4f);
+    // ended: the next swing starts from nothing
+    for (int i = 0; i < 10; ++i) b.update({0.5f, 0, 0}, {0, 0, -1}, dt, k);
+    CHECK(!b.active() && b.peak() == 0.0f);
+    Config c;
+    CHECK(near(c.swordVoiceSpeed, 7.0f) && from_kv(c, "vr.swordVoiceSpeed", "0") && c.swordVoiceSpeed == 0.0f);
+}
+
+// SteamVR's slow state judged by the last 20 frames' xrEndFrame (vr_runtime_slow.h)
+static void test_runtime_slow() {
+    RuntimeSlowDetector d;
+    // state A, the odd long frame: never slow
+    for (int i = 0; i < 200; ++i) CHECK(!d.update(i % 20 == 0 ? 10.8 : 1.7) && !d.slow);
+    // the mixed state of the 2026-11-20 run (3 and 10 ms alternating, ten in a row never slow): slow within 20 frames
+    int changedAt = -1;
+    for (int i = 0; i < 40; ++i)
+        if (d.update(i % 2 ? 10.5 : 3.0) && changedAt < 0) changedAt = i;
+    CHECK(d.slow && changedAt >= 0 && changedAt < 20);
+    // a short good stretch does not end it (the gap between the limits): 5 good frames in it
+    for (int i = 0; i < 5; ++i) d.update(1.7);
+    CHECK(d.slow);
+    // a lasting good state does
+    bool back = false;
+    for (int i = 0; i < 40 && !back; ++i) back = d.update(1.7);
+    CHECK(back && !d.slow);
+    // full state B
+    RuntimeSlowDetector b;
+    for (int i = 0; i < 25; ++i) b.update(10.8);
+    CHECK(b.slow && std::fabs(b.average() - 10.8) < 1e-6);
+    // a pause starts the window again, the state kept
+    b.restart();
+    CHECK(b.slow && !b.update(1.7));
+}
+
+// True size (vr.trueSize, docs/VR_FIRST_PERSON_CAMERA.md "True size"): the eye height the view is put at
+static void test_true_size() {
+    // a floor-level space, standing: the headset's own height above the floor
+    CHECK(near(true_size_eye_metres(true, Posture::Standing, 1.62f, 1.70f), 1.62f));
+    // no floor-level space (LOCAL), or seated: your height times the eyes' share
+    CHECK(near(true_size_eye_metres(false, Posture::Standing, 1.62f, 1.70f), 1.70f * kEyeShareOfHeight));
+    CHECK(near(true_size_eye_metres(true, Posture::Seated, 1.10f, 1.80f), 1.80f * kEyeShareOfHeight));
+    // a headset height no standing eye has (lying down, tracking lost at the recentre): the setting instead
+    CHECK(near(true_size_eye_metres(true, Posture::Standing, 0.30f, 1.60f), 1.60f * kEyeShareOfHeight));
+    CHECK(near(true_size_eye_metres(true, Posture::Standing, 2.60f, 1.60f), 1.60f * kEyeShareOfHeight));
+    // the setting held to its range
+    CHECK(near(true_size_eye_metres(false, Posture::Standing, 0, 3.0f), 2.3f * kEyeShareOfHeight));
+    // at the default scale a 1.75 m player's eyes are well above Link's (about 93 units)
+    CHECK(true_size_eye_metres(false, Posture::Standing, 0, 1.75f) * 100.0f > 150.0f);
+    // the settings: off by default, read and clamped
+    Config c;
+    CHECK(!c.trueSize && near(c.playerHeight, 1.70f));
+    CHECK(from_kv(c, "vr.trueSize", "1") && c.trueSize);
+    CHECK(from_kv(c, "vr.playerHeight", "1.85") && near(c.playerHeight, 1.85f));
+    CHECK(from_kv(c, "vr.playerHeight", "5") && near(c.playerHeight, 2.3f));
+    // the arms from your shoulders: below and beside your eyes, an adult's, at the world scale (facing +Z, heading 0:
+    // right is -X, heading_right)
+    const Vec3 eyes{0, 160, 0}, fwd{0, 0, 1};
+    const Vec3 rs = true_size_shoulder(eyes, fwd, 1, 100), ls = true_size_shoulder(eyes, fwd, -1, 100);
+    CHECK(near(rs, Vec3{-19, 136, -6}) && near(ls, Vec3{19, 136, -6}));
+    CHECK(near(rs, true_size_shoulder(eyes, Vec3{0, 0.5f, 2}, 1, 100)));  // (only the facing's heading counts)
+    // a hand within the arm's reach: the arm at your shoulder; beyond it: slid out along the line, ending at the hand
+    CHECK(near(true_size_arm_root(rs, rs + Vec3{0, 0, 30}, 34.6f), rs));
+    const Vec3 far = rs + Vec3{0, 0, 60}, root = true_size_arm_root(rs, far, 34.6f);
+    CHECK(near(length(far - root), 34.6f) && near(root, rs + Vec3{0, 0, 60 - 34.6f}));
 }
 
 // the VR view's UI (vr_ui.h, docs/VR_UI.md): the gameplay HUD not shown in VR, the action prompt and dialogue kept
@@ -1869,6 +1948,373 @@ static void test_swing() {
     CHECK(!e.started);
 }
 
+// (docs/VR_SWORD_COMBAT_PLAN.md, stage 1) the sword's motion from its poses at the headset's frame rate
+static void test_sword_motion() {
+    // angular velocity from two orientations: 90 degrees/s about +Y, measured over 1/90 s
+    const float dt = 1.0f / 90.0f, w = kPi / 2;
+    const Vec3 av = angular_velocity(Quat{}, yaw_quat(w * dt), dt);
+    CHECK(near(av, {0, w, 0}, 1e-3f));
+    // the shortest way round: q and -q are the same orientation
+    const Quat q = yaw_quat(w * dt);
+    CHECK(near(angular_velocity(Quat{}, Quat{-q.x, -q.y, -q.z, -q.w}, dt), {0, w, 0}, 1e-3f));
+    CHECK(near(angular_velocity(Quat{}, Quat{}, dt), {}));
+    CHECK(near(angular_velocity(Quat{}, q, 0), {}));
+    // a wrist flick: the root still, the sword turning 10 rad/s about +Y with the blade along -Z. A point 0.85 m down
+    // the blade moves at 8.5 m/s, all across the blade; the root not at all
+    SwordMotion m;
+    const double t0 = 100.0;
+    for (int i = 0; i <= 9; ++i) CHECK(m.push(t0 + i * dt, Pose{yaw_quat(10.0f * dt * float(i)), {0, 1, 0}}));
+    CHECK(m.count() == 10 && m.pushed() == 10 && m.glitches() == 0);
+    CHECK(near(m.mean_step(), dt, 1e-5f));
+    const BladeImpact tip = SwordMotion::impact_at(m.latest(), 0.85f);
+    CHECK(near(tip.speed, 8.5f, 0.02f) && tip.acrossShare > 0.999f);
+    CHECK(near(tip.angularSpeed, 10.0f, 0.01f));
+    CHECK(SwordMotion::impact_at(m.latest(), 0.0f).speed < 1e-3f);
+    // v + w x r: about +Y, the tip's velocity is w x (the blade's direction now, turned 1 radian from -Z)
+    CHECK(near(SwordMotion::point_velocity(m.latest(), 1.0f),
+               cross({0, 10.0f, 0}, rotate(m.latest().pose.orientation, {0, 0, -1})), 0.02f));
+    // a stab: the root moving along the blade at 3 m/s, no turn: all along the blade
+    SwordMotion stab;
+    for (int i = 0; i <= 3; ++i) stab.push(i * dt, Pose{Quat{}, {0, 0, -3.0f * dt * float(i)}});
+    const BladeImpact st = stab.peak_impact(0.85f, 0.1f);
+    CHECK(near(st.speed, 3.0f, 1e-2f) && st.acrossShare < 0.01f);
+    // the same time again, or older: not taken; a gap (a hitch) measures no velocity
+    CHECK(!stab.push(3 * dt, Pose{Quat{}, {}}));
+    CHECK(stab.push(3 * dt + 0.5, Pose{Quat{}, {5, 0, 0}}) && stab.gaps() == 1 && near(stab.latest().velocity, {}));
+    // a tracking glitch (a 1 m jump in one frame: 90 m/s): counted, the motion carried on as it was
+    SwordMotion g;
+    g.push(0, Pose{Quat{}, {}});
+    g.push(dt, Pose{Quat{}, {0.01f, 0, 0}});
+    g.push(2 * dt, Pose{Quat{}, {1.0f, 0, 0}});
+    CHECK(g.glitches() == 1 && near(g.latest().velocity, {0.9f, 0, 0}, 1e-2f));
+    CHECK(!g.push(3 * dt, Pose{Quat{}, {NAN, 0, 0}}));
+    // the peak over a window: a fast frame 50 ms ago is found in 0.1 s, not in 20 ms
+    SwordMotion p;
+    for (int i = 0; i <= 12; ++i) {
+        const float x = i <= 5 ? 0.0f : (i == 6 ? 0.05f : 0.05f + 0.001f * float(i - 6));
+        p.push(i * dt, Pose{Quat{}, {x, 0, 0}});
+    }
+    CHECK(p.peak_impact(0.5f, 0.1f).speed > 4.0f);   // 0.05 m in 1/90 s: 4.5 m/s, 6 frames ago
+    CHECK(p.peak_impact(0.5f, 0.02f).speed < 0.2f);  // the last two frames: 0.09 m/s
+    // the ring keeps the newest kHistory samples
+    SwordMotion r;
+    for (int i = 0; i < SwordMotion::kHistory * 3; ++i) r.push(i * dt, Pose{Quat{}, {}});
+    CHECK(r.count() == SwordMotion::kHistory && near(float(r.latest().time), float((SwordMotion::kHistory * 3 - 1) * dt), 1e-4f));
+    CHECK(near(float(r.sample(r.count() - 1).time), float((SwordMotion::kHistory * 2) * dt), 1e-4f));
+    // where along the blade a hit lies
+    CHECK(near(blade_fraction({0, 0, 0}, {0, 0, -100}, {5, 0, -60}), 0.6f));
+    CHECK(near(blade_fraction({0, 0, 0}, {0, 0, -100}, {0, 0, 50}), 0.0f));
+    CHECK(near(blade_fraction({0, 0, 0}, {0, 0, -100}, {NAN, 0, 0}), 1.0f));
+    // power: the game's own unless the setting is on and the strike fast enough
+    CHECK(impact_attack_power(9.0f, 0.0f) == 1 && impact_attack_power(3.9f, 4.0f) == 1 && impact_attack_power(4.0f, 4.0f) == 2);
+    // haptics: harder hits stronger and longer, never above the strength's range; deflections sharp; off at 0
+    const ImpactHaptic soft = impact_haptic(1.0f, 0.6f, false), hard = impact_haptic(20.0f, 0.6f, false);
+    CHECK(soft.amplitude < hard.amplitude && soft.seconds < hard.seconds);
+    CHECK(near(hard.amplitude, 0.6f) && near(impact_haptic(0, 0.6f, false).amplitude, 0.6f * kHapticFloor));
+    CHECK(impact_haptic(2.0f, 0.6f, true).amplitude > hard.amplitude && impact_haptic(2.0f, 1.0f, true).amplitude <= 1.0f);
+    CHECK(impact_haptic(5.0f, 0.0f, false).amplitude == 0 && impact_haptic(NAN, 0.6f, false).amplitude > 0);
+    // the sword's frame is the blade's: blade_from_grip's root and tip lie on it
+    Config c;
+    const Pose grip{yaw_quat(0.3f), {0.1f, 1.2f, -0.3f}};
+    const Pose sw = sword_pose_from_grip(grip, c);
+    const Blade b = blade_from_grip(grip, c);
+    CHECK(near(sw.position, b.root) && near(transform(sw, {0, 0, -c.bladeLength}), b.tip));
+}
+
+// (docs/VR_SWORD_COMBAT_PLAN.md, stage 3c) the capsules along the swing's arc from the headset's poses between steps
+static void test_sword_arc_sweep() {
+    const float dt = 1.0f / 90.0f, L = 100.0f;  // a game blade 100 units long
+    // a fast flat swing: the sword turns 90 degrees about +Y in one logic step (3 headset frames), the hand still. The
+    // game's frame the tracking space's (toGame identity, 100 units a metre)
+    auto pose_at = [](float a) { return Pose{yaw_quat(a), {0, 1, 0}}; };
+    auto game_blade = [&](float a) { return Blade{{0, 100, 0}, Vec3{0, 100, 0} + rotate(yaw_quat(a), Vec3{0, 0, -L})}; };
+    const float turn = kPi / 2;
+    SwordMotion m;
+    for (int i = 0; i <= 3; ++i) m.push(10.0 + i * dt, pose_at(turn * float(i) / 3.0f));
+    const Blade before = game_blade(0), now = game_blade(turn);
+    const BladePath path = path_between(m, 10.0, before, now, Quat{}, 100.0f);
+    CHECK(path.n == 4);  // before, the two frames between, now
+    CHECK(near(path.blade[1].tip, game_blade(turn / 3).tip, 0.05f) && near(path.blade[2].tip, game_blade(2 * turn / 3).tip, 0.05f));
+    // a small target (a pot, a Keese: radius 5) 40 units out, halfway round the arc; the capsules' radius 20
+    const Vec3 target = Vec3{0, 100, 0} + rotate(yaw_quat(turn / 2), Vec3{0, 0, -0.4f * L});
+    const Sweep old = sweep(before, now);
+    CHECK(!sweep_touches(old, 20.0f, target, 5.0f));  // the one chord: missed
+    const SweepChoice ch = sweep_path(path, 20.0f);
+    CHECK(ch.changed && ch.after.outside < ch.before.outside && ch.before.outside > 0);
+    CHECK(sweep_touches(ch.sweep, 20.0f, target, 5.0f));  // along the arc: hit
+    CHECK(near(ch.sweep.capsule[0].a, now.root) && near(ch.sweep.capsule[0].b, now.tip));  // the blade now kept
+    CHECK(near(ch.sweep.atVec, now.tip - before.tip));
+    // never worse: over many arcs, turns, hand moves and Link's own step, the chosen gap at most the old one's
+    uint32_t seed = 12345;
+    auto rnd = [&] { seed = seed * 1664525u + 1013904223u; return float(seed >> 8) / float(1u << 24); };
+    for (int n = 0; n < 300; ++n) {
+        SwordMotion r;
+        const Vec3 axis = normalize(Vec3{rnd() - 0.5f, rnd() - 0.5f, rnd() - 0.5f});
+        const float a = (rnd() - 0.2f) * 2.0f, move = rnd() * 0.3f;
+        const int frames = 1 + int(rnd() * 4.0f);  // 1 to 4 poses a step (hitches, slower headsets)
+        for (int i = 0; i <= frames; ++i) {
+            const float u = float(i) / float(frames);
+            r.push(i * dt, Pose{axis_angle(axis, a * u), Vec3{move * u, 1, 0}});
+        }
+        const Pose pn = r.latest().pose, p0 = r.sample(frames).pose;
+        auto gb = [&](const Pose& q, Vec3 shift) {
+            const Vec3 root = q.position * 100.0f + shift;
+            return Blade{root, root + rotate(q.orientation, Vec3{0, 0, -L})};
+        };
+        const Blade b0 = gb(p0, {rnd() * 10.0f, 0, 0}), bn = gb(pn, {});  // (Link moved up to 10 units)
+        const BladePath bp = path_between(r, 0.0, b0, bn, Quat{}, 100.0f);
+        CHECK(bp.n == frames + 1);
+        CHECK(near(bp.blade[0].tip, b0.tip) && near(bp.blade[bp.n - 1].tip, bn.tip));
+        const SweepChoice c = sweep_path(bp, 20.0f);
+        CHECK(c.after.outside <= c.before.outside + 1e-3f);
+    }
+    // nothing in between (one pose a step, or the step before no longer known): exactly the old sweep
+    SwordMotion one;
+    one.push(0.0, pose_at(0));
+    one.push(dt, pose_at(0.5f));
+    const BladePath p2 = path_between(one, 0.0, before, game_blade(0.5f), Quat{}, 100.0f);
+    CHECK(p2.n == 2);
+    const SweepChoice c2 = sweep_path(p2, 20.0f);
+    const Sweep o2 = sweep(before, game_blade(0.5f));
+    CHECK(!c2.changed && near(c2.sweep.capsule[1].a, o2.capsule[1].a) && near(c2.sweep.capsule[2].b, o2.capsule[2].b));
+    CHECK(path_between(one, 5.0, before, now, Quat{}, 100.0f).n == 2);  // (a start time after the latest)
+    // the game's frame turned from the tracking space's: the path turns with it
+    const Quat toGame = yaw_quat(1.2f);
+    const Blade gBefore{rotate(toGame, before.root), rotate(toGame, before.tip)}, gNow{rotate(toGame, now.root), rotate(toGame, now.tip)};
+    const BladePath gp = path_between(m, 10.0, gBefore, gNow, toGame, 100.0f);
+    CHECK(gp.n == 4 && near(gp.blade[1].tip, rotate(toGame, path.blade[1].tip), 0.05f));
+}
+
+// (2026-11-20 headset test: the sword hit nothing) a swing from the elbow and wrist: the hand at 1.2 m/s, under the
+// swing start speed, the sword turning 10 rad/s. SwingDetector starts no swing (the capsules were never armed); the
+// blade three quarters of the way down moves over 6 m/s and arms the physical sword (blade_arm)
+static void test_blade_arming() {
+    Config c;  // the defaults: swingStartSpeed 1.6, bladeLength 0.85, physicalSwordSpeed 3
+    const float dt = 1.0f / 90.0f;
+    SwingDetector d(c);
+    SwordMotion m;
+    bool started = false, armedEver = false;
+    float peak = 0;
+    for (int i = 0; i <= 30; ++i) {
+        const Pose grip{yaw_quat(-10.0f * dt * float(i)), {1.2f * dt * float(i), 1.2f, -0.3f}};
+        started |= d.update(blade_from_grip(grip, c), dt, 0).started;
+        m.push(i * dt, sword_pose_from_grip(grip, c));
+        const BladeImpact b = m.peak_impact(kArmAlong * c.bladeLength, 1.0f / 30.0f);
+        peak = std::max(peak, b.speed);
+        armedEver |= blade_arm(b.speed, c.physicalSwordSpeed, false, false).fast;
+    }
+    CHECK(!started);   // the hand's rule: no swing, nothing armed (the bug)
+    CHECK(peak > 6.0f && armedEver);  // the blade's: armed
+    // a hand held still with tracking noise (1 mm, 0.5 degree jitter): never armed
+    SwordMotion still;
+    bool noise = false;
+    for (int i = 0; i <= 90; ++i) {
+        const float j = (i % 2) ? 1.0f : -1.0f;
+        still.push(i * dt, sword_pose_from_grip(Pose{yaw_quat(j * 0.0044f), {0.001f * j, 1.2f, -0.3f}}, c));
+        noise |= blade_arm(still.peak_impact(kArmAlong * c.bladeLength, 1.0f / 30.0f).speed, c.physicalSwordSpeed, false, false).fast;
+    }
+    // (0.5 degree a frame back and forth: 0.4 rad/s x 0.64 m plus 0.18 m/s: under 0.5 m/s)
+    CHECK(!noise);
+    // a slow, deliberate turn of the wrist (90 degrees in a second): 1 m/s at the measuring point, not armed
+    CHECK(!blade_arm(0.64f * kPi / 2, 3.0f, false, false).fast);
+    // off, a fresh swing only from unarmed without the hand's swing, NaN never arms
+    CHECK(!blade_arm(9.0f, 0.0f, false, false).fast);
+    CHECK(blade_arm(4.0f, 3.0f, false, false).newSwing && !blade_arm(4.0f, 3.0f, true, false).newSwing &&
+          !blade_arm(4.0f, 3.0f, false, true).newSwing);
+    CHECK(!blade_arm(NAN, 3.0f, false, false).fast);
+    // (the player-only sword) a fast back-and-forth: the blade back the other way is a new swing, so a target can be
+    // hit again; not a sideways wobble, not too soon after the swing began, not slow, not with no swing direction
+    const Vec3 right{4, 0, 0};
+    CHECK(blade_reversed({-5, 0, 0}, right, 5.0f, 3.0f, 6));
+    CHECK(blade_reversed({-3, 3.5f, 0}, right, 4.6f, 3.0f, 6));   // (back and up: 130 degrees)
+    CHECK(!blade_reversed({0, 5, 0}, right, 5.0f, 3.0f, 6));      // (90 degrees: a turn, not back)
+    CHECK(!blade_reversed({-5, 0, 0}, right, 5.0f, 3.0f, 2));     // (within 0.1 s of the start)
+    CHECK(!blade_reversed({-2, 0, 0}, right, 2.0f, 3.0f, 6));     // (slower than arming)
+    CHECK(!blade_reversed({-5, 0, 0}, {}, 5.0f, 3.0f, 6));         // (no direction yet)
+    CHECK(!blade_reversed({-5, 0, 0}, right, 5.0f, 0.0f, 6));     // (blade arming off)
+    // a whole flurry, simulated at 30 logic steps a second: right, left, right, each 0.2 s at 6 m/s. Every change of
+    // direction is a new swing (3 swings), each with its hits afresh
+    {
+        HitLedger ledger;
+        PhysicalSword ps;
+        Vec3 dir;
+        int start = 0, swings = 0;
+        for (int st = 0; st < 18; ++st) {
+            const Vec3 v{(st / 6) % 2 ? -6.0f : 6.0f, 0, 0};
+            const BladeArm a = blade_arm(6.0f, 3.0f, false, ps.armed());
+            const bool rev = ps.armed() && blade_reversed(v, dir, 6.0f, 3.0f, st - start);
+            if (a.newSwing || rev) {
+                ledger.begin_swing();
+                dir = v;
+                start = st;
+            }
+            if (ps.update(true, false, a.fast, ledger.swing(), 1.0f / 30.0f).began) ++swings;
+        }
+        CHECK(swings == 3 && ledger.swing() == 3);
+    }
+    // with the physical sword: armed while the blade is fast and kPhysicalHold after
+    PhysicalSword p;
+    CHECK(p.update(true, false, blade_arm(6.0f, 3.0f, false, p.armed()).fast, 1, 1.0f / 30.0f).began);
+    CHECK(p.update(true, false, blade_arm(0.5f, 3.0f, false, p.armed()).fast, 1, 1.0f / 30.0f).armed);
+}
+
+// (2026-11-20, headset: "I just move my hand very lightly ... Link will yell") only real swings count: fast AND far
+// (BladeSwing). Motions as the game measures them: sword poses at 90 Hz, the point three quarters down the blade
+static int real_swings(const std::vector<Pose>& poses, int* confirmedAt = nullptr, int* thrusts = nullptr) {
+    Config c;  // the defaults: physicalSwordSpeed 4.5, swordSwingDistance 0.30, bladeLength 0.85
+    const float dt = 1.0f / 90.0f;
+    SwordMotion m;
+    BladeSwing b;
+    int n = 0;
+    for (size_t i = 0; i < poses.size(); ++i) {
+        m.push(double(i) * dt, poses[i]);
+        if (m.count() < 2) continue;
+        BladeSwingConfig k;
+        k.speed = c.physicalSwordSpeed;
+        k.distance = c.swordSwingDistance;
+        const BladeSwing::Event e = b.update(SwordMotion::point_velocity(m.latest(), kArmAlong * c.bladeLength),
+                                             rotate(m.latest().pose.orientation, Vec3{0, 0, -1}), dt, k);
+        if (e.confirmed) {
+            if (confirmedAt && !n) *confirmedAt = int(i);
+            if (thrusts && e.thrust) ++*thrusts;
+            ++n;
+        }
+    }
+    return n;
+}
+// the sword turning about +Y (a flat swing) from a0 to a1 degrees over `frames` headset frames, then held
+static std::vector<Pose> turn(float a0, float a1, int frames, int hold = 20) {
+    std::vector<Pose> p;
+    for (int i = 0; i <= frames; ++i) p.push_back({yaw_quat((a0 + (a1 - a0) * float(i) / float(frames)) * kPi / 180.0f), {0, 1.2f, -0.3f}});
+    for (int i = 0; i < hold; ++i) p.push_back(p.back());
+    return p;
+}
+static void test_real_swing() {
+    // a real slash: 70 degrees in 0.12 s (6.5 m/s at the point): one swing, counted about 0.05 s in
+    int at = -1;
+    CHECK(real_swings(turn(0, -70, 11), &at) == 1 && at >= 3 && at <= 6);
+    // a light flick of the wrist, fast but short: 20 degrees in 0.04 s (5.6 m/s, 0.22 m): nothing
+    CHECK(real_swings(turn(0, -20, 4)) == 0);
+    // a light move of the hand: 15 degrees in 0.1 s (1.7 m/s): nothing
+    CHECK(real_swings(turn(0, 15, 9)) == 0);
+    // moving the sword into position: the hand 0.5 m at 1.5 m/s, no turn: nothing
+    {
+        std::vector<Pose> p;
+        for (int i = 0; i <= 30; ++i) p.push_back({Quat{}, {0.5f * float(i) / 30.0f, 1.2f, -0.3f}});
+        CHECK(real_swings(p) == 0);
+    }
+    // twitching: back and forth 12 degrees at 5 times a second (fast, but each way short): nothing
+    {
+        std::vector<Pose> p;
+        for (int i = 0; i <= 90; ++i) p.push_back({yaw_quat(0.21f * std::sin(float(i) / 90.0f * 2 * kPi * 5)), {0, 1.2f, -0.3f}});
+        CHECK(real_swings(p) == 0);
+    }
+    // a real back-and-forth: 70 degrees right, then 70 back: two swings
+    {
+        std::vector<Pose> p = turn(0, -70, 11, 0), q = turn(-70, 0, 11);
+        p.insert(p.end(), q.begin() + 1, q.end());
+        CHECK(real_swings(p) == 2);
+    }
+    // a slower, full swing: 90 degrees in 0.25 s (4.0 m/s at the point, under 4.5): not counted (a deliberate swing
+    // is faster; vr.physicalSwordSpeed tunes it)
+    CHECK(real_swings(turn(0, -90, 22)) == 0);
+    // a hard overhead chop: about +X, 80 degrees in 0.1 s: one
+    {
+        std::vector<Pose> p;
+        for (int i = 0; i <= 9; ++i) p.push_back({axis_angle({1, 0, 0}, (40.0f - 80.0f * float(i) / 9.0f) * kPi / 180.0f), {0, 1.5f, -0.3f}});
+        for (int i = 0; i < 20; ++i) p.push_back(p.back());
+        CHECK(real_swings(p) == 1);
+    }
+    // (asked for: "make sure thrust attacks still work") thrusts: the blade (along -Z here) pushed tip first
+    auto push = [](Vec3 move, float seconds) {
+        std::vector<Pose> p;
+        const int frames = std::max(1, int(seconds * 90.0f + 0.5f));
+        for (int i = 0; i <= frames; ++i) p.push_back({Quat{}, Vec3{0, 1.2f, -0.3f} + move * (float(i) / float(frames))});
+        for (int i = 0; i < 20; ++i) p.push_back(p.back());
+        return p;
+    };
+    int thrusts = 0;
+    CHECK(real_swings(push({0, 0, -0.25f}, 0.1f), nullptr, &thrusts) == 1 && thrusts == 1);  // a stab: 2.5 m/s, 0.25 m
+    thrusts = 0;
+    CHECK(real_swings(push({0, 0, -0.30f}, 0.15f), nullptr, &thrusts) == 1 && thrusts == 1); // a slower stab: 2 m/s
+    CHECK(real_swings(push({0, 0, -0.06f}, 0.025f)) == 0);  // a light poke: 2.4 m/s but 0.06 m
+    CHECK(real_swings(push({0, 0, -0.30f}, 0.30f)) == 0);   // a slow push: 1 m/s
+    CHECK(real_swings(push({0.30f, 0, 0}, 0.12f)) == 0);    // a shove sideways at 2.5 m/s: not along the blade
+    CHECK(real_swings(push({0, 0, 0.25f}, 0.1f)) == 0);     // pulling the sword back: toward the hilt
+    CHECK(real_swings(push({0, 0, 0.45f}, 0.08f)) == 0);    // pulling it back fast (5.6 m/s): not a slash either
+    {   // a stab and the quick pull back after it: one thrust, no slash
+        std::vector<Pose> p = push({0, 0, -0.25f}, 0.1f), q = push({0, 0, 0.45f}, 0.08f);
+        for (auto& x : q) x.position = x.position + Vec3{0, 0, -0.25f};
+        p.insert(p.end(), q.begin(), q.end());
+        thrusts = 0;
+        CHECK(real_swings(p, nullptr, &thrusts) == 1 && thrusts == 1);
+    }
+    // a thrust at the game's slash speed still counts as a thrust, and a slash is not a thrust
+    thrusts = 0;
+    CHECK(real_swings(push({0, 0, -0.5f}, 0.08f), nullptr, &thrusts) == 1 && thrusts == 1);
+    thrusts = 0;
+    CHECK(real_swings(turn(0, -70, 11), nullptr, &thrusts) == 1 && thrusts == 0);
+    // a hitch in the middle of building it up: nothing carried over
+    BladeSwing b;
+    const BladeSwingConfig k;
+    CHECK(!b.update({6, 0, 0}, {0, 0, -1}, 1.0f / 90.0f, k).confirmed && b.phase() == BladeSwing::Phase::Building);
+    b.update({6, 0, 0}, {0, 0, -1}, 0.5f, k);
+    CHECK(b.phase() == BladeSwing::Phase::Idle && b.id() == 0);
+}
+
+// (2026-11-20, Tower of the Gods: Link's head missing in a cutscene) the head's joints folded for first person given back
+// on a draw that shows it, only where the fold still stands (vr_head_keep.h)
+static void test_head_keep() {
+    auto fold = [](uint32_t* m, uint32_t x, uint32_t y, uint32_t z) {
+        for (int i = 0; i < 12; ++i) m[i] = 0;
+        m[3] = x, m[7] = y, m[11] = z;
+    };
+    uint32_t pose[3][12];  // three joints as the game made them
+    for (int j = 0; j < 3; ++j)
+        for (int i = 0; i < 12; ++i) pose[j][i] = 0x3F800000u + uint32_t(j * 16 + i);
+    uint32_t mem[3][12];
+    std::memcpy(mem, pose, sizeof mem);
+    const uint32_t base = 0x40000000u;
+    auto resolve = [&](uint32_t addr) -> uint32_t* {
+        const uint32_t j = (addr - base) / 48;
+        return addr >= base && j < 3 ? mem[j] : nullptr;
+    };
+    HeadKeep k;
+    // a first-person draw: all three folded onto the neck
+    auto draw_first_person = [&] {
+        for (uint32_t j = 0; j < 3; ++j) {
+            k.before_fold(base + j * 48, mem[j]);
+            fold(mem[j], 11, 22, 33);
+            k.after_fold(base + j * 48, mem[j]);
+        }
+    };
+    draw_first_person();
+    draw_first_person();  // (a second draw in the same step: still folded, the game's pose kept, not the fold)
+    CHECK(k.size() == 3);
+    // the cutscene holds Link still (the game works nothing out again): the head is given back as the game made it
+    CHECK(k.restore(resolve) == 3);
+    CHECK(std::memcmp(mem, pose, sizeof mem) == 0 && k.empty());
+    // the game worked a joint out again meanwhile (a new pose): that one is left alone, the others given back
+    draw_first_person();
+    uint32_t fresh[12];
+    for (int i = 0; i < 12; ++i) fresh[i] = 0x40000000u + uint32_t(i);
+    std::memcpy(mem[1], fresh, sizeof fresh);
+    CHECK(k.restore(resolve) == 2);
+    CHECK(std::memcmp(mem[0], pose[0], 48) == 0 && std::memcmp(mem[1], fresh, 48) == 0 && std::memcmp(mem[2], pose[2], 48) == 0);
+    // the game's new pose between two first-person draws: the new one kept (what the next restore gives back)
+    std::memcpy(mem, pose, sizeof mem);
+    draw_first_person();
+    for (int j = 0; j < 3; ++j) std::memcpy(mem[j], fresh, sizeof fresh);  // (a new logic step)
+    draw_first_person();
+    CHECK(k.restore(resolve) == 3);
+    for (int j = 0; j < 3; ++j) CHECK(std::memcmp(mem[j], fresh, 48) == 0);
+    // no longer Link's (a new stage, another model): nothing written
+    draw_first_person();
+    CHECK(k.restore([](uint32_t) -> uint32_t* { return nullptr; }) == 0 && k.empty());
+    // nothing kept: nothing to give back
+    CHECK(k.restore(resolve) == 0);
+}
+
 static void test_blade_and_sweep() {
     Config c;
     c.gripPitchDegrees = 0;
@@ -2216,6 +2662,29 @@ static void test_head_controller() {
         const Pose turned = g.game_camera_view(eye, center, up, yaw_quat(0.8f));
         CHECK(near(game_heading(rotate(turned.orientation, {0, 0, -1})), game_heading(center - eye) + 0.3f, 1e-4f));
         CHECK(g.end_game_camera() && !g.game_camera());
+    }
+    // cutscenes: the head's movement since the cutscene began, turned as the view is, at most the limit, scaled
+    {
+        HeadController g;
+        const Vec3 eye{0, 100, 0}, center{100, 100, 0}, up{0, 1, 0}, start{0.1f, 1.6f, 0.2f};
+        const float scale = 50.0f;
+        g.begin_game_camera(0.5f);
+        CHECK(near(g.game_camera_head_offset(eye, center, up, start + Vec3{0, 0, -0.2f}, 0.5f, scale), {}));  // (not begun)
+        g.begin_lean(start);
+        CHECK(g.lean_begun());
+        CHECK(near(g.game_camera_head_offset(eye, center, up, start, 0.5f, scale), {}));
+        // leaning 0.2 m forward along where the head looked when it began: 0.2 m toward what the camera shows
+        const Vec3 fwd = rotate(yaw_quat(0.5f), {0, 0, -0.2f});
+        CHECK(near(g.game_camera_head_offset(eye, center, up, start + fwd, 0.5f, scale), Vec3{0.2f * scale, 0, 0}, 1e-3f));
+        // standing up 0.1 m: up in the view
+        CHECK(near(g.game_camera_head_offset(eye, center, up, start + Vec3{0, 0.1f, 0}, 0.5f, scale), Vec3{0, 0.1f * scale, 0}, 1e-3f));
+        // walking 2 m away: held at the limit
+        CHECK(near(length(g.game_camera_head_offset(eye, center, up, start + Vec3{2, 0, 0}, 0.5f, scale)), 0.5f * scale, 1e-3f));
+        // third person (begin_game_camera again), first person and a recentre end it
+        g.begin_game_camera(0.0f);
+        CHECK(!g.lean_begun());
+        g.begin_lean(start);
+        CHECK(g.end_game_camera() && !g.lean_begun());
     }
     // the views by display time (the screen blur): a second pass of a frame changes nothing
     {
@@ -2735,6 +3204,13 @@ static void test_tracking_hold() {
         const Vec3 drifted{0, 0.4f, 0}, found{0, 1.6f, 0};
         CHECK(head_out_of_reach(found, drifted, 0.2, 0.19));
         CHECK(!head_out_of_reach(found, drifted, 0.4, 0.39));
+        // never a head in the room (2026-11-18, Sony's SteamVR driver before its tracking locked: 43 m out): the jump
+        // to the real head is taken at once; a jump from the room out to there is still held
+        const Vec3 placeholder{30.32f, 8.19f, 29.57f}, real{-0.05f, 0.83f, -0.75f};
+        CHECK(!head_out_of_reach(real, placeholder, 0.011, -1));
+        CHECK(!head_out_of_reach(real, placeholder, 1.0, 0.99));
+        CHECK(head_out_of_reach(placeholder, real, 0.011, -1));
+        CHECK(head_out_of_reach(placeholder, real, 5.0, 4.99));
 
         // back from it the view eases (head_ease): all of the offset at first, half halfway, none after
         const Vec3 off{0, 1.0f, 0};
@@ -3393,6 +3869,9 @@ static void test_sailing_views() {
         s = ok;
         s.greatSea = false;  // not the open world
         CHECK(!sailing_eligible(s));
+        // the stages with the boat's views: the Great Sea and the Tower of the Gods (asked for, 2026-11-20); not others
+        CHECK(boat_view_stage("sea") && boat_view_stage("Siren"));
+        CHECK(!boat_view_stage("M_NewD2") && !boat_view_stage("sea_T") && !boat_view_stage("") && !boat_view_stage(nullptr));
         s = ok;
         s.ship = false;
         CHECK(!sailing_eligible(s));
@@ -3996,6 +4475,9 @@ static void test_frame_synthesis() {
 }
 
 int main() {
+    test_swing_voice_peak();
+    test_runtime_slow();
+    test_true_size();
     test_upscaling();
     test_frame_synthesis();
     test_conversion();
@@ -4013,6 +4495,11 @@ int main() {
     test_swing();
     test_flap();
     test_blade_and_sweep();
+    test_sword_motion();
+    test_sword_arc_sweep();
+    test_blade_arming();
+    test_real_swing();
+    test_head_keep();
     test_filters();
     test_gameplay_camera_regression();
     test_camera_audit();

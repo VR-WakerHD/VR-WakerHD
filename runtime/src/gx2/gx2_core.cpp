@@ -10,6 +10,7 @@
 #include "../mods/fast_forward.h"
 #include "../mods/mod_actor_shadow_proof.h"
 #include "../per_thread.h"
+#include "../write_watch.h"
 #include "../interp.h"
 #include "../platform/host.h"
 #ifdef __APPLE__
@@ -600,6 +601,12 @@ static int64_t steady_ns() {
 }
 static void perf_split_log();
 static std::atomic<uint64_t> g_split_sync_ns{0}, g_split_sync_n{0}, g_split_exec_ns{0}, g_split_exec_max_ns{0};
+// (docs/VR_RUNTIME_PACING_PLAN.md, the frame planner) the game thread's time waiting here: in GX2WaitForVsync (its whole
+// call) and for the render thread elsewhere (render_sync), taken by the planner each pass (gx2::take_game_waited_ns).
+// Paced by the runtime, a pass's time is otherwise the headset's rhythm, not the game's work
+// (per thread: the planner, on the game thread, takes only that thread's waits, not another guest thread's)
+static thread_local uint64_t t_game_waited_ns = 0;
+static thread_local int t_in_vsync_wait = 0;  // (render_sync inside GX2WaitForVsync: counted once, by the vsync wait)
 static void render_thread_main() {
     host::set_thread_name("GX2 render");
     // the game thread waits at its swap for depth-peek answers: wake this thread's command wait so it
@@ -799,6 +806,8 @@ static void render_sync(int site = kSyncShutdown) {
             g_split_sync_ns.fetch_add(uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
                                       std::memory_order_relaxed);
             g_split_sync_n.fetch_add(1, std::memory_order_relaxed);
+            if (!t_in_vsync_wait)
+                t_game_waited_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count());
             sync_stat(site, waited);
             if (rprof::enabled())
                 rprof::add_sync(site == kSyncDrawDone ? rprof::kSyncDrawDone : site == kSyncCopySurface ? rprof::kSyncCopySurface
@@ -817,6 +826,59 @@ static void render_sync(int site = kSyncShutdown) {
     std::unique_lock<std::mutex> lk(g_q_mutex);
     g_q_done_cv.wait(lk, [&] { return g_fence_done >= id; });
     g_guarded_done = std::max(g_guarded_done, covers);
+}
+// ---- (2026-11-20) the frame overlap at the frame's end (WWHD_GX2_DRAWDONE_OVERLAP=1). The game calls GX2DrawDone when
+// a frame is queued (from 0274C908) and waits until the render thread has executed it, so that it may rewrite the memory
+// those commands read; the two threads took turns there (in the Forsaken Fortress the game waited 20% of its time and
+// the render thread 22% for the game's next commands). Measured (WWHD_DRAWDONE_PROBE, desktop): the game's first write
+// of renderer data after that wait (its first hint) came 8 to 16 ms later (10%: 8 ms); the render thread's lag is 2 to
+// 3 ms in the headset. With the overlap that GX2DrawDone queues its fence and returns; the game thread waits for the
+// fence only if it gets there first: at its next write of renderer data (a hint: DCFlush or GX2Invalidate of vertex or
+// uniform data, or a write fault on a page the renderer armed), at the next GX2DrawDone (one frame ahead at most), or at
+// any other sync (render_sync waits for everything queued anyway)
+static std::atomic<uint64_t> g_overlapFence{0};   // the fence of a frame-end GX2DrawDone that returned before it
+static uint64_t g_overlapCovers = 0;               // (g_q_mutex) the guarded commands it covers
+static std::atomic<uint32_t> g_overlapThread{0};  // the game thread's id (the guard waits only there)
+static std::atomic<uint64_t> g_ovEarly{0}, g_ovWaitHint{0}, g_ovWaitDone{0}, g_ovWaitNs{0}, g_ovPassed{0};
+static uint32_t ov_thread_id() {
+#ifdef _WIN32
+    return (uint32_t)GetCurrentThreadId();
+#else
+    return (uint32_t)(uintptr_t)pthread_self();
+#endif
+}
+// the game thread: wait for the pending fence (none: return at once). where: 0 a hint or fault, 1 the next DrawDone
+static void overlap_wait(int where) {
+    const uint64_t id = g_overlapFence.load(std::memory_order_acquire);
+    if (!id) return;
+    if (ov_thread_id() != g_overlapThread.load(std::memory_order_relaxed)) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    bool passed;
+    {
+        std::unique_lock<std::mutex> lk(g_q_mutex);
+        passed = g_fence_done >= id;
+        if (!passed) g_q_done_cv.wait(lk, [&] { return g_fence_done >= id; });
+        g_guarded_done = std::max(g_guarded_done, g_overlapCovers);
+    }
+    uint64_t expect = id;
+    g_overlapFence.compare_exchange_strong(expect, 0);
+    if (passed) ++g_ovPassed;
+    else {
+        ++(where ? g_ovWaitDone : g_ovWaitHint);
+        g_ovWaitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
+    }
+}
+static void overlap_guard() { overlap_wait(0); }
+static bool overlap_on() {
+    static const bool on = [] {
+        const char* e = getenv("WWHD_GX2_DRAWDONE_OVERLAP");
+        const bool v = e && *e == '1';
+        LOG("[gx2] frame overlap at the frame-end GX2DrawDone: %s", v ? "on (the game goes on while the render thread finishes)"
+                                                                     : "off (WWHD_GX2_DRAWDONE_OVERLAP=1 turns it on)");
+        if (v) wwatch::set_write_guard(overlap_guard);
+        return v;
+    }();
+    return on;
 }
 // nothing GX2DrawDone protects is queued and not yet executed (PERF-07a)
 static bool nothing_guarded_pending() {
@@ -2439,6 +2501,8 @@ static int64_t g_count_offset = 0;     // guest-visible swap/flip counts minus o
 
 // The clock is advanced (g_vsync_shift) when a late flip moves the grid (vsync_pacing.h).
 static std::atomic<int64_t> g_vsync_shift{0};  // ns; written with g_flip_mutex held
+// (diagnostics, gx2::anchor_vsync_grid) how far the grid moved to follow the runtime's releases
+static std::atomic<uint64_t> g_anchor_moves{0}, g_anchor_abs_ns{0}, g_anchor_max_ns{0};
 // The vsync's period: 59.94 Hz, or in VR the headset's (gx2::lock_vsync_to_display, docs/VR_FRAME_RATE.md "Locked to the
 // headset's clock"). Written with g_flip_mutex held
 static std::atomic<int64_t> g_vsync_period{kVsyncPeriod.count()};
@@ -2506,6 +2570,34 @@ void gx2::delay_vsync_grid(int64_t ns) {
     g_vsync_shift.fetch_sub(ns, std::memory_order_relaxed);
 }
 int64_t gx2::vsync_period_ns() { return g_vsync_period.load(std::memory_order_relaxed); }
+uint64_t gx2::take_game_waited_ns() {
+    const uint64_t n = t_game_waited_ns;
+    t_game_waited_ns = 0;
+    return n;
+}
+// VR paced by the runtime (docs/VR_RUNTIME_PACING_PLAN.md): the grid's nearest frame boundary moved to `at` (the moment
+// the runtime released a real frame), the step slots with it. Not while the game clock is shifted (Fast Forward and
+// the other speed modes keep the game's own timer)
+void gx2::anchor_vsync_grid(std::chrono::steady_clock::time_point at) {
+    if (game_clock::shifted()) return;
+    std::lock_guard<std::mutex> lk(g_flip_mutex);
+    int64_t shift = g_vsync_shift.load(std::memory_order_relaxed);
+    const int64_t t = std::chrono::duration_cast<std::chrono::nanoseconds>(at - g_vsync_epoch).count();
+    const int64_t d = vsync_pacing::anchor_grid(vsync_clock(), shift, t, vsync_granule());
+    g_vsync_shift.store(shift, std::memory_order_relaxed);
+    if (g_step_slot >= 0) g_step_slot += d;
+    g_anchor_moves.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t ad = uint64_t(d < 0 ? -d : d);
+    g_anchor_abs_ns.fetch_add(ad, std::memory_order_relaxed);
+    uint64_t m = g_anchor_max_ns.load(std::memory_order_relaxed);
+    while (ad > m && !g_anchor_max_ns.compare_exchange_weak(m, ad, std::memory_order_relaxed)) {}
+}
+void gx2::take_anchor_stats(uint64_t& moves, double& meanMs, double& maxMs) {
+    moves = g_anchor_moves.exchange(0, std::memory_order_relaxed);
+    const uint64_t sum = g_anchor_abs_ns.exchange(0, std::memory_order_relaxed);
+    maxMs = double(g_anchor_max_ns.exchange(0, std::memory_order_relaxed)) / 1e6;
+    meanMs = moves ? double(sum) / double(moves) / 1e6 : 0.0;
+}
 // paced interpolation (interp.cpp): a logic pass more than a step late drops the schedule (the next
 // logic frame starts a new one)
 void gx2::drop_step_slot() {
@@ -2902,7 +2994,85 @@ HLE(gx2, GX2DrawDone) {
     }
     emit_host(OP_DRAW_DONE, {});
     const bool skipped = safe && skipSafe;
-    if (!skipped) render_sync(kSyncDrawDone);
+    // (the frame overlap, above: only the frame-end call, the one returning to 0274C908, and never with a
+    // fence still pending: at most one frame ahead)
+    if (overlap_on()) {
+        overlap_wait(1);
+        // (its return address: the trace's "DrawDone from 0274C908"; through the build map, GC, so a European game's
+        // address matches too)
+        if (!skipped && c->lr == GC(0x0274C908)) {
+            g_overlapThread = ov_thread_id();
+            uint64_t id;
+            {
+                std::lock_guard<std::mutex> lk(g_q_mutex);
+                id = ++g_fence_issued;
+                g_overlapCovers = g_guarded_queued;
+            }
+            uint32 w = (uint32)id;
+            enqueue(OP_FENCE, &w, 1);
+            g_overlapFence.store(id, std::memory_order_release);
+            ++g_ovEarly;
+            static auto since = std::chrono::steady_clock::now();
+            if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10)) {
+                const uint64_t e = g_ovEarly.exchange(0), wh = g_ovWaitHint.exchange(0), wd = g_ovWaitDone.exchange(0),
+                               ns = g_ovWaitNs.exchange(0), pa = g_ovPassed.exchange(0);
+                LOG("[gx2] frame overlap (10 s): %llu frame-end waits returned at once; the render thread was through "
+                    "before the game needed it %llu times; the game waited %llu times at a write of renderer data and %llu "
+                    "at the next frame end, %.2f ms each on average", (unsigned long long)e, (unsigned long long)pa,
+                    (unsigned long long)wh, (unsigned long long)wd, (wh + wd) ? double(ns) / 1e6 / double(wh + wd) : 0.0);
+                since = std::chrono::steady_clock::now();
+            }
+            return;
+        }
+    }
+    // (probe, 2026-11-20, WWHD_DRAWDONE_PROBE=1: could the frames overlap here? For each wait: how long the game waited
+    // for the render thread, and how soon after the wait it next wrote a page the renderer reads (write-watch armed:
+    // vertex, index, uniform buffers, textures). A first write later than the wait is a frame that could have gone on
+    // without waiting)
+    static const bool probe = getenv("WWHD_DRAWDONE_PROBE") != nullptr;
+    if (probe && skipped) {
+        // (a skipped wait, the swap's: the probe runs on from the wait before it)
+    } else if (probe) {
+        static std::vector<double> waits, firsts;
+        static uint64_t none = 0, after = 0, frames = 0;
+        static double lastWait = -1;
+        static auto since = std::chrono::steady_clock::now();
+        static std::unordered_map<uint32_t, uint64_t> pages;
+        int64_t ns;
+        uint32_t addr;
+        const bool wrote = wwatch::probe_take(ns, addr);
+        if (lastWait >= 0) {
+            ++frames;
+            if (!wrote) ++none;
+            else {
+                firsts.push_back(double(ns) / 1e6);
+                if (double(ns) / 1e6 > lastWait) ++after;
+                ++pages[addr & ~0xFFFu];
+            }
+            waits.push_back(lastWait);
+        }
+        lastWait = -1;
+        if (std::chrono::steady_clock::now() - since > std::chrono::seconds(10) && frames) {
+            auto med = [](std::vector<double>& v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[v.size() / 2]; };
+            auto p10 = [](std::vector<double>& v) { if (v.empty()) return 0.0; std::sort(v.begin(), v.end()); return v[v.size() / 10]; };
+            uint32_t topPage = 0; uint64_t topN = 0;
+            for (auto& [pg, n] : pages) if (n > topN) topN = n, topPage = pg;
+            LOG("[gx2] DrawDone probe (10 s): %llu waits, the wait median %.2f ms; the game's next write to a renderer input "
+                "page: median %.2f ms after the wait, 10%% %.2f; later than the wait in %llu (%.0f%%), none before the next "
+                "wait in %llu; most written page %08X (%llu times)", (unsigned long long)frames, med(waits), med(firsts),
+                p10(firsts), (unsigned long long)after, 100.0 * double(after + none) / double(frames), (unsigned long long)none,
+                topPage, (unsigned long long)topN);
+            waits.clear(), firsts.clear(), pages.clear();
+            none = after = frames = 0;
+            since = std::chrono::steady_clock::now();
+        }
+        if (!skipped) {
+            const auto w0 = std::chrono::steady_clock::now();
+            render_sync(kSyncDrawDone);
+            lastWait = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+            wwatch::probe_mark();
+        }
+    } else if (!skipped) render_sync(kSyncDrawDone);
     if (trace) {
         struct Site { uint64_t calls = 0, safe = 0, skipped = 0; double waitMs = 0, atMs = 0; uint64_t ops[OP_COUNT + 1] = {}; };
         static std::unordered_map<uint64_t, Site> sites;
@@ -3101,6 +3271,15 @@ HLE(gx2, GX2GetSwapStatus) {
 }
 HLE(gx2, GX2SetSwapInterval) { g_swap_interval = std::max<uint32>(arg(c, 0), 1); }
 HLE(gx2, GX2WaitForVsync) {
+    struct Waited {  // (the frame planner: the whole wait, gx2::take_game_waited_ns)
+        std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+        Waited() { ++t_in_vsync_wait; }
+        ~Waited() {
+            --t_in_vsync_wait;
+            t_game_waited_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                             std::chrono::steady_clock::now() - t).count());
+        }
+    } waited;
     if(uncapped_benchmark()) {
         BlockingScope b;
         // The queue fence follows earlier swaps, whose presentation path waits

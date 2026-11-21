@@ -69,7 +69,7 @@ panel. See [VR_PAUSE_MENU.md](VR_PAUSE_MENU.md).
 |---|---|---|---|---|
 | `vr.menuZoomOut` | 3 | 1 .. 4 | x | title and file select: the game's camera this much farther from what it frames, their layouts this much smaller |
 | `vr.cutsceneZoomOut` | 1 | 1 .. 3 | x | cutscenes: the game's camera this much farther from what it frames |
-| `vr.cutsceneFollow` | 1 | 0, 1 | | cutscenes: the game's camera with your head's rotation (0: a flat, head-locked picture) |
+| `vr.cutsceneFollow` | 1 | 0, 1 | | cutscenes: the game's camera with your head's rotation and movement, up to 0.5 m from where it began (0: a flat, head-locked picture) |
 
 The gameplay camera (your head at Link's eyes) has no zoom setting.
 
@@ -79,7 +79,9 @@ The gameplay camera (your head at Link's eyes) has no zoom setting.
 |---|---|---|---|---|
 | `vr.heightOffset` | 0 | -1 .. 1 | m | added to your calibrated eye height (seated play: raise it) |
 | `vr.unitsPerMetre` | 100 | 40 .. 250 | game units / m | world scale when `vr.matchLinkBody` is off (the launcher's and Settings > VR's World scale slider: moving it sets this and turns the match off) |
-| `vr.matchLinkBody` | 0 | 0 / 1 | | world scale = Link's arm / `vr.realArmLength` (docs/VR_ARM_ANIMATION.md) |
+| `vr.matchLinkBody` | 0 | 0 / 1 | | world scale = Link's arm / `vr.realArmLength` (docs/VR_ARM_ANIMATION.md); not with `vr.trueSize` |
+| `vr.trueSize` | 0 | 0 / 1 | | True size: first person from your own eye height above Link's feet, in his world at `vr.unitsPerMetre`; only his hands drawn, arms detached (docs/VR_FIRST_PERSON_CAMERA.md, "True size") |
+| `vr.playerHeight` | 1.70 | 1.0 .. 2.3 | m | your height, for True size when the headset has no floor-level space or you play seated (eyes at 93 % of it) |
 | `vr.maxHeadOffset` | 1.0 | 0.05 .. 2 | m | how far you may lean or walk from Link before the view stops (walls stop it sooner) |
 | `vr.eyeForward` | 0 | -0.3 .. 0.3 | m | first person: the view in front of (+) or behind (-) Link's eyes (the game's eye point) |
 | `vr.roomScale` | 1 | 0, 1 | | first person: leaning or walking in your play space moves Link with you, his body under the view (while he stands or walks on the ground) |
@@ -121,6 +123,13 @@ change.
 | `vr.realArmLength` | 0.6 | 0.3 .. 1 | m | your shoulder-to-hand length (scales your reach to Link's) |
 | `vr.trackedSword` | 1 | 0, 1 | | the sword drawn at the sword hand's controller |
 | `vr.physicalSword` | 1 | 0, 1 | | while the sword hand swings, the blade hits and cuts along its tracked path without Link's attack animation (TPVR's physical sword); full swings still attack |
+| `vr.swordImpactHaptics` | 1 | 0, 1 | | sword hits' haptics by how fast the blade moved where it struck (35% to 100% of `vr.hapticStrength`, full at 15 m/s); a deflected hit a sharp pulse; off: one pulse per hit ([VR_SWORD_COMBAT_PLAN.md](VR_SWORD_COMBAT_PLAN.md)) |
+| `vr.physicalSwordSpeed` | 4.5 | 0 .. 15 | m/s | how fast the blade must move, three quarters of the way to its tip, for a swing: with `vr.swordPlayerOnly`, a real swing is this fast and goes `vr.swordSwingDistance` (light movements of the hand do not count); without it, this speed alone arms the physical sword |
+| `vr.swordSwingDistance` | 0.3 | 0.05 .. 1 | m | with `vr.swordPlayerOnly`: how far that point must travel at that speed before a swing counts (its hits); about 27 degrees of arc |
+| `vr.swordVoiceSpeed` | 7 | 0 .. 20 | m/s | with `vr.swordPlayerOnly`: how fast that point must get in a real swing before Link yells, once a swing (Settings > VR > Sword and items: "Swing speed for Link's yell"). A gentle real swing cuts without a yell. 0: he yells on every real swing |
+| `vr.swordPlayerOnly` | 1 | 0, 1 | | first person with the sword: every swing is your blade's own attack (it cuts where it goes, locked on too, a fast back-and-forth hits again); no swing plays Link's attack animations. B attacks, A parries (the finishing cut started by your swing) and the spin attack stay on their buttons; 0: full swings play the game's attacks as before |
+| `vr.swordStrongHitSpeed` | 10 | 0 .. 12 | m/s | a physical-sword hit at least this fast (where it struck, three quarters down the blade) has a finishing cut's power, twice the normal cut's; 0: off |
+| `vr.swordDebug` | 0 | 0, 1 | | (diagnostics) once a second, the sword's measured motion in the log |
 | `vr.itemWheel` | 1 | 0, 1 | | the item wheel: reach over the shield hand's shoulder, choose with the right stick, bring the hand forward to put the item on a button ([VR_ITEM_WHEEL.md](VR_ITEM_WHEEL.md)) |
 | `vr.itemWheelButton` | x | x, y, r | | the item button the wheel puts its choice on |
 | `vr.bodyFollowDegrees` | 30 | 10 .. 90 | degrees | standing still in first person, Link turns to face where you look once your head has turned this far from his body; he turns until within 5 degrees ([VR_BODY_FOLLOW.md](VR_BODY_FOLLOW.md)) |

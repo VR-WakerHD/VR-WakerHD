@@ -26,9 +26,13 @@ struct Blade {
 };
 // the blade of a sword held in a controller's grip pose: the grip offset and pitch from the settings, then
 // bladeLength along the grip's forward (-Z) direction
-inline Blade blade_from_grip(const Pose& grip, const Config& c) {
+// (the sword's own frame: its origin at the blade's root, the blade along -Z; vr_sword_motion.h measures it)
+inline Pose sword_pose_from_grip(const Pose& grip, const Config& c) {
     const Quat tilt = axis_angle({1, 0, 0}, c.gripPitchDegrees * kPi / 180.0f);
-    const Pose sword = compose(grip, Pose{tilt, Vec3{c.gripOffsetX, c.gripOffsetY, c.gripOffsetZ}});
+    return compose(grip, Pose{tilt, Vec3{c.gripOffsetX, c.gripOffsetY, c.gripOffsetZ}});
+}
+inline Blade blade_from_grip(const Pose& grip, const Config& c) {
+    const Pose sword = sword_pose_from_grip(grip, c);
     return {sword.position, transform(sword, Vec3{0, 0, -c.bladeLength})};
 }
 

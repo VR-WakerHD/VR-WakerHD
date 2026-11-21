@@ -22,7 +22,7 @@ Key facts:
 - Runtimes tested: SteamVR (Windows, Linux), Monado (Linux), Meta Quest Link. Virtual Desktop and Air Link streaming
   are experimental.
 - Headsets tested most: PlayStation VR2, Meta Quest 3 / 3S.
-- Status: experimental, in active development; latest release 0.5.1 (November 2026).
+- Status: experimental, in active development; latest release 0.6.0 (November 2026).
 - License: the VR mode is GPL-3.0-or-later with a credit term ("VR mode by VR-WakerHD"); the original port's code is
   MPL-2.0.
 

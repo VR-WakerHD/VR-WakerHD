@@ -4,6 +4,7 @@
 #include "handoff_trace.h"
 #include "render_prof.h"
 #include "transfer_wait.h"
+#include "xr_queue_sync.h"
 #include <atomic>
 #include <vector>
 #include <algorithm>
@@ -1345,12 +1346,13 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
           if constexpr (kDrawGuard) guard_forget(cmd);
           checked(gfxvk::vkEndCommandBuffer(cmd));
           checked(gfxvk::vkResetFences(device, 1, &fence));
-          std::array<VkSemaphore, 3> waits{}, signals{};
-          std::array<VkPipelineStageFlags, 3> stages{
+          std::array<VkSemaphore, 4> waits{}, signals{};
+          std::array<VkPipelineStageFlags, 4> stages{
+              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-          std::array<uint64_t, 3> waitValues{};
+          std::array<uint64_t, 4> waitValues{}, signalValues{};
           VkTimelineSemaphoreSubmitInfo timeline{};
           VkSubmitInfo info{VK_STRUCTURE_TYPE_SUBMIT_INFO};
           info.commandBufferCount = 1;
@@ -1368,6 +1370,8 @@ void PodCommands::replay(const std::vector<std::byte> &bytes) {
           info.pWaitDstStageMask = stages.data();
           // the texture-pack upload thread's copies of replacements guest textures now hold (transfer_wait.h)
           transfer_wait::add(info, waits.data(), stages.data(), waitValues.data(), timeline);
+          xr_queue_sync::add(info, cmd, waits.data(), stages.data(), waitValues.data(), signals.data(), signalValues.data(),
+                             timeline);
           if (handoff_trace::enabled()) handoff_trace::emit_worker(handoff_trace::Kind::QueueSubmitBegin);
           VkResult result;
           {

@@ -1,6 +1,6 @@
 # VR sailing views (the King of Red Lions)
 
-While Link sails the King of Red Lions on the Great Sea, the right stick's click offers two more views after first and
+While Link sails the King of Red Lions on the Great Sea or in the Tower of the Gods, the right stick's click offers two more views after first and
 third person, the view on the **King of Red Lions' neck** and the **Free Roam Camera**:
 
 `First person → Third person → Red Lion's neck → Free Roam Camera → First person`
@@ -60,7 +60,7 @@ All of the following must hold, read at each pad read and each frame:
 | Link rides the boat | player status 0 `SHIP_RIDE` (play +0x5CD8, bit 0x10000) |
 | the boat exists | play's ship pointer (`mpPlayerPtr[2]`, play +0x5B3C), only read while he rides; its position finite |
 | the boat is sailing | `daShip_c::mCurMode` (+0x635) is 0 waiting at the tiller, 1 steering with the sail, 2 paddling |
-| the open world | the stage is `sea` (the Great Sea) |
+| a sailing stage | the stage is `sea` (the Great Sea) or `Siren` (the Tower of the Gods, since 2026-11-20: only first and third person were offered there) |
 | normal play | `aspect::gameplay_camera()`: no event, cutscene, talk, title or conducting |
 | no menu, no zoom | no GamePad menu (`gfx::display_gamepad_menu_open`), not the telescope or the Picto Box |
 

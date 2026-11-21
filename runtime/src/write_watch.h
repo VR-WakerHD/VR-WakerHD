@@ -76,6 +76,14 @@ struct HostWrite {
     ~HostWrite() { host_write_end(addr, size); }
 };
 
+// (probe, 2026-11-20) probe_mark: from now, the first write fault on an armed page records its time; probe_take: that
+// time in ns after the mark (false: none yet) and its guest address. Used to measure how soon the game rewrites the
+// render thread's inputs after a GX2DrawDone returns
+// (2026-11-20, the frame overlap: gx2_core.cpp overlap_wait) called at the start of every hint, and of every write
+// fault on Windows, while set: the game thread may have to wait there for the render thread before it writes on
+void set_write_guard(void (*guard)());
+void probe_mark();
+bool probe_take(int64_t& ns, uint32_t& addr);
 // statistics for the renderers' periodic report: write faults and pages protected since the last call
 void take_stats(uint64_t& faults, uint64_t& protectedPages);
 // hints since the last call: calls and bytes covered

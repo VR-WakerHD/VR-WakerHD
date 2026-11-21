@@ -93,4 +93,44 @@ inline int64_t next_slot(int64_t slot, int64_t t, int64_t step, int64_t frame) {
     return t - slot < 2 * step ? slot + step : t + frame;
 }
 
+// VR paced by the runtime (docs/VR_RUNTIME_PACING_PLAN.md): the grid follows the moments the runtime releases its
+// frames (xrWaitFrame returns). The granule boundary nearest `t` is moved to start at `t` (shift updated); returns how
+// far the boundaries moved (ns, later when positive), for the step slots, which are times on the clock and must move
+// with them. Nearest: a release a little early or late moves the grid by that little, never by a frame.
+inline int64_t anchor_grid(const Clock& c, int64_t& shift, int64_t t, uint64_t granule) {
+    granule = std::max<uint64_t>(granule, 1);
+    const uint64_t i = c.index(t, shift) / granule * granule;  // the boundary at or before t
+    const int64_t a = c.time(i, shift), b = c.time(i + granule, shift);
+    const int64_t at = t - a <= b - t ? a : b;
+    const int64_t d = t - at;
+    shift -= d;
+    return d;
+}
+
+// The moment the runtime releases a frame, from its display time: display time minus a smoothed offset between the
+// two clocks (the runtime's XrTime and the game's), so the anchor is as even as the runtime's display times and the
+// game needs no time-conversion extension. A release found earlier than the offset says (the runtime let the game go
+// sooner) is followed quickly, a later one slowly: a late return is often the game asking late (xrWaitFrame returns at
+// once then), not the runtime's rhythm. A run of samples a quarter period off (a hitch, a new rhythm) restarts it.
+struct ReleaseAnchor {
+    bool have = false;
+    double offset = 0;  // ns: display time minus release
+    int outliers = 0;
+    int64_t update(int64_t sample, int64_t period) {
+        if (!have) {
+            have = true;
+            offset = double(sample);
+            return sample;
+        }
+        const double d = double(sample) - offset;
+        if (period > 0 && (d > 0.25 * double(period) || -d > 0.25 * double(period))) {
+            if (++outliers >= 8) offset = double(sample), outliers = 0;
+            return int64_t(offset);
+        }
+        outliers = 0;
+        offset += d > 0 ? d / 4 : d / 16;
+        return int64_t(offset);
+    }
+};
+
 }  // namespace vsync_pacing

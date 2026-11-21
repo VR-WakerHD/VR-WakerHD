@@ -69,6 +69,7 @@
 #include "bc_decode.h"
 #include "texture_pack_vk.h"
 #include "transfer_wait.h"
+#include "xr_queue_sync.h"
 #include "shader_compiler.h"
 #include "android_driver.h"
 #include "stutter_trace.h"
@@ -1722,9 +1723,9 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
     // Use the sealed slot, never the aliases of a newer active recording.
     vk_check(timed_call(commandEndTiming,[&]{return vkEndCommandBuffer(slot.cmd);}),"end command buffer");
     vk_check(timed_call(fenceResetTiming,[&]{return vkResetFences(R.device,1,&slot.fence);}),"reset fence");
-    std::array<VkPipelineStageFlags,3> stages{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
-    std::array<VkSemaphore,3> waits{},signals{};
-    std::array<uint64_t,3> waitValues{};
+    std::array<VkPipelineStageFlags,4> stages{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,VK_PIPELINE_STAGE_ALL_COMMANDS_BIT};
+    std::array<VkSemaphore,4> waits{},signals{};
+    std::array<uint64_t,4> waitValues{},signalValues{};
     VkTimelineSemaphoreSubmitInfo timeline{};
     VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     si.commandBufferCount=1;si.pCommandBuffers=&slot.cmd;
@@ -1737,6 +1738,7 @@ static void submit(VkSemaphore wait = VK_NULL_HANDLE,
     si.pWaitSemaphores=waits.data();si.pWaitDstStageMask=stages.data();si.pSignalSemaphores=signals.data();
     // the texture-pack upload thread's copies of replacements guest textures now hold (transfer_wait.h)
     transfer_wait::add(si,waits.data(),stages.data(),waitValues.data(),timeline);
+    xr_queue_sync::add(si,slot.cmd,waits.data(),stages.data(),waitValues.data(),signals.data(),signalValues.data(),timeline);
     vk_check(timed_call(queueSubmitTiming,[&]{return vkQueueSubmit(R.queue,1,&si,slot.fence);}),"submit graphics");
 #ifdef __ANDROID__
     if(snapshotSignal && isolatedSecondary && isolatedSecondary->prepared()) {
@@ -1808,6 +1810,40 @@ void flush_async() {
   if (!R.recording && (!R.garbageBuffers.empty() || !R.garbageImages.empty() || !R.garbageFramebuffers.empty() ||
                        !R.garbageCacheRegions.empty())) command_buffer();
   submit(VK_NULL_HANDLE,VK_NULL_HANDLE,true);
+}
+// (2026-11-20) SteamVR on Linux: the end-frame thread waits for the frame's writes into the eye images before release
+// and xrEndFrame ("graphics queue taken": 1.6 to 3.3 ms at the median in a slow-state run, up to 5.6), about the GPU's
+// whole frame (2 to 4.5 ms): the frame reached the GPU only at its end, unless the game flushed (GX2Flush). With
+// SteamVR's xrEndFrame at 7 to 11 ms the end-frame thread was then busy 10.9 ms of an 11.1 ms frame and the render
+// thread waited for it, 12 ms at a time. The render thread goes idle many times a frame waiting for the game's next
+// commands: there the frame so far is submitted, as a deferred guest flush already is at the same point, and the GPU
+// works meanwhile, leaving it only the frame's tail at the hand-over. VR on PC only (a tiled GPU, the Quest, pays for
+// each split pass)
+void submit_on_idle() {
+#if !defined(__ANDROID__)
+  static const bool on = [] {
+    const char* e = std::getenv("WWHD_VK_IDLE_SUBMIT");
+    const bool v = !(e && *e == '0');
+    LOG("[vulkan] the frame so far submitted when the render thread goes idle (VR): %s",
+        v ? "on (WWHD_VK_IDLE_SUBMIT=0 off)" : "off (WWHD_VK_IDLE_SUBMIT=0)");
+    return v;
+  }();
+  if (!on || stereo::frame.mode != stereo::XR || !R.recording) return;
+  static std::chrono::steady_clock::time_point last{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now - last < std::chrono::milliseconds(1)) return;
+  last = now;
+  static uint64_t count = 0;
+  static auto since = now;
+  ++count;
+  if (now - since >= std::chrono::seconds(10)) {
+    LOG("[vulkan] idle submits (10 s): %llu (the frame so far handed to the GPU while the game builds the rest)",
+        (unsigned long long)count);
+    count = 0;
+    since = now;
+  }
+  flush_async();
+#endif
 }
 void flush() {
   if(active_deferred_commands)active_deferred_commands->finish_exact();
@@ -5566,7 +5602,7 @@ static void init_device(std::vector<const char *> extensions,
   }
   LOG("[vulkan] secondary fence retirement %s",R.secondaryPresentFences ? "enabled" : "unavailable; idle compatibility path");
 #endif
-  float priorities[2]={1.0f,0.5f};
+  float priorities[3]={1.0f,0.5f,1.0f};  // (the game's, the mirror's, the OpenXR runtime's own: xr_queue_sync.h)
   VkDeviceQueueCreateInfo queues[3]={{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO},
                                    {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO},
                                    {VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO}};
@@ -5620,6 +5656,25 @@ static void init_device(std::vector<const char *> extensions,
       mirrorQueue = true;
     } else
       LOG("[vulkan] desktop mirror: the graphics family has one queue; the render thread presents it");
+  }
+#endif
+#ifndef __ANDROID__
+  // (VR, xr_queue_sync.h) a queue of the graphics family for the OpenXR runtime of its own, with timeline semaphores:
+  // its xrEndFrame then never holds the game's queue (and its lock) while it waits on the GPU
+  R.xrQueueIndex = UINT32_MAX;
+  if (vrvk::wants_queue(R.physicalDevice)) {
+    uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(R.physicalDevice, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> familyProperties(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(R.physicalDevice, &families, familyProperties.data());
+    if (vulkan12 && available12.timelineSemaphore && R.queueFamily < families &&
+        familyProperties[R.queueFamily].queueCount > queues[0].queueCount && queues[0].queueCount < 3) {
+      R.xrQueueIndex = queues[0].queueCount++;
+      enabled12.timelineSemaphore = VK_TRUE;
+    } else {
+      LOG("[vr] the OpenXR runtime shares the game's queue (the graphics family has no queue to spare, or no timeline "
+          "semaphores)");
+    }
   }
 #endif
   R.primaryRequestedQueues=queues[0].queueCount;
@@ -5739,6 +5794,7 @@ static void init_device(std::vector<const char *> extensions,
   }
   init_pass_caches();
   vkGetDeviceQueue(R.device, R.queueFamily, 0, &R.queue);
+  if (R.xrQueueIndex != UINT32_MAX) vkGetDeviceQueue(R.device, R.queueFamily, R.xrQueueIndex, &R.xrQueue);
 #ifndef __ANDROID__
   if (mirrorQueue) {
     vkGetDeviceQueue(R.device, R.queueFamily, 1, &g_mirror.queue);

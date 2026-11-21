@@ -183,6 +183,7 @@ public:
     void begin_game_camera(float headYaw) {
         gameCamera_ = true;
         gameCameraYaw_ = headYaw;
+        leanBegun_ = false;
         boatView_ = 0;
     }
     bool game_camera() const { return gameCamera_; }
@@ -190,11 +191,30 @@ public:
         const Quat camera = look_rotation(center - eye, up);
         return {normalize(camera * normalize(yaw_quat(-gameCameraYaw_) * head)), eye};
     }
+    // Cutscenes (2026-11-16): the head's movement since the event began (begin_lean: the head's position then, tracking
+    // space metres; third person, first person and the boat's views end it: lean_ended), at most maxMetres away, turned as the view is (the game's camera times the head's turn since then)
+    // and scaled to game units: added to the game's camera position, so leaning in or to the side moves the view
+    void begin_lean(Vec3 headPosition) {
+        gameCameraOrigin_ = headPosition;
+        leanBegun_ = true;
+    }
+    bool lean_begun() const { return leanBegun_; }
+    void end_lean() { leanBegun_ = false; }
+    Vec3 game_camera_head_offset(Vec3 eye, Vec3 center, Vec3 up, Vec3 headPosition, float maxMetres, float scale) const {
+        if (!leanBegun_) return {};
+        Vec3 d = headPosition - gameCameraOrigin_;
+        const float len = length(d);
+        if (!(len <= 1e3f)) return {};
+        if (len > maxMetres) d = d * (maxMetres / len);
+        const Quat camera = look_rotation(center - eye, up);
+        return rotate(normalize(camera * yaw_quat(-gameCameraYaw_)), d) * scale;
+    }
     // first person again after the game's camera: true when it was the game's (the caller recentres: the event may have
     // moved Link, and you may have walked or turned in the room meanwhile)
     bool end_game_camera() {
         const bool was = gameCamera_ || boatView_;
         gameCamera_ = false;
+        leanBegun_ = false;
         boatView_ = 0;
         return was;
     }
@@ -209,6 +229,7 @@ public:
         boatOrigin_ = head.position;
         boatYaw_ = yaw_of(head.orientation);
         gameCamera_ = false;
+        leanBegun_ = false;
     }
     int boat_view() const { return boatView_; }
     // the right stick's turn in a boat view (the neck view: as in first person, smooth or snap), about the anchor; the
@@ -273,6 +294,8 @@ private:
     RigTurn rig_;
     bool gameCamera_ = false;
     float gameCameraYaw_ = 0;
+    Vec3 gameCameraOrigin_;  // the head's position when the cutscene began (begin_lean: its movement is added)
+    bool leanBegun_ = false;
     int boatView_ = 0;  // the boat's view drawn (0: none), from where the head was when it began
     Vec3 boatOrigin_;
     float boatYaw_ = 0;

@@ -1818,6 +1818,13 @@ void tab_vr() {
                  "Applies at the next start.");
             ImGui::TextDisabled("Now: %s", vr::framesynth::status().c_str());
         }
+        changed |= ImGui::Checkbox("True size (your own height)", &c.trueSize);
+        help("First person: you see from your own eye height, not Link's (about 1 m up), in his world at its normal "
+             "scale, so you stand taller than him. Only his hands are drawn, free at your controllers. Your height "
+             "comes from the headset when it tracks the floor; otherwise, and when seated, from Your height below. "
+             "Crawling, swimming and climbing still put the view at his eyes. Recentre after turning it on.");
+        if (c.trueSize)
+            changed |= ImGui::SliderFloat("Your height", &c.playerHeight, 1.0f, 2.3f, "%.2f m", ImGuiSliderFlags_AlwaysClamp);
         changed |= ImGui::Checkbox("Hide Link's body", &c.hideBody);
         help("First person: only his arms, hands and whatever is in them are drawn; not his body, legs and head, nor the "
              "shield and sword on his back. His shadow goes with his body.");
@@ -1960,6 +1967,9 @@ void tab_vr() {
         help("Game units per real metre. Lower: the world looks bigger around you. With the world sized to Link it\n"
              "follows your arm length; moving the slider sets it directly.");
         heading("Sword and items");
+        changed |= ImGui::SliderFloat("Swing speed for Link's yell", &c.swordVoiceSpeed, 0.0f, 20.0f, "%.1f m/s", ImGuiSliderFlags_AlwaysClamp);
+        help("How hard a sword swing must be before Link yells (the blade's speed, three quarters of the way to its tip).\n"
+             "Swings still cut from the swing speed; only the yell waits for a hard one. 0: he yells on every real swing.");
         changed |= ImGui::SliderFloat("Hand speed to start a swing", &c.swingStartSpeed, 0.5f, 10, "%.1f m/s", ImGuiSliderFlags_AlwaysClamp);
         changed |= ImGui::SliderFloat("Hand speed that ends it", &c.swingEndSpeed, 0.2f, 8, "%.1f m/s", ImGuiSliderFlags_AlwaysClamp);
         changed |= ImGui::SliderFloat("Side slice: hand travel", &c.swingAcrossDistance, 0.05f, 0.6f, "%.2f m", ImGuiSliderFlags_AlwaysClamp);

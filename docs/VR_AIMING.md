@@ -110,6 +110,39 @@ draws, so the arrow stood out of the drawing hand at that hand's angle, neither 
 - the aim, the shot and the laser follow the same line (`g_bowLine`, read by `bow_aim`).
 The string is drawn as soon as the arrow is on (vr_bow.h), as before.
 
+## Fire, ice and light arrows (audit, 2026-11-20)
+
+Asked for: "make sure all arrows have the same settings in VR first person as the normal arrow". Checked against the
+decompilation (`d_a_arrow.cpp`, `d_a_player_main` bow code) and the VR code:
+
+| What | Normal arrow | Fire, ice, light | Result |
+|---|---|---|---|
+| The actor | `daArrow_c`, `fpcNm_ARROW_e` (0x1D8) | the same class and name; only `mArrowType` (1 fire, 2 ice, 3 light) differs | same |
+| The bow recognised | item 0x27 | 0x35 (with fire and ice), 0x36 (with light): `bow_in_hand`, `bow_item` | same |
+| The aim and the laser (`bow_aim`) | along the arrow drawn between the hands | the arrow read from Link's kept item each frame | same |
+| The arrow drawn along the bow (`frame_correct`, `g_bowLine`) | its model moved rigidly onto the line | matched by the kept arrow's model pointer, any model (light arrows use `ARROWGLITTER`) | same |
+| The shot (`arrow_kept`) | the angles from the drawn line | the same: the game flies every type at 200 units a step along its angles | same |
+| Dropping an arrow (`arrow_fall_step`) | by its actor name | the same name | same |
+| **Changing the arrow type** | — | the game's Swap Modes, its R (this port's **ZR**) while the bow is aimed: `changeArrowType` | **was missing in first person: fixed** |
+| **The glow on the arrow** (`ARROW_LIGHTEFF`) | none | placed from the arrow's own matrix (`field_0x6b4`, the game's arrow at Link's hand) plus 62 units | **to check in the headset** |
+
+- **Changing the arrow type.** ZR is right stick down in first person. It was taken off while any item was aimed (so the
+  stick could not make Link crouch mid-aim), which also took away the only way to change arrows. With the bow aimed
+  it now stays: push the right stick down to go through normal, fire, ice and light (the game skips those you don't
+  have or lack the magic for). In third person the left grip already gave ZR. The log says `[vr] bow: right stick
+  down: Swap Modes`. On the boat the right stick is the camera's, as before.
+- **The right trigger too (2026-11-20, asked for).** With no arrow on the bow the triggers shoot nothing, so there the
+  right controller's trigger is ZR as well: it sets the type of the next arrow (`changeArrowTypeNotReady`). With an
+  arrow on the bow it still shoots; right stick down changes that arrow. Logged: `[vr] bow: the right trigger, no arrow
+  on the bow: Swap Modes`.
+- **Changing it replaces the arrow.** The game deletes the arrow on the bow and makes a new one
+  (`fopAcM_fastCreate(fpcNm_ARROW_e)`). Everything above reads the arrow from Link's kept item each frame, so it follows
+  the new one at the next frame.
+- **The glow.** Fire, ice and light arrows carry a glow, a child actor that places itself from a matrix the arrow keeps
+  from the game's own idea of where it is (Link's hand), not from the model the VR code draws along your hands. It may
+  show off the arrow you see. The aim, the flight and the hits are not affected. If it does, the fix is to move the
+  glow's model with the arrow's, as the arrow's own model is moved.
+
 ## Tested
 
 - `vr_test`: `test_pointing_aim` (the measured conventions, the pitch limit, bad directions) and `test_laser` (the
