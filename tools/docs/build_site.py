@@ -90,6 +90,55 @@ def video_block(caption):
             f'<p>{caption}</p>')
 
 
+# the gameplay tutorial (as the README's "Gameplay tutorial" section: keep them the same)
+TEACHES = [
+    ("Settings", "click the left stick for the VR options menu (sliders, mods and cheats)."),
+    ("Views", "click the right stick to switch between first person and third person."),
+    ("The HUD on your wrists", "turn your hands over to see your hearts and rupees."),
+    ("Ducking and crawling", "push the right stick down."),
+    ("Sword", "reach behind your right shoulder, hold the right grip and pull forward to draw it, then swing it yourself."),
+    ("Shield", "raise it to block attacks."),
+    ("Lock-on", "the left trigger targets an enemy. Hold and release B (Circle) for a spin attack."),
+    ("Item wheel", "hold the right trigger, pick an item with the right stick and let go to bring it out. (In the video, "
+                   "reaching over the left shoulder with the grip brings back the last item; now it opens the item wheel "
+                   "too.)"),
+    ("Bow", "hold the left grip to pull the string, release to shoot."),
+    ("Bombs", "throw them with a forward motion of your hand."),
+    ("Hookshot and boomerang", "aim by pointing your hand, fire with a trigger."),
+    ("Wind Waker", "wait a second, then conduct with your right hand (left, right, up, down, middle, or hold the right "
+                   "trigger); move your left hand to the left to change the beat."),
+]
+# (seconds into the video, chapter); the next chapter's start ends each
+CHAPTERS = [(12, "Tutorial: the VR features"), (245, "Setting sail: the four boat views"), (366, "Sailing at full speed"),
+            (510, "Dragon Roost Cavern"), (757, "Boss: Gohma"), (1057, "Forest Haven: the Great Deku Tree"),
+            (1135, "Forbidden Woods"), (1663, "Boss: Kalle Demos"), (1854, "Fairy Fountain"), (1972, "Tower of the Gods"),
+            (2176, "Mini-boss: Darknut"), (2388, "Boss: Gohdan, the Great Arbiter"),
+            (2721, "Hyrule Castle: the Master Sword awaits")]
+VIDEO_SECONDS = 3113
+
+
+def at(seconds):
+    return f"https://youtu.be/{VIDEO}?t={seconds}"
+
+
+def clock(seconds):
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def tutorial_html():
+    teaches = "".join(f"<li><strong>{html.escape(k)}:</strong> {html.escape(v)}</li>" for k, v in TEACHES)
+    teaches += f'<li><strong>Sailing</strong> (<a href="{at(245)}">4:05</a>): the four boat views, then sailing at full speed.</li>'
+    rows = "".join(f'<tr><td><a href="{at(t)}">{clock(t)}</a></td><td>{html.escape(name)}</td></tr>' for t, name in CHAPTERS)
+    return f"""<p><a href="https://youtu.be/{VIDEO}"><strong>The Legend of Zelda Wind Waker HD VR: (VR-WakerHD) Tutorial + Gameplay! #1</strong></a> was made by <a href="https://www.youtube.com/@legaiaflame">legaiaflame</a>, who also tests VR-WakerHD and reports its bugs. The 52-minute video opens with a four-minute tutorial that shows every VR control in the headset, then plays VR-WakerHD from the Great Sea through Dragon Roost Cavern, the Forbidden Woods and the Tower of the Gods to the Master Sword, with real sword fights, boss battles and sailing.</p>
+<h3>What the tutorial teaches</h3>
+<p>In order (<a href="{at(12)}">watch from 0:12</a>):</p>
+<ul>{teaches}</ul>
+<h3>Chapters</h3>
+<p>Each link opens the video at that point.</p>
+<div class="wrap"><table><tr><th>Time</th><th>Chapter</th></tr>{rows}</table></div>
+<p>(Recorded with an earlier version. 0.6.0 adds to it: only real swings of the sword count, and the bow can now switch between fire, ice and light arrows. See <a href="{BLOB}docs/PLAYING.md">Controls</a> for the current controls.)</p>"""
+
+
 SOFTWARE = {
     "@context": "https://schema.org",
     "@type": "SoftwareApplication",
@@ -120,6 +169,10 @@ VIDEO_LD = {
                     "Dragon Roost Cavern, the Forbidden Woods and the Tower of the Gods, by legaiaflame."),
     "thumbnailUrl": THUMB, "uploadDate": "2026-11-20", "duration": "PT51M53S",
     "contentUrl": f"https://youtu.be/{VIDEO}", "embedUrl": f"https://www.youtube.com/embed/{VIDEO}",
+    # the chapters as key moments (schema.org Clip)
+    "hasPart": [{"@type": "Clip", "name": name, "startOffset": t,
+                 "endOffset": CHAPTERS[i + 1][0] if i + 1 < len(CHAPTERS) else VIDEO_SECONDS, "url": at(t)}
+                for i, (t, name) in enumerate(CHAPTERS)],
 }
 
 
@@ -195,8 +248,9 @@ add("", "Wind Waker HD VR Mod – VR-WakerHD",
     f"""<p class="lead"><strong>VR-WakerHD</strong> is a free, open-source <strong>Wind Waker VR mod</strong>: a VR version of <em>The Legend of Zelda: The Wind Waker HD</em>. You play in first person through Link's eyes, with head tracking, motion controls, your arms as Link's arms and a sword you swing yourself. It runs on PC VR headsets through OpenXR (Windows and Linux) and standalone on Meta Quest 3 and 3S. It is built on <a href="https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp">ZeldaWWHDRecomp</a>, the native port (recompilation) of the Wii U game.</p>
 {NOTICE}
 {BUTTONS}
-<h2>Watch it played</h2>
-{video_block('<a href="https://youtu.be/' + VIDEO + '">The Legend of Zelda Wind Waker HD VR: (VR-WakerHD) Tutorial + Gameplay! #1</a>, by legaiaflame (52 minutes): a four-minute tutorial of every VR control in the headset, then the game played from the Great Sea to the Master Sword.')}
+<h2>Gameplay tutorial</h2>
+<a class="video" href="https://youtu.be/{VIDEO}"><img src="{THUMB}" width="480" height="360" alt="Wind Waker HD VR mod gameplay tutorial video on YouTube (VR-WakerHD)"></a>
+{tutorial_html()}
 <h2>What the Wind Waker VR mod does</h2>
 <ul>
 <li><strong>First person at Link's eyes</strong>, in stereo 3D with 6DoF head tracking; third person is a stick click away. <a href="/VR-WakerHD/features/">All features</a></li>
