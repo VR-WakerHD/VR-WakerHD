@@ -24,6 +24,9 @@ LASTMOD = "2026-11-22"
 # Bing Webmaster Tools' "Meta tag" method): put the content="..." value here, build, and publish; empty: no tag
 GOOGLE_SITE_VERIFICATION = ""
 BING_SITE_VERIFICATION = ""
+# IndexNow (https://www.indexnow.org: Bing, Yandex, Seznam, Naver): the site's key, served as <key>.txt at the site's
+# root, which proves the submissions of its pages are the site's own (tools/docs/indexnow.py sends them)
+INDEXNOW_KEY = "263b55a00e1d67ba7f14e61c4603b108"
 INFO = json.load(open(os.path.join(ROOT, "docs", "project-info.json"), encoding="utf-8"))
 VERSION = INFO["latestRelease"]["version"]
 
@@ -515,6 +518,8 @@ def main():
         for path, *_ in PAGES:
             f.write(f"  <url>\n    <loc>{SITE}{path}</loc>\n    <lastmod>{LASTMOD}</lastmod>\n  </url>\n")
         f.write("</urlset>\n")
+    with open(os.path.join(site, INDEXNOW_KEY + ".txt"), "w", encoding="utf-8") as f:
+        f.write(INDEXNOW_KEY)
     shutil.copyfile(os.path.join(ROOT, "llms.txt"), os.path.join(site, "llms.txt"))
     shutil.copyfile(os.path.join(ROOT, "docs", "project-info.json"), os.path.join(site, "project-info.json"))
     print(f"site: {len(PAGES)} pages, sitemap, llms.txt, project-info.json")
