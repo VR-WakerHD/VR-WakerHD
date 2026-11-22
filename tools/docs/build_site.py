@@ -22,7 +22,7 @@ THUMB = f"https://img.youtube.com/vi/{VIDEO}/hqdefault.jpg"
 LASTMOD = "2026-11-22"
 # the search engines' site verification codes (the maintainer's, from Google Search Console's "HTML tag" method and
 # Bing Webmaster Tools' "Meta tag" method): put the content="..." value here, build, and publish; empty: no tag
-GOOGLE_SITE_VERIFICATION = ""
+GOOGLE_SITE_VERIFICATION = "JqucIGneuSG-VYe8-rhFanRy0RQ246OTexwxUY-nE3g"
 BING_SITE_VERIFICATION = ""
 # IndexNow (https://www.indexnow.org: Bing, Yandex, Seznam, Naver): the site's key, served as <key>.txt at the site's
 # root, which proves the submissions of its pages are the site's own (tools/docs/indexnow.py sends them)
