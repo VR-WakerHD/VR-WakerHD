@@ -13,10 +13,12 @@ import xml.dom.minidom
 
 ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 # the documents players and search engines read (the older technical docs are not held to this check)
-DOCS = ["README.md", "llms.txt", "LICENSE-VR.md", ".github/RELEASE_TEMPLATE.md"] + [
+DOCS = ["README.md", "llms.txt", "LICENSE-VR.md", ".github/RELEASE_TEMPLATE.md", "CONTRIBUTING.md", "SECURITY.md"] + [
     "docs/" + f for f in ("INSTALLATION.md", "COMPATIBILITY.md", "QUEST.md", "FAQ.md", "FEATURES.md", "PLAYING.md",
                           "BUILDING.md", "DEVELOPMENT.md", "SEARCH-DISCOVERABILITY.md",
-                          "diagnosis/README.md")]
+                          "diagnosis/README.md", "discoverability/DISCOVERABILITY_AUDIT.md",
+                          "discoverability/DISCOVERABILITY_IMPLEMENTATION_REPORT.md",
+                          "discoverability/SEO_KEYWORD_TRACKER.md")]
 REPO = "https://github.com/VR-WakerHD/VR-WakerHD"
 SITE = "https://vr-wakerhd.github.io/VR-WakerHD/"
 problems = []
@@ -111,6 +113,7 @@ def check_site():
             json.loads(block)
         except ValueError as e:
             problems.append(f"site/index.html: structured data is not JSON ({e})")
+    locs = []
     try:
         sitemap = xml.dom.minidom.parse(os.path.join(ROOT, "site", "sitemap.xml"))
         locs = [n.firstChild.data.strip() for n in sitemap.getElementsByTagName("loc")]
@@ -121,6 +124,57 @@ def check_site():
     robots = open(os.path.join(ROOT, "site", "robots.txt"), encoding="utf-8").read()
     if SITE + "sitemap.xml" not in robots:
         problems.append("site/robots.txt: no Sitemap line for the sitemap")
+    check_site_pages(locs)
+
+
+def check_site_pages(locs):
+    """Every page of the site (tools/docs/build_site.py): its own title, description and canonical address, Open
+    Graph, structured data that parses, links within the site that lead to a page, and a place in the sitemap."""
+    site = os.path.join(ROOT, "site")
+    titles, descriptions = {}, {}
+    for dirpath, _dirs, files in os.walk(site):
+        if "index.html" not in files:
+            continue
+        rel = os.path.relpath(dirpath, site)
+        path = "" if rel == "." else rel.replace(os.sep, "/") + "/"
+        name = f"site/{path}index.html"
+        text = open(os.path.join(dirpath, "index.html"), encoding="utf-8").read()
+        p = Html()
+        p.feed(text)
+        if p.stack or p.bad:
+            problems.append(f"{name}: unbalanced tags {p.stack or p.bad}")
+        if p.imgs_without_alt:
+            problems.append(f"{name}: {p.imgs_without_alt} image(s) without alt text")
+        for key in ("description", "og:title", "og:description", "og:url", "twitter:card", "canonical"):
+            if not p.meta.get(key):
+                problems.append(f"{name}: no {key}")
+        if p.meta.get("canonical") != SITE + path or p.meta.get("og:url") != SITE + path:
+            problems.append(f"{name}: canonical / og:url is not {SITE + path}")
+        if SITE + path not in locs:
+            problems.append(f"site/sitemap.xml: {SITE + path} is not listed")
+        title, desc = p.title.strip(), p.meta.get("description", "")
+        if title in titles:
+            problems.append(f"{name}: the same title as {titles[title]}")
+        if desc in descriptions:
+            problems.append(f"{name}: the same description as {descriptions[desc]}")
+        titles[title], descriptions[desc] = name, name
+        if len(title) > 65:  # (search results cut longer titles)
+            problems.append(f"{name}: title longer than 65 characters ({len(title)})")
+        if len(desc) > 160:  # (search results cut longer ones)
+            problems.append(f"{name}: description longer than 160 characters ({len(desc)})")
+        if len(re.findall(r"<h1[ >]", text)) != 1:
+            problems.append(f"{name}: not exactly one h1")
+        for block in re.findall(r'<script type="application/ld\+json">(.*?)</script>', text, re.S):
+            try:
+                data = json.loads(block)
+                if data.get("@context") != "https://schema.org" or not data.get("@type"):
+                    problems.append(f"{name}: structured data without @context / @type")
+            except ValueError as e:
+                problems.append(f"{name}: structured data is not JSON ({e})")
+        for href in re.findall(r'href="(/VR-WakerHD/[^"#]*)', text):
+            target = os.path.join(site, href[len("/VR-WakerHD/"):])
+            if not (os.path.isfile(target) or os.path.isfile(os.path.join(target, "index.html"))):
+                problems.append(f"{name}: broken link {href}")
 
 
 def check_identity():

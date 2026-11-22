@@ -1,12 +1,16 @@
 {
   "name": "VR-WakerHD",
   "alternativeNames": [
+    "Wind Waker HD VR Mod",
+    "Wind Waker VR mod",
     "ZeldaWWHD-VR",
     "Wind Waker HD VR",
     "The Legend of Zelda: The Wind Waker HD VR",
     "Wind Waker VR port"
   ],
   "searchTerms": [
+    "Wind Waker VR mod",
+    "Wind Waker HD VR mod",
     "The Legend of Zelda: The Wind Waker VR",
     "Wind Waker HD VR",
     "Wind Waker VR port",
@@ -122,5 +126,14 @@
     "originalPort": "MPL-2.0",
     "credit": "VR mode by VR-WakerHD (https://github.com/VR-WakerHD/)"
   },
-  "website": "https://vr-wakerhd.github.io/VR-WakerHD/"
+  "website": "https://vr-wakerhd.github.io/VR-WakerHD/",
+  "website_pages": {
+    "windWakerVrMod": "https://vr-wakerhd.github.io/VR-WakerHD/wind-waker-vr-mod/",
+    "features": "https://vr-wakerhd.github.io/VR-WakerHD/features/",
+    "installation": "https://vr-wakerhd.github.io/VR-WakerHD/installation/",
+    "quest3": "https://vr-wakerhd.github.io/VR-WakerHD/quest-3/",
+    "pcvr": "https://vr-wakerhd.github.io/VR-WakerHD/pcvr/",
+    "linux": "https://vr-wakerhd.github.io/VR-WakerHD/linux/",
+    "faq": "https://vr-wakerhd.github.io/VR-WakerHD/faq/"
+  }
 }

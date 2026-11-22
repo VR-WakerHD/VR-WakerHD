@@ -1,5 +1,7 @@
 # VR-WakerHD search discoverability: baseline, causes and monthly test
 
+The 2026-11-22 round: [audit](discoverability/DISCOVERABILITY_AUDIT.md), [what was done](discoverability/DISCOVERABILITY_IMPLEMENTATION_REPORT.md), [keyword tracker](discoverability/SEO_KEYWORD_TRACKER.md).
+
 **VR-WakerHD**, the open-source VR version of *The Legend of Zelda: The Wind Waker HD*, should be findable by people
 who have never heard its name. On 2026-11-20 an AI assistant researching Wind Waker VR projects did not find it. This
 page records that failure, what caused it, what was done about it, and a search test to repeat each month.
@@ -127,8 +129,9 @@ found".
 - [ ] Note any new competing Wind Waker VR project.
 
 **How the site is served.** GitHub Actions is turned off on the public repository, so the site is served by GitHub
-Pages from the `gh-pages` branch (four files and `.nojekyll`), not by `.github/workflows/pages.yml`. After changing
-`site/` on `main`, copy its files to `gh-pages` and push. If Actions is ever turned on, switch Pages' source to "GitHub
+Pages from the `gh-pages` branch (the files of `site/`, with its page folders, and `.nojekyll`), not by
+`.github/workflows/pages.yml`. The pages are generated: edit `tools/docs/build_site.py`, run it, then copy `site/` to
+`gh-pages` and push. If Actions is ever turned on, switch Pages' source to "GitHub
 Actions" and the workflow takes over.
 
 The workflow `.github/workflows/docs-check.yml` checks the documentation's links, the JSON, the sitemap and that the

@@ -1,10 +1,11 @@
-# VR-WakerHD: The Legend of Zelda: The Wind Waker HD in VR
+# VR-WakerHD: Wind Waker HD VR Mod (The Legend of Zelda: The Wind Waker HD in VR)
 
-**VR-WakerHD is a fan-made VR version of *The Legend of Zelda: The Wind Waker HD*.** You play in first person through
+**VR-WakerHD is a free, open-source Wind Waker VR mod: a fan-made VR version of *The Legend of Zelda: The Wind Waker
+HD*.** You play in first person through
 Link's eyes, with head tracking, motion controls, your arms as Link's arms and a sword you swing yourself. It runs on
 PC VR headsets through OpenXR (SteamVR, Meta Quest Link, Virtual Desktop, Monado) and standalone on Meta Quest 3 and
 3S. It is built on [ZeldaWWHDRecomp](https://github.com/ZeldaWWHDRecomp/ZeldaWWHDRecomp), the native PC port
-(recompilation) of the Wii U game.
+(recompilation) of the Wii U game. The project was called ZeldaWWHD-VR before.
 
 > **Unofficial, and no game included.** VR-WakerHD is not made by or affiliated with Nintendo. You need your own,
 > legally obtained copy of the Wii U game: setup builds the game on your own device from your own game files. The
@@ -12,6 +13,8 @@ PC VR headsets through OpenXR (SteamVR, Meta Quest Link, Virtual Desktop, Monado
 
 **[Download the latest release](https://github.com/VR-WakerHD/VR-WakerHD/releases/latest)** ·
 [Website](https://vr-wakerhd.github.io/VR-WakerHD/) · [Install](docs/INSTALLATION.md) ·
+[Quest 3 guide](https://vr-wakerhd.github.io/VR-WakerHD/quest-3/) · [PC VR](https://vr-wakerhd.github.io/VR-WakerHD/pcvr/) ·
+[Linux](https://vr-wakerhd.github.io/VR-WakerHD/linux/) ·
 [Features](docs/FEATURES.md) · [Compatibility](docs/COMPATIBILITY.md) · [Quest guide](docs/QUEST.md) ·
 [Controls](docs/PLAYING.md) · [FAQ](docs/FAQ.md)
 
