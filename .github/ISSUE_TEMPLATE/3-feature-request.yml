@@ -2,6 +2,20 @@ name: Feature request
 description: An idea or a wish for the port (an option, a mod, platform support, ...).
 labels: ["enhancement"]
 body:
+  - type: markdown
+    attributes:
+      value: |
+        ## ⚠️ Is something going wrong? Use **Bug report** instead
+        This form is for **new ideas only**. If something in the game, the VR launcher or setup is broken or looks or
+        sounds wrong (graphics, video, sound, controls, crashes, slowness), go back and choose **Bug report**: it needs
+        your **log file** (`wwhd.log`). Bugs filed here without a log are closed.
+  - type: checkboxes
+    id: not-a-bug
+    attributes:
+      label: This is an idea, not a bug
+      options:
+        - label: "I'm asking for something new, not reporting something that goes wrong (bugs go in **Bug report**, with a log)."
+          required: true
   - type: textarea
     id: idea
     attributes:
